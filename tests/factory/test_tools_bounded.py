@@ -29,6 +29,7 @@ def test_coder_can_write_product_and_tests(sandbox):
         "docs/SPEC.md",
         "AGENTS.md",
         "factory_app/orchestrator.py",  # el agente no reescribe la fabrica
+        "tests/factory/test_orchestrator.py",  # ni los tests DE la fabrica (solo producto)
         "scripts/approve_gate.py",  # ni los gates
         "change_requests/CR-001.md",  # ni el input
         "runs/CR-001/07-verification.txt",  # ni la evidencia

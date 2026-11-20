@@ -262,6 +262,51 @@ def _archive(run_dir: Path, name: str, round_no: int) -> None:
         src.rename(run_dir / name.replace(".json", f"-round{round_no}.json"))
 
 
+def _commit_product_changes(change_id: str, fix_reason: str) -> str:
+    """Git evidence: comitea cambios de producto SOLO en la rama factory/<CR>.
+
+    Sin repo git o sin rama de run => no comitea (nunca en main: regla dura).
+    Autoria 'Agentic Software Factory': commit de maquina que espera review humano.
+    Retorna hash corto o ''.
+    """
+    if _git(["rev-parse", "--verify", "HEAD"]).returncode != 0:
+        return ""
+    branch = f"factory/{change_id}"
+    current = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    if current != branch:
+        if _git(["rev-parse", "--verify", branch]).returncode != 0:
+            return ""
+        _git(["checkout", "-q", branch])
+    for path in ("campusflow", "tests/product"):
+        if (REPO_ROOT / path).exists():
+            _git(["add", path])
+    if _git(["diff", "--cached", "--quiet"]).returncode == 0:
+        return ""
+    msg = f"factory({change_id}): " + (
+        "apply accepted findings" if fix_reason else "implement approved plan"
+    )
+    r = subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Agentic Software Factory",
+            "-c",
+            "user.email=factory@local",
+            "commit",
+            "-q",
+            "-m",
+            msg,
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if r.returncode != 0:
+        return ""
+    return _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
+
+
 # ================================================================= avance
 def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
     executor = executor or FakeExecutor()
@@ -348,11 +393,24 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         phase = "fix" if fix_reason else "implement"
         out = executor.run_agent(phase, ctx)
         target = "11-fix-report.md" if fix_reason else "05-coder-report.md"
-        (run_dir / target).write_text(out["report"], encoding="utf-8")
+        commit = _commit_product_changes(change_id, fix_reason)
+        diff_stat = _git(["diff", "main...HEAD", "--stat"]).stdout if commit else ""
+        report = out["report"]
+        if commit:
+            report += (
+                f"\n\n## Git evidence\n\n- commit: `{commit}` "
+                f"(rama {state.get('branch', 'factory/' + change_id)})\n```text\n{diff_stat}```\n"
+            )
+        (run_dir / target).write_text(report, encoding="utf-8")
         if not fix_reason:
             out2 = executor.run_agent("test_analysis", ctx)
             (run_dir / "06-test-analysis.md").write_text(out2["report"], encoding="utf-8")
-        _update_state(run_dir, status="VERIFY_PENDING", fix_reason="")
+        _update_state(
+            run_dir,
+            status="VERIFY_PENDING",
+            fix_reason="",
+            last_commit=commit or state.get("last_commit", ""),
+        )
         return advance(change_id, executor)
 
     # ---- 4 VERIFICATION determinista (FAIL nunca llega a review)

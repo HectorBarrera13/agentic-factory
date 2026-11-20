@@ -201,3 +201,41 @@ def test_rejected_gate_escalates(sandbox):
         ORCH.advance("CR-T", FakeExecutor())
     assert state(run)["status"] == "ESCALATED"
     assert not (run / "05-coder-report.md").exists()
+
+
+# ---------------------------------------------------------------- Git evidence
+def test_git_commit_and_diff_evidence_on_factory_branch(sandbox):
+    """En repo git real, el implement cierra commit en factory/<CR>, nunca en main."""
+    import shutil
+    import subprocess
+
+    git = shutil.which("git")
+    if git is None:
+        pytest.skip("git no disponible")
+    run = sandbox()
+    tmp = run.parents[1]
+    (tmp / "campusflow").mkdir(exist_ok=True)
+    (tmp / "tests" / "product").mkdir(parents=True, exist_ok=True)
+    (tmp / "campusflow" / "service.py").write_text("VALUE = 1\n")
+    subprocess.run([git, "init", "-q", "-b", "main", str(tmp)], check=True)
+    subprocess.run([git, "add", "-A"], cwd=tmp, check=True)
+    subprocess.run(
+        [git, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "base"],
+        cwd=tmp,
+        check=True,
+    )
+
+    approve(run, "requirements")
+    approve(run, "plan")
+    (tmp / "campusflow" / "service.py").write_text("VALUE = 2\n")  # coder simulado
+
+    with pytest.raises(AwaitingHuman):  # se detiene sola en el gate de review
+        ORCH.advance("CR-T", FakeExecutor())
+
+    st = state(run)
+    assert "## Git evidence" in (run / "05-coder-report.md").read_text()
+    assert st["last_commit"]
+    head = subprocess.run(
+        [git, "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp, capture_output=True, text=True
+    ).stdout.strip()
+    assert head == "factory/CR-T"  # el commit de maquina jamas toca main

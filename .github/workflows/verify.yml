@@ -13,7 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --dev
+      - run: uv sync --dev --group security
       - run: uv run pytest -q
       - run: uv run ruff check campusflow tests factory_app scripts
-      # Students add Semgrep, dependency audit and secret scanning.
+      - run: uv run python scripts/verify_repo.py
+      # Gates de seguridad deterministas (SAST/SCA/secrets) — HIGH bloquea el pipeline.
+      - name: Security scanners (semgrep + pip-audit + detect-secrets)
+        run: >
+          uv run python -c "from pathlib import Path;
+          from factory_app.scanners import run_security_scans;
+          r = run_security_scans(Path('.'));
+          print('high:', r['high'], '| degraded scanners:', r['degraded_scanners']);
+          raise SystemExit(1 if r['blocked'] else 0)"
+      - name: Secret committed check
+        run: "! git ls-files | grep -qx .env"

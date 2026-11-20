@@ -13,6 +13,7 @@ from .tools import (
     list_repo_files,
     read_repo_file,
     run_baseline_verification,
+    run_security_scans_tool,
     write_product_file,
     write_run_evidence,
 )
@@ -70,7 +71,7 @@ security_agent = LlmAgent(
     model=GEMINI_MODEL,
     description="Independent read-only security reviewer.",
     instruction=SECURITY_INSTRUCTION,
-    tools=READ_TOOLS,
+    tools=[*READ_TOOLS, run_security_scans_tool],
     output_key="security_report",
 )
 

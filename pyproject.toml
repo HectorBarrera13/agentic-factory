@@ -16,6 +16,11 @@ dev = [
   "ruff>=0.8",
   "httpx>=0.27",
 ]
+security = [
+  "semgrep>=1.80",
+  "pip-audit>=2.7",
+  "detect-secrets>=1.5",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

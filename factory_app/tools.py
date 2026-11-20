@@ -93,7 +93,7 @@ def write_run_evidence(change_id: str, filename: str, content: str) -> dict:
 
 
 # --- T06: capacidad de escritura ACOTADA para el Coder (least privilege real) ---
-WRITABLE_ROOTS = ("campusflow", "tests")
+WRITABLE_ROOTS = ("campusflow", "tests/product")
 NEVER_WRITE = (
     ".env",
     "pyproject.toml",
@@ -121,7 +121,8 @@ def write_product_file(relative_path: str, content: str) -> dict:
     top = rel.parts[0] if rel.parts else ""
     if top in NEVER_WRITE:
         return {"ok": False, "error": f"write denied for {top!r} (least privilege)"}
-    if top not in WRITABLE_ROOTS:
+    posix = rel.as_posix()
+    if not any(posix == w or posix.startswith(w + "/") for w in WRITABLE_ROOTS):
         return {"ok": False, "error": f"write allowed only under {WRITABLE_ROOTS}"}
     if candidate.is_dir():
         return {"ok": False, "error": "target is a directory"}
@@ -135,3 +136,14 @@ def write_product_file(relative_path: str, content: str) -> dict:
 def read_product_file(relative_path: str) -> dict:
     """Read helper for the Coder scoped to product areas."""
     return read_repo_file(relative_path)
+
+
+def run_security_scans_tool() -> dict:
+    """Deterministic SAST/SCA/secrets evidence for the Security agent.
+
+    Solo lectura; el agente interpreta la salida, jams la reemplaza con opinion.
+    Herramienta ausente => TOOL_MISSING reportado honestamente (nunca simulado).
+    """
+    from .scanners import run_security_scans
+
+    return run_security_scans(REPO_ROOT)
