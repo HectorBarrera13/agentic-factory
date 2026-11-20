@@ -1,7 +1,7 @@
 # Starter Tasks
 
 - [x] T01 Run baseline tests. (31 passed + 1 xfailed intencional; `python scripts/verify_repo.py`)
-- [ ] T02 Configure Google AI Studio API key. (pegar `GOOGLE_API_KEY=...` en `.env` — requiere humano)
+- [x] T02 Configure Google AI Studio API key. (GOOGLE_API_KEY en `.env` — verificada con llamada ping; .env gitignoreado y ausente de todo el historial git; scanner cubre formato `AQ.`)
 - [ ] T03 Run Intake/Planner in ADK. (código listo: `python -m factory_app.orchestrator CR-001 --adk`; falta corrida real con key)
 - [ ] T04 Execute CR-001 through planning. (demo fake end-to-end ✅; falta con Gemini real)
 - [x] T05 Implement human plan gate pause/resume. (`orchestrator.advance` + `approve_gate.py`; silence is never approval — testeado)
