@@ -18,7 +18,9 @@ from .tools import (
     write_run_evidence,
 )
 
-GEMINI_MODEL = "gemini-3.8-flash"
+import os
+
+GEMINI_MODEL = os.getenv("FACTORY_MODEL", "gemini-3.8-flash")
 READ_TOOLS = [list_repo_files, read_repo_file]
 
 intake_agent = LlmAgent(
