@@ -48,6 +48,21 @@ class Blocked(Exception):
     pass
 
 
+class TransientModelError(Exception):
+    """429/503 con reintentos agotados. El run queda en su ultimo checkpoint;
+    reanudar repitiendo el mismo comando --adk (curso §20)."""
+
+
+_TRANSIENT_MARKERS = (
+    "429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "high demand", "rate limit",
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__} {exc}".lower()
+    return any(m in text for m in _TRANSIENT_MARKERS)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -169,6 +184,10 @@ class ADKExecutor(AgentExecutor):
         "evidence": "evidence_agent",
     }
 
+    def __init__(self, backoff_base: float = 3.0, max_retries: int = 5):
+        self.backoff_base = backoff_base
+        self.max_retries = max_retries
+
     def run_agent(self, phase: str, context: dict) -> dict:
         import asyncio
 
@@ -194,7 +213,10 @@ class ADKExecutor(AgentExecutor):
                     text = event.content.parts[-1].text or ""
             return text
 
-        report = asyncio.run(_run())
+        def _call() -> str:
+            return asyncio.run(_run())
+
+        report = self._call_with_backoff(_call, phase, context["change_id"])
         recommendation = (
             "HUMAN_CLARIFICATION_REQUIRED"
             if re.search(r"HUMAN_CLARIFICATION_REQUIRED|\bSTOP\b", report)
@@ -204,6 +226,53 @@ class ADKExecutor(AgentExecutor):
             "report": report or f"# {phase} {context['change_id']} (respuesta vacía)",
             "recommendation": recommendation,
         }
+
+    def _call_with_backoff(self, fn, phase: str, change_id: str):
+        """§20: exponential backoff + jitter ante 429/503/high-demand.
+
+        Reintentos quedan registrados en factory-state.json (metrica §19.1).
+        Agotados los reintentos: TransientModelError; el run NO pierde checkpoint.
+        """
+        import random
+        import time
+
+        max_retries = self.max_retries
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as exc:
+                if not _is_transient(exc):
+                    raise
+                if attempt >= max_retries:
+                    self._record_retries(change_id, phase, attempt, exhausted=True)
+                    raise TransientModelError(
+                        f"{phase}: {max_retries} reintentos agotados; el run sigue en su "
+                        "ultimo checkpoint — reanudar con la misma linea --adk"
+                    ) from exc
+                attempt += 1
+                delay = self.backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 2)
+                print(f"  [llm] {phase}: transitorio ({type(exc).__name__}), "
+                      f"intento {attempt}/{max_retries} en {delay:.1f}s")
+                time.sleep(delay)
+
+    @staticmethod
+    def _record_retries(change_id: str, phase: str, n: int, exhausted: bool) -> None:
+        """Persiste la metrica de rate-limit retries en factory-state.json."""
+        if n == 0 and not exhausted:
+            return
+        run_dir = REPO_ROOT / "runs" / str(change_id).strip().upper()
+        if not _state_path(run_dir).is_file():
+            return
+        prior = json.loads(_state_path(run_dir).read_text(encoding="utf-8")).get(
+            "llm_retries", 0
+        )
+        _update_state(
+            run_dir,
+            llm_retries=prior + n,
+            last_llm_note=f"{phase}: {n} backoff retries"
+            + (" — EXHAUSTED (run resumable)" if exhausted else ""),
+        )
 
     def run_verification(self) -> dict:
         from .tools import run_baseline_verification
@@ -694,6 +763,10 @@ if __name__ == "__main__":
     import sys
 
     mode = "adk" if "--adk" in sys.argv else "fake"
+    if mode == "adk":  # las credenciales viven SOLO en .env (gitignoreado)
+        from dotenv import load_dotenv
+
+        load_dotenv(REPO_ROOT / ".env")
     ex: AgentExecutor = ADKExecutor() if mode == "adk" else FakeExecutor()
     try:
         st = advance(sys.argv[1], ex)
@@ -701,3 +774,6 @@ if __name__ == "__main__":
     except (AwaitingHuman, Blocked) as exc:
         print(f"\nSTOP: {exc}")
         sys.exit(3)
+    except TransientModelError as exc:
+        print(f"\nREASUMIBLE: {exc}")
+        sys.exit(4)

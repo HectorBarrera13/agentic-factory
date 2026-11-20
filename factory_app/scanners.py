@@ -105,7 +105,8 @@ def secret_scan(root: Path) -> dict:
     if r["status"] != "OK":
         # fallback determinista simple incluso sin la herramienta
         pattern = re.compile(
-            r"(AIza[0-9A-Za-z_\-]{35}|sk-[0-9A-Za-z]{20,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+            r"(AIza[0-9A-Za-z_\-]{35}|AQ\.[A-Za-z0-9_\-]{30,}|sk-[0-9A-Za-z]{20,}"
+            r"|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
         )
         hits = []
         for f in root.rglob("*"):
