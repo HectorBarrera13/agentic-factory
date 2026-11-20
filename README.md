@@ -1,144 +1,81 @@
-# CampusFlow + Agentic Software Factory — Starter Repository
+# CampusFlow + Agentic Software Factory
 
-Starter repository for the UADY course **Ingeniería de Software asistida por IA**.
+Repositorio del curso UADY **Ingeniería de Software asistida por IA**, sobre el starter oficial.
 
-This repository deliberately separates two systems:
+Dos sistemas separados:
 
-1. **`campusflow/`** — the software product the factory must evolve.
-2. **`factory_app/`** — an initial Google ADK skeleton for the software factory.
-
-The goal is not to build the fanciest application. The goal is to engineer a repeatable **Human + AI Software Factory** that can transform a Change Request into verifiable software evidence.
+1. **`campusflow/`** — el producto que la fábrica evoluciona.
+2. **`factory_app/`** — la fábrica (Google ADK + orquestador propio con human gates).
 
 ## Reference stack
 
-- Python 3.11+
-- Google ADK
-- Gemini Developer API via Google AI Studio
-- Google Agents CLI
-- Git + GitHub
-- pytest + ruff
-- Semgrep / dependency audit / secret scan (students add/configure)
-- GitHub Actions
-
-No Google Cloud billing is required for the starter.
+Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) · Agents CLI · Git/GitHub · pytest + ruff · Semgrep/pip-audit/detect-secrets · GitHub Actions. Sin Google Cloud billing.
 
 ## Setup
 
 ```bash
-uvx google-agents-cli setup
 uv sync
-cp .env.example .env
-```
-
-Set the Google AI Studio key in `.env`:
-
-```bash
-GOOGLE_API_KEY="..."
-```
-
-Baseline:
-
-```bash
-uv run pytest -q
+cp .env.example .env        # pegar GOOGLE_API_KEY de Google AI Studio
+uv run pytest -q            # 31 passed + 1 xfailed (defecto intencional CR-003)
 uv run ruff check campusflow tests factory_app scripts
+python scripts/verify_repo.py
 ```
 
-## Run the ADK starter
+## Cómo opera la fábrica (implementado)
 
 ```bash
-uv run adk run factory_app
-```
-
-or:
-
-```bash
-uv run adk web --port 8000
-```
-
-The root ADK workflow currently executes only **Intake -> Planner**. This is intentional: the factory must stop for a human plan approval before implementation.
-
-Run the starter eval dataset with:
-
-```bash
-agents-cli eval run
-```
-
-## Start a factory run
-
-```bash
+# 1. abrir un run
 uv run python scripts/start_run.py CR-001
-uv run python scripts/approve_gate.py CR-001 plan APPROVED "Plan reviewed by Tech Lead"
+
+# 2. avanzar fases (se DETIENE solo en cada human gate; sin veredicto no sigue)
+uv run python -m factory_app.orchestrator CR-001          # plantillas fake (sin API)
+uv run python -m factory_app.orchestrator CR-001 --adk    # agentes Gemini reales (requiere .env)
+
+# 3. decisiones humanas (cada una firma nombre+rol y queda como artefacto)
+uv run python scripts/approve_gate.py CR-001 requirements APPROVED "interpretacion OK" --by "Hector (Product Owner)"
+uv run python scripts/approve_gate.py CR-001 plan APPROVED "alcance acotado" --by "Hector (Tech Lead)"
+uv run python scripts/decide_findings.py CR-001 --by "Ana (Human Reviewer)" RF-01=ACCEPTED RF-02=DEFERRED
+uv run python scripts/approve_gate.py CR-001 review APPROVED "hallazgos clasificados" --by "Ana (Human Reviewer)"
+uv run python scripts/approve_gate.py CR-001 release APPROVED "evidencia completa" --by "Hector (Release Manager)"
+
+# 4. inspección
 uv run python scripts/show_run.py CR-001
+cat runs/CR-001/factory-run.json runs/CR-001/traceability.md
 ```
 
-## Student mission
+Flujo de fases: `intake → gate requirements → plan → gate plan → coder+test analyst →
+verification(pytest/ruff determinista) → reviewer ∥ security (sesiones separadas, solo lectura) →
+gate findings → (fix → re-verification → re-review, ≤3 rondas) → evidencia consolidada →
+gate release → READY FOR HUMAN MERGE`.
 
-Extend the starter until the factory supports:
+Garantías estructurales (no de prompt):
 
-```text
-Change Request
-    |
-Intake Agent
-    |
-Planner Agent
-    |
-HUMAN GATE: Product Owner / Tech Lead
-    |
-Coder Agent
-    |
-Deterministic Verification
-    |
-+-------------------+
-|                   |
-Reviewer Agent   Security Agent
-|                   |
-+---------+---------+
-          |
-HUMAN REVIEW
-          |
-Fix (if required)
-          |
-Re-verification
-          |
-Re-review
-          |
-HUMAN RELEASE GATE
-          |
-PR Evidence
+- Gates: `advance()` persiste estado y **termina el proceso** sin veredicto registrado.
+- Verification FAIL → nunca corre Reviewer/Security.
+- El Coder solo puede escribir `campusflow/` y `tests/` (`write_product_file`); docs/fábrica/evidencia/config están denegados en runtime.
+- Findings sin decisión humana ACCEPTED/MODIFIED no cambian código; tras un fix, la nueva revisión exige decisiones de la ronda actual.
+- `factory-run.json`, `traceability.md` y `14-evidence-summary.md` los genera el motor con contadores parseados de evidencia real.
+- Estado máximo = READY FOR HUMAN MERGE; no existe tool de merge.
+
+Capa LLM desacoplada (`factory_app/orchestrator.py`): `FakeExecutor` (CI/sin cuota,
+comportamiento determinista) ↔ `ADKExecutor` (Gemini real). Cambiar de proveedor no toca
+gates, permisos, evidencia ni estado.
+
+## Evals
+
+Dataset ampliado en `tests/eval/datasets/basic-dataset.json` (7 casos: normal, ambiguo,
+regresión, API alucinada, defecto de seguridad, abuso de prompt, scope control) con
+métricas `factory_planning_quality` + `adversarial_compliance`:
+
+```bash
+agents-cli eval run        # requiere GOOGLE_API_KEY
 ```
 
-### Mandatory principles
+## Change Requests
 
-- Coder and Reviewer must not share the same review context.
-- Reviewer and Security are read-only during first-pass review.
-- Requirements are the source of truth.
-- Never weaken tests to obtain PASS.
-- LLM output is not verification.
-- Deterministic checks belong in deterministic tools.
-- Important transitions must produce evidence.
-- Human decisions must be explicit and auditable.
-- Never send secrets or real personal data to the Gemini Free Tier.
+`CR-001` waitlist · `CR-002` autorización owner/admin · `CR-003` bug duplicados (xfail intencional) · `CR-004` CSV export · `CR-005` ambiguo (la fábrica debe STOPear).
 
-## Initial Change Requests
+## Estado
 
-1. `CR-001-waitlist.md`
-2. `CR-002-authorization.md`
-3. `CR-003-duplicate-registration.md`
-4. `CR-004-csv-export.md`
-5. `CR-005-ambiguous-priority.md`
-
-CR-005 is intentionally ambiguous. A good factory must stop for clarification rather than inventing policy.
-
-## Intentionally incomplete
-
-Students still have to implement:
-
-- the complete orchestrator;
-- bounded Coder write tools;
-- Git branch/diff/commit evidence;
-- security scanner integration;
-- human finding decisions;
-- fix -> reverify -> rereview;
-- release readiness;
-- traceability and `factory-run.json`;
-- expanded agent evals.
+Ver `PROJECT_MILESTONES.md` y `docs/TASKS.md`. Pendiente principal: corridas reales con
+Gemini (T02–T04/T08), 3 CRs completos con evidencia, eval compare y defensa con CR sorpresa.
