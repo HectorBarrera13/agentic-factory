@@ -63,6 +63,12 @@ def _is_transient(exc: BaseException) -> bool:
     return any(m in text for m in _TRANSIENT_MARKERS)
 
 
+def _retry_hint_seconds(exc: BaseException) -> int | None:
+    """Extrae RetryInfo.retryDelay ('20000s') de errores 429 de genai."""
+    m = re.search(r'retryDelay\D*(\d+)s', str(exc))
+    return int(m.group(1)) if m else None
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -244,6 +250,16 @@ class ADKExecutor(AgentExecutor):
             except Exception as exc:
                 if not _is_transient(exc):
                     raise
+                hint = _retry_hint_seconds(exc)
+                if hint is not None and hint > 600:
+                    # cuota diaria: reintentar YA gastaria quota sin posibilidad;
+                    # checkpoint intacto + mensaje con ventana de resume (§20)
+                    self._record_retries(change_id, phase, attempt, exhausted=True)
+                    raise TransientModelError(
+                        f"{phase}: cuota free-tier; reintentar en ~{hint // 60} min O "
+                        "cambiar FACTORY_MODEL (pool de quota distinto, p. ej. "
+                        "gemini-3.5-flash-lite); run resumible"
+                    ) from exc
                 if attempt >= max_retries:
                     self._record_retries(change_id, phase, attempt, exhausted=True)
                     raise TransientModelError(

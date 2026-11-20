@@ -1,3 +1,5 @@
+import os
+
 from google.adk.agents.llm_agent import LlmAgent
 
 from .prompts import (
@@ -17,8 +19,6 @@ from .tools import (
     write_product_file,
     write_run_evidence,
 )
-
-import os
 
 GEMINI_MODEL = os.getenv("FACTORY_MODEL", "gemini-3.8-flash")
 READ_TOOLS = [list_repo_files, read_repo_file]
