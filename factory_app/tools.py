@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -147,3 +149,163 @@ def run_security_scans_tool() -> dict:
     from .scanners import run_security_scans
 
     return run_security_scans(REPO_ROOT)
+
+
+# --- Test Analyst: escritura SOLO de tests (curso §7: "write tests únicamente") ---
+TEST_WRITABLE_ROOT = "tests/product/"
+
+
+def write_test_file(relative_path: str, content: str) -> dict:
+    """Bounded write for the Test Analyst: only tests/product/test_*.py.
+
+    Nunca codigo de aplicacion (campusflow/), requisitos, fabrica ni evidencia:
+    delega en write_product_file para heredar TODAS sus denegaciones.
+    """
+    candidate = (REPO_ROOT / relative_path).resolve()
+    try:
+        posix = candidate.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        return {"ok": False, "error": "path escapes repository"}
+    name = posix.rsplit("/", 1)[-1]
+    if not posix.startswith(TEST_WRITABLE_ROOT) or not (
+        name.startswith("test_") and name.endswith(".py")
+    ):
+        return {
+            "ok": False,
+            "error": f"test analyst may write only {TEST_WRITABLE_ROOT}test_*.py",
+        }
+    return write_product_file(relative_path, content)
+
+
+# --- Reviewer/Security: diff de solo lectura (curso §8: inspect_git_diff) ---
+def inspect_git_diff(stat_only: bool = False) -> dict:
+    """Read-only: `git diff main...HEAD` de la rama del run. Sin argumentos libres."""
+    cmd = ["git", "diff", "main...HEAD"] + (["--stat"] if stat_only else [])
+    completed = subprocess.run(
+        cmd, cwd=REPO_ROOT, text=True, capture_output=True, timeout=60, check=False
+    )
+    if completed.returncode != 0:
+        return {"ok": False, "error": completed.stderr[-500:] or "git diff failed"}
+    out = completed.stdout
+    if len(out) > 40_000:
+        out = out[:40_000] + "\n...[TRUNCATED]..."
+    return {"ok": True, "diff": out}
+
+
+# --- Context engineering (curso §12): seleccionar, no volcar el repo ---
+_AC = re.compile(r"AC-[A-Za-z0-9]+\.\d+")
+_REQ_ID = re.compile(r"\b(?:N?FR)-\d+\b")
+_CONTEXT_CAP = 12_000
+_ALWAYS = {"NFR-01"}  # restriccion arquitectonica aplica a todo cambio
+
+
+def _sections(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for chunk in re.split(r"(?m)^(?=## )", text):
+        if not chunk.startswith("## "):
+            continue
+        heading = chunk.splitlines()[0][3:].strip()
+        m = _REQ_ID.search(heading)
+        out[m.group(0) if m else heading] = chunk.strip()
+    return out
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:6] for w in re.findall(r"[a-z]{5,}", text.lower())}
+
+
+def select_context(change_id: str) -> dict:
+    """Selecciona solo el contexto relevante para un Change Request y lo deja auditable.
+
+    Descubre estructura via docs/REPO_MAP.md; elige secciones de REQUIREMENTS/SPEC
+    citadas por el CR (ids FR/NFR, nombre del CR, palabras clave), ARCHITECTURE, los
+    archivos fuente que el CR/REPO_MAP senalan y los tests relacionados. Escribe
+    runs/<CR>/context-manifest.json con lo incluido Y lo descartado.
+    """
+    change_id = change_id.strip().upper()
+    run_dir = REPO_ROOT / "runs" / change_id
+    cr_path = run_dir / "00-change-request.md"
+    if not cr_path.is_file():
+        matches = sorted((REPO_ROOT / "change_requests").glob(f"{change_id}-*.md"))
+        cr_path = matches[0] if matches else cr_path
+    cr_text = cr_path.read_text(encoding="utf-8") if cr_path.is_file() else ""
+    cr_ids = set(_REQ_ID.findall(cr_text))
+    cr_stems = _stems(cr_text)
+
+    def pick(doc: str) -> dict[str, str]:
+        path = REPO_ROOT / "docs" / doc
+        secs = _sections(path.read_text(encoding="utf-8")) if path.is_file() else {}
+        chosen = {}
+        for key, body in secs.items():
+            heading = body.splitlines()[0]
+            if (
+                key in cr_ids
+                or key in _ALWAYS
+                or change_id in body
+                or (_stems(heading) & cr_stems)
+            ):
+                chosen[key] = body
+        return chosen
+
+    requirements, spec = pick("REQUIREMENTS.md"), pick("SPEC.md")
+    arch_path = REPO_ROOT / "docs" / "ARCHITECTURE.md"
+    architecture = arch_path.read_text(encoding="utf-8") if arch_path.is_file() else ""
+
+    repo_map = REPO_ROOT / "docs" / "REPO_MAP.md"
+    mapped = (
+        re.findall(r"\|\s*`([^`]+\.py)`\s*\|", repo_map.read_text(encoding="utf-8"))
+        if repo_map.is_file()
+        else []
+    )
+    product = [p for p in mapped if p.startswith("campusflow/")]
+    words = set(re.findall(r"[a-z]+", cr_text.lower()))
+    source = [p for p in product if p.rsplit("/", 1)[-1][:-3] in words]
+    source_basis = "cr_mentions_module"
+    if not source:  # el CR no senala modulo: producto completo segun REPO_MAP (pequeno)
+        source, source_basis = product, "repo_map_product_fallback"
+    stems = {p.rsplit("/", 1)[-1][:-3] for p in source}
+    tests_dir = REPO_ROOT / "tests" / "product"
+    tests = [
+        str(t.relative_to(REPO_ROOT))
+        for t in sorted(tests_dir.glob("test_*.py"))
+        if tests_dir.is_dir()
+        and (
+            any(s in t.read_text(encoding="utf-8") for s in stems)
+            or set(_AC.findall(cr_text)) & set(_AC.findall(t.read_text(encoding="utf-8")))
+        )
+    ]
+
+    text = "\n\n".join([*requirements.values(), *spec.values(), architecture])[:_CONTEXT_CAP]
+    manifest = {
+        "change_id": change_id,
+        "change_request": str(cr_path.relative_to(REPO_ROOT)) if cr_path.is_file() else None,
+        "discovery": "docs/REPO_MAP.md",
+        "included": {
+            "requirements_sections": sorted(requirements),
+            "spec_sections": sorted(spec),
+            "architecture": bool(architecture),
+            "source_files": source,
+            "source_basis": source_basis,
+            "tests": tests,
+        },
+        "excluded": {
+            "requirements_sections": sorted(
+                set(_sections_ids("REQUIREMENTS.md")) - set(requirements)
+            ),
+            "spec_sections": sorted(set(_sections_ids("SPEC.md")) - set(spec)),
+            "source_files": [p for p in product if p not in source],
+            "areas": ["factory_app/", "scripts/", ".github/", "runs/ (other runs)", "uv.lock"],
+        },
+        "text_chars": len(text),
+        "whole_repo_sent": False,
+    }
+    if run_dir.is_dir():
+        (run_dir / "context-manifest.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+    return {"ok": True, "manifest": manifest, "text": text}
+
+
+def _sections_ids(doc: str) -> list[str]:
+    path = REPO_ROOT / "docs" / doc
+    return list(_sections(path.read_text(encoding="utf-8"))) if path.is_file() else []

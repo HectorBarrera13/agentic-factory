@@ -17,6 +17,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _roles import validate_role  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 VERDICTS = {"ACCEPTED", "REJECTED", "MODIFIED", "DEFERRED"}
 FINDING_RE = re.compile(r"^(RF|SEC)-\d{2,}$")
@@ -31,6 +34,7 @@ def main() -> None:
     change_id = argv[0].upper()
     by_index = argv.index("--by")
     recorded_by = argv[by_index + 1]
+    role = validate_role("findings", recorded_by)
     pairs = [a for i, a in enumerate(argv[by_index + 2 :], start=by_index + 2) if "=" in a]
     if not pairs:
         raise SystemExit("Include at least one FINDING=VERDICT pair")
@@ -62,6 +66,7 @@ def main() -> None:
         "gate": "findings",
         "decisions": decisions,
         "recorded_by": recorded_by,
+        "role": role,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "note": "Los ACCEPTED/MODIFIED bloqueantes autorizan Coder Fix; el resto no cambia codigo.",
     }

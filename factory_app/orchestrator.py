@@ -108,7 +108,9 @@ class FakeExecutor(AgentExecutor):
         cid = context["change_id"]
         cr_text = context.get("cr_text", "")
         if phase == "intake":
-            if self.ambiguous_cr or re.search(r"intentionally ambiguous|ambigu", cr_text, re.I):
+            if not context.get("po_clarification") and (
+                self.ambiguous_cr or re.search(r"intentionally ambiguous|ambigu", cr_text, re.I)
+            ):
                 return {
                     "recommendation": "HUMAN_CLARIFICATION_REQUIRED",
                     "report": f"# Intake {cid}\n\nSTOP: el CR no define politica; "
@@ -201,8 +203,11 @@ class ADKExecutor(AgentExecutor):
         from google.genai import types
 
         from . import agents as A
+        from .tools import select_context
 
         agent = getattr(A, self.AGENT_FOR_PHASE[phase])
+        # Context engineering (§12): solo lo relevante, con manifiesto auditable en el run.
+        context = {**context, "selected_context": select_context(context["change_id"])["text"]}
         prompt = self._prompt(phase, context)
 
         async def _run() -> str:
@@ -300,10 +305,13 @@ class ADKExecutor(AgentExecutor):
         bits = [f"Change ID: {context['change_id']}"]
         for key in (
             "cr_text",
+            "po_clarification",
+            "selected_context",
             "intake_report",
             "implementation_plan",
             "git_diff",
             "verification_summary",
+            "prior_findings",
             "accepted_blocking_findings",
         ):
             if context.get(key):
@@ -333,18 +341,80 @@ def _gate_decision(run_dir: Path, gate: str) -> dict | None:
     return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
 
 
+# Artefactos de decision humana con el nombre exacto del instructivo (§17). Los
+# human-<gate>-decision.json internos siguen siendo la fuente que lee el motor.
+GATE_ARTIFACT = {
+    "requirements": "02-human-requirement-decision.md",
+    "plan": "04-human-plan-approval.md",
+}
+
+
+def _write_gate_artifact(run_dir: Path, gate: str, decision: dict, extra: str = "") -> None:
+    """Registro legible y auditable de una decision humana (quien, que, por que, cuando)."""
+    name = GATE_ARTIFACT.get(gate)
+    if name is None:
+        return
+    (run_dir / name).write_text(
+        "\n".join(
+            [
+                f"# Human decision — gate {gate}",
+                "",
+                f"- Decision: **{decision.get('decision', '?')}**",
+                f"- Recorded by: {decision.get('recorded_by', 'unknown')}",
+                f"- Recorded at: {decision.get('recorded_at', 'unknown')}",
+                f"- Reason: {decision.get('reason', '')}",
+                "",
+                extra,
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
 def _apply_gate_decision(run_dir: Path, change_id: str, gate: str, decision: dict) -> None:
     """REJECTED/DEFERRED en gates 1 escalan; no hay continuacion automatica."""
+    _write_gate_artifact(run_dir, gate, decision)
     if decision["decision"] in {"APPROVED", "MODIFIED"}:
         return
-    _update_state(run_dir, status="ESCALATED", stop_reason=f"gate {gate}: {decision['decision']}")
+    _update_state(
+        run_dir,
+        status="ESCALATED",
+        stop_reason=f"gate {gate}: {decision['decision']}",
+        escalated_at=_now(),
+    )
     raise AwaitingHuman(change_id, gate, f"decision {decision['decision']}: intervenga un humano")
 
 
 def _archive(run_dir: Path, name: str, round_no: int) -> None:
     src = run_dir / name
     if src.is_file():
-        src.rename(run_dir / name.replace(".json", f"-round{round_no}.json"))
+        stem, dot, ext = name.rpartition(".")
+        src.rename(run_dir / f"{stem}-round{round_no}{dot}{ext}")
+
+
+def _try_resume_escalation(run_dir: Path, state: dict) -> dict | None:
+    """Un ESCALATED por ambiguedad (intake/planner) se reanuda SOLO cuando el humano
+    registra una decision APPROVED/MODIFIED POSTERIOR al escalamiento (curso §11.3:
+    STOP hasta recibir decision humana). Rechazos de gate (`gate ...`) no se reanudan."""
+    reason = str(state.get("stop_reason", ""))
+    resume = {"intake:": ("requirements", "INTAKE_PENDING"), "planner:": ("plan", "PLAN_PENDING")}
+    for prefix, (gate, target) in resume.items():
+        if not reason.startswith(prefix):
+            continue
+        decision = _gate_decision(run_dir, gate)
+        escalated_at = state.get("escalated_at", "")
+        if (
+            decision
+            and decision.get("decision") in {"APPROVED", "MODIFIED"}
+            and decision.get("recorded_at", "") > escalated_at
+        ):
+            return _update_state(
+                run_dir,
+                status=target,
+                stop_reason="",
+                po_clarification=str(decision.get("reason", ""))[:2000],
+            )
+    return None
 
 
 def _commit_product_changes(change_id: str, fix_reason: str) -> str:
@@ -403,19 +473,27 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         )
     state = json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
     status = state["status"]
+    if status == "ESCALATED":
+        state = _try_resume_escalation(run_dir, state) or state
+        status = state["status"]
     if status in TERMINAL:
         return state
     cr_text = _read(run_dir / "00-change-request.md")
+    clarification = state.get("po_clarification", "")
 
     # ---- 1 INTAKE
     if status == "INTAKE_PENDING":
-        out = executor.run_agent("intake", {"change_id": change_id, "cr_text": cr_text})
+        out = executor.run_agent(
+            "intake",
+            {"change_id": change_id, "cr_text": cr_text, "po_clarification": clarification},
+        )
         (run_dir / "01-intake-report.md").write_text(out["report"], encoding="utf-8")
         if out.get("recommendation") != "PROCEED":
             _update_state(
                 run_dir,
                 status="ESCALATED",
                 stop_reason="intake: requiere clarificacion del Product Owner",
+                escalated_at=_now(),
             )
             raise AwaitingHuman(
                 change_id,
@@ -444,11 +522,17 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 "change_id": change_id,
                 "cr_text": cr_text,
                 "intake_report": _read(run_dir / "01-intake-report.md"),
+                "po_clarification": clarification,
             },
         )
         (run_dir / "03-implementation-plan.md").write_text(out["report"], encoding="utf-8")
         if out.get("recommendation") != "PROCEED":
-            _update_state(run_dir, status="ESCALATED", stop_reason="planner: ambiguedad residual")
+            _update_state(
+                run_dir,
+                status="ESCALATED",
+                stop_reason="planner: ambiguedad residual",
+                escalated_at=_now(),
+            )
             raise AwaitingHuman(change_id, "plan", "planner pidio aclaracion")
         decision = _gate_decision(run_dir, "plan")
         if decision is None:
@@ -530,48 +614,95 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
 
     # ---- 5 REVIEWER + SECURITY independientes + gate findings
     if status == "REVIEW_PENDING":
-        diff = _git(["diff", "main...HEAD"]).stdout
-        review_ctx = {
-            "change_id": change_id,
-            "cr_text": cr_text,
-            "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
-            "git_diff": diff,
-            "verification_summary": _read(run_dir / "07-verification.txt"),
-        }
-        review = executor.run_agent("review", review_ctx)  # sesion propia
-        (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
-        sec = executor.run_agent(
-            "security", {"change_id": change_id, "cr_text": cr_text, "git_diff": diff}
-        )  # sesion propia distinta
-        from .scanners import run_security_scans
+        rounds = state.get("iterations", 0)
+        # Los reportes se generan UNA vez por ronda: al reanudar tras la decision humana
+        # NO se re-ejecutan (el humano clasifico ESTOS findings, no unos nuevos).
+        fresh = not (
+            state.get("reviewed_round") == rounds and (run_dir / "08-review-report.md").is_file()
+        )
+        if fresh:
+            prior_findings = ""
+            re_review = (run_dir / "08-review-report.md").is_file()
+            if re_review:  # re-review: conservar la ronda anterior, no sobrescribirla
+                prior_findings = (
+                    _read(run_dir / "08-review-report.md")
+                    + "\n"
+                    + _read(run_dir / "09-security-report.md")
+                    + "\nFIX AUTORIZADO: "
+                    + str(state.get("last_fix_reason", ""))
+                )
+                n = len(list(run_dir.glob("08-review-report-round*.md")))
+                _archive(run_dir, "08-review-report.md", n)
+                _archive(run_dir, "09-security-report.md", n)
+            diff = _git(["diff", "main...HEAD"]).stdout
+            review_ctx = {
+                "change_id": change_id,
+                "cr_text": cr_text,
+                "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
+                "git_diff": diff,
+                "verification_summary": _read(
+                    run_dir
+                    / (
+                        "12-re-verification.txt"
+                        if (run_dir / "12-re-verification.txt").is_file()
+                        else "07-verification.txt"
+                    )
+                ),
+                "prior_findings": prior_findings,
+            }
+            review = executor.run_agent("review", review_ctx)  # sesion propia
+            (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
+            sec = executor.run_agent(
+                "security",
+                {
+                    "change_id": change_id,
+                    "cr_text": cr_text,
+                    "git_diff": diff,
+                    "prior_findings": prior_findings,
+                },
+            )  # sesion propia distinta
+            from .scanners import run_security_scans
 
-        scans = run_security_scans(REPO_ROOT)
-        (run_dir / "09-security-report.md").write_text(
-            sec["report"]
-            + "\n\n## Escaneos deterministas\n\n```json\n"
-            + json.dumps(scans, indent=2)
-            + "\n```\n",
-            encoding="utf-8",
-        )
-        counts = count_findings(review["report"] + "\n" + sec["report"])
-        review_status = "PASS" if counts["must_fix"] == 0 else "CHANGES_REQUESTED"
-        security_status = "BLOCKED" if (counts["high"] > 0 or scans["blocked"]) else "PASS"
-        state = _update_state(
-            run_dir,
-            review={"status": review_status, **{k: counts[k] for k in ("must_fix", "should_fix")}},
-            security={
-                "status": security_status,
-                "high": counts["high"],
-                "medium": counts["medium"],
-            },
-        )
+            scans = run_security_scans(REPO_ROOT)
+            (run_dir / "09-security-report.md").write_text(
+                sec["report"]
+                + "\n\n## Escaneos deterministas\n\n```json\n"
+                + json.dumps(scans, indent=2)
+                + "\n```\n",
+                encoding="utf-8",
+            )
+            if re_review:
+                (run_dir / "13-re-review.md").write_text(
+                    f"# Re-review — {change_id} (ronda {rounds})\n\n"
+                    "Reviewer y Security re-chequean los findings autorizados y buscan "
+                    "regresiones/riesgos nuevos introducidos por el fix.\n\n"
+                    "## Reviewer\n\n" + review["report"] + "\n\n## Security\n\n"
+                    + sec["report"] + "\n",
+                    encoding="utf-8",
+                )
+            counts = count_findings(review["report"] + "\n" + sec["report"])
+            review_status = "PASS" if counts["must_fix"] == 0 else "CHANGES_REQUESTED"
+            security_status = "BLOCKED" if (counts["high"] > 0 or scans["blocked"]) else "PASS"
+            state = _update_state(
+                run_dir,
+                reviewed_round=rounds,
+                review={
+                    "status": review_status,
+                    **{k: counts[k] for k in ("must_fix", "should_fix")},
+                },
+                security={
+                    "status": security_status,
+                    "high": counts["high"],
+                    "medium": counts["medium"],
+                },
+            )
         decision = _gate_decision(run_dir, "review")
         if decision is None:
             raise AwaitingHuman(
                 change_id, "review", "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)"
             )
         blocking = accepted_blocking(run_dir)
-        rounds = state.get("iterations", 0)
+        _record_review_decisions(run_dir, rounds, decision, blocking)
         if blocking:
             _archive(run_dir, "human-review-decision.json", rounds)
             _archive(run_dir, "human-findings-decisions.json", rounds)
@@ -581,6 +712,7 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 iterations=rounds + 1,
                 human_gates={**state["human_gates"], "review": decision["decision"]},
                 fix_reason="findings bloqueantes aceptados: " + ", ".join(blocking),
+                last_fix_reason="findings bloqueantes aceptados: " + ", ".join(blocking),
             )
             return advance(change_id, executor)
         _update_state(
@@ -618,6 +750,9 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             human_gates={**state["human_gates"], "release": verdict},
             release_decision=decision,
         )
+        (run_dir / "15-release-decision.json").write_text(
+            json.dumps({**decision, "final_status": final}, indent=2), encoding="utf-8"
+        )
         (run_dir / "factory-run.json").write_text(
             json.dumps(build_factory_run(change_id, state, run_dir), indent=2), encoding="utf-8"
         )
@@ -652,16 +787,85 @@ def count_findings(text: str) -> dict:
     }
 
 
+FINDING_ID_RE = re.compile(r"\b(?:RF|SEC)-\d{2,}\b")
+SEVERITY_RE = re.compile(r"\b(?:MUST FIX|SHOULD FIX|OPTIONAL|CRITICAL|HIGH|MEDIUM|LOW)\b", re.I)
+BLOCKING_SEVERITIES = {"MUST FIX", "CRITICAL", "HIGH"}
+
+
+def finding_segments(text: str) -> dict[str, str]:
+    """finding id -> texto desde su primera aparicion hasta el siguiente finding distinto."""
+    hits: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for m in FINDING_ID_RE.finditer(text):
+        if m.group(0) not in seen:
+            seen.add(m.group(0))
+            hits.append((m.group(0), m.start()))
+    return {
+        fid: text[start : hits[i + 1][1] if i + 1 < len(hits) else len(text)]
+        for i, (fid, start) in enumerate(hits)
+    }
+
+
+def finding_severities(run_dir: Path) -> dict[str, str]:
+    """Severidad de cada finding segun los reportes de la ronda actual (misma linea del id
+    primero; si no, dentro de su segmento). Sin severidad detectable => no se incluye."""
+    text = _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
+    out: dict[str, str] = {}
+    for fid, segment in finding_segments(text).items():
+        line_start = text.find(segment)
+        line_end = text.find("\n", line_start)
+        line = text[text.rfind("\n", 0, line_start) + 1 : line_end if line_end != -1 else None]
+        m = SEVERITY_RE.search(line) or SEVERITY_RE.search(segment)
+        if m:
+            out[fid] = m.group(0).upper()
+    return out
+
+
 def accepted_blocking(run_dir: Path) -> list[str]:
+    """Findings que el humano ACEPTO/MODIFICO Y que son bloqueantes (MUST FIX / HIGH).
+    Un SHOULD FIX aceptado NO dispara un ciclo de fix; sin severidad parseable se trata
+    como bloqueante (conservador)."""
     path = run_dir / "human-findings-decisions.json"
     if not path.is_file():
         return []  # sin decision explicita, ningun finding se auto-aplica (Gate 2 real)
     data = json.loads(path.read_text(encoding="utf-8"))
+    severities = finding_severities(run_dir)
     return [
         d["finding_id"]
         for d in data.get("decisions", [])
         if d.get("decision") in {"ACCEPTED", "MODIFIED"}
+        and severities.get(d["finding_id"], "MUST FIX") in BLOCKING_SEVERITIES
     ]
+
+
+def _record_review_decisions(
+    run_dir: Path, round_no: int, decision: dict, blocking: list[str]
+) -> None:
+    """10-human-review-decisions.md (§17): decisiones por finding de cada ronda, append-only."""
+    path = run_dir / "10-human-review-decisions.md"
+    findings = run_dir / "human-findings-decisions.json"
+    data = json.loads(findings.read_text(encoding="utf-8")) if findings.is_file() else {}
+    severities = finding_severities(run_dir)
+    lines = [
+        f"## Round {round_no} — gate review: {decision.get('decision')}",
+        "",
+        f"- Recorded by: {decision.get('recorded_by', 'unknown')} "
+        f"at {decision.get('recorded_at', 'unknown')}",
+        f"- Reason: {decision.get('reason', '')}",
+        f"- Blocking accepted (authorize Coder Fix): {', '.join(blocking) or 'none'}",
+        "",
+        "| Finding | Severity | Human decision |",
+        "|---|---|---|",
+        *[
+            f"| {d['finding_id']} | {severities.get(d['finding_id'], 'unknown')} "
+            f"| {d['decision']} |"
+            for d in data.get("decisions", [])
+        ],
+        "",
+    ]
+    header = "" if path.is_file() else f"# Human review decisions — {run_dir.name}\n\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(header + "\n".join(lines) + "\n")
 
 
 def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
@@ -703,6 +907,7 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
             "release_manager": state["human_gates"].get("release", "PENDING"),
         },
         "iterations": state.get("iterations", 0),
+        "traceability_gaps": traceability_gaps(compute_traceability(run_dir)),
         "history": state.get("transitions", []),
     }
 
@@ -720,6 +925,7 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
                 f"- Security: {run['security']}",
                 f"- Gates humanos: {run['human_gates']}",
                 f"- Iteraciones fix: {run['iterations']}",
+                f"- Traceability gaps ({UNMAPPED}): {run.get('traceability_gaps', 0)}",
                 f"- Artefactos ({len(present)}): {', '.join(present)}",
                 "",
                 "> Generado por factory_app/orchestrator desde evidencia real del run.",
@@ -730,33 +936,82 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
     )
 
 
-def build_traceability(run: dict, run_dir: Path) -> str:
-    acs = sorted(set(re.findall(r"AC-CR\d+\.\d+", _read(run_dir / "00-change-request.md"))))
-    coder = _read(run_dir / "05-coder-report.md") + _read(run_dir / "11-fix-report.md")
-    code_files = re.findall(r"(campusflow/[\w/\.]+\.py)", coder) or ["campusflow/service.py"]
-    findings = sorted(
-        set(
-            re.findall(
-                r"(RF-\d+|SEC-\d+)",
-                _read(run_dir / "08-review-report.md") + _read(run_dir / "09-security-report.md"),
-            )
-        )
+AC_RE = re.compile(r"AC-[A-Za-z0-9]+\.\d+")
+UNMAPPED = "UNMAPPED"
+
+
+def compute_traceability(run_dir: Path) -> list[dict]:
+    """Req/AC -> Task -> Code -> Test -> Finding -> Human decision, solo con vinculos
+    EVIDENCIABLES (el plan cita el AC; el diff contiene el archivo; un test cita el AC;
+    un finding cita el AC). Si no hay vinculo => UNMAPPED, nunca relleno."""
+    acs = sorted(set(AC_RE.findall(_read(run_dir / "00-change-request.md"))))
+    plan_lines = _read(run_dir / "03-implementation-plan.md").splitlines()
+    diff_files = {
+        f
+        for f in _git(["diff", "--name-only", "main...HEAD"]).stdout.split()
+        if f.startswith(("campusflow/", "tests/product/"))
+    }
+    tests_by_ac: dict[str, list[str]] = {}
+    tests_dir = REPO_ROOT / "tests" / "product"
+    for tf in sorted(tests_dir.glob("test_*.py")) if tests_dir.is_dir() else []:
+        for chunk in re.split(r"(?m)^(?=def test_|    def test_)", tf.read_text(encoding="utf-8")):
+            name = re.match(r"\s*def (test_\w+)", chunk)
+            if not name:
+                continue
+            for ac in set(AC_RE.findall(chunk)):
+                tests_by_ac.setdefault(ac, []).append(f"{tf.name}::{name.group(1)}")
+    reports = (
+        _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
     )
+    segments = finding_segments(reports)
     dec_path = run_dir / "human-findings-decisions.json"
     decisions = (
         {
             d["finding_id"]: d["decision"]
-            for d in json.loads(dec_path.read_text()).get("decisions", [])
+            for d in json.loads(dec_path.read_text(encoding="utf-8")).get("decisions", [])
         }
         if dec_path.is_file()
         else {}
     )
     rows = []
-    for i, ac in enumerate(acs):
-        f = findings[i] if i < len(findings) else "-"
+    for ac in acs:
+        cited = [line for line in plan_lines if ac in line]
+        tasks = sorted({t for line in cited for t in re.findall(r"\b(?:TASK-\d+|T\d+)\b", line)})
+        planned_files = {f for line in cited for f in re.findall(r"[\w/]+\.py", line)}
+        code = sorted(planned_files & diff_files)  # planeado Y realmente cambiado
+        findings = sorted(fid for fid, seg in segments.items() if ac in seg)
         rows.append(
-            f"| {ac} | T1 | {code_files[0]} | tests/product/ | {f} | {decisions.get(f, '-')} |"
+            {
+                "ac": ac,
+                "tasks": tasks or [UNMAPPED],
+                "code": code or [UNMAPPED],
+                "tests": tests_by_ac.get(ac) or [UNMAPPED],
+                "findings": findings or ["-"],
+                "decisions": [decisions.get(f, "-") for f in findings] or ["-"],
+            }
         )
+    return rows
+
+
+def traceability_gaps(rows: list[dict]) -> int:
+    return sum(
+        1 for r in rows for col in ("tasks", "code", "tests") if r[col] == [UNMAPPED]
+    )
+
+
+def build_traceability(run: dict, run_dir: Path) -> str:
+    rows = compute_traceability(run_dir)
+    diff_files = [
+        f
+        for f in _git(["diff", "--name-only", "main...HEAD"]).stdout.split()
+        if f.startswith(("campusflow/", "tests/product/"))
+    ]
+    table = [
+        f"| {r['ac']} | {', '.join(r['tasks'])} | {', '.join(r['code'])} | "
+        f"{', '.join(r['tests'])} | {', '.join(r['findings'])} | {', '.join(r['decisions'])} |"
+        for r in rows
+    ]
+    gaps = traceability_gaps(rows)
     return (
         "\n".join(
             [
@@ -764,8 +1019,15 @@ def build_traceability(run: dict, run_dir: Path) -> str:
                 "",
                 "| Req / AC | Task | Code | Test | Finding | Human decision |",
                 "|---|---|---|---|---|---|",
-                *rows,
+                *(table or ["| (no AC-* in the Change Request) | - | - | - | - | - |"]),
                 "",
+                f"**Traceability gaps ({UNMAPPED}): {gaps}** — vinculos que la evidencia del "
+                "run no sustenta; el Release Manager debe considerarlos antes de decidir."
+                if gaps
+                else "Traceability gaps: 0",
+                "",
+                "Files changed in the run (git diff main...HEAD): "
+                + (", ".join(diff_files) or "none recorded"),
                 f"Gates: {json.dumps(run['human_gates'])}",
                 f"Estado final: {run['status']} — el merge final es exclusivamente humano.",
                 "",

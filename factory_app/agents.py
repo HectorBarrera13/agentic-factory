@@ -12,12 +12,14 @@ from .prompts import (
     TEST_ANALYST_INSTRUCTION,
 )
 from .tools import (
+    inspect_git_diff,
     list_repo_files,
     read_repo_file,
     run_baseline_verification,
     run_security_scans_tool,
     write_product_file,
     write_run_evidence,
+    write_test_file,
 )
 
 GEMINI_MODEL = os.getenv("FACTORY_MODEL", "gemini-3.8-flash")
@@ -53,9 +55,9 @@ coder_agent = LlmAgent(
 test_analyst_agent = LlmAgent(
     name="TestAnalystAgent",
     model=GEMINI_MODEL,
-    description="Finds test gaps and interprets deterministic verification evidence.",
+    description="Finds test gaps, adds authorized tests (tests/product only), reads evidence.",
     instruction=TEST_ANALYST_INSTRUCTION,
-    tools=[*READ_TOOLS, run_baseline_verification],
+    tools=[*READ_TOOLS, run_baseline_verification, write_test_file],
     output_key="test_analysis",
 )
 
@@ -64,7 +66,7 @@ reviewer_agent = LlmAgent(
     model=GEMINI_MODEL,
     description="Independent read-only software reviewer.",
     instruction=REVIEWER_INSTRUCTION,
-    tools=READ_TOOLS,
+    tools=[*READ_TOOLS, inspect_git_diff],
     output_key="review_report",
 )
 
@@ -73,7 +75,7 @@ security_agent = LlmAgent(
     model=GEMINI_MODEL,
     description="Independent read-only security reviewer.",
     instruction=SECURITY_INSTRUCTION,
-    tools=[*READ_TOOLS, run_security_scans_tool],
+    tools=[*READ_TOOLS, inspect_git_diff, run_security_scans_tool],
     output_key="security_report",
 )
 

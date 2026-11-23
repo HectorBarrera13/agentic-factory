@@ -15,8 +15,8 @@ Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) · Agents CLI · 
 
 ```bash
 uv sync
-cp .env.example .env        # pegar GOOGLE_API_KEY de Google AI Studio
-uv run pytest -q            # 31 passed + 1 xfailed (defecto intencional CR-003)
+cp .env.example .env        # pegar GEMINI_API_KEY de Google AI Studio (GOOGLE_API_KEY tambien vale)
+uv run pytest -q            # 82 passed + 1 xfailed (defecto intencional CR-003)
 uv run ruff check campusflow tests factory_app scripts
 python scripts/verify_repo.py
 ```
@@ -57,6 +57,24 @@ Garantías estructurales (no de prompt):
 - `factory-run.json`, `traceability.md` y `14-evidence-summary.md` los genera el motor con contadores parseados de evidencia real.
 - Estado máximo = READY FOR HUMAN MERGE; no existe tool de merge.
 
+Alineación con el instructivo (§8-§18):
+
+- Contratos por agente en `factory_app/contracts.py` (role, context, allow, deny, output,
+  stop conditions, escalation), validados contra las tools reales de cada agente.
+- Test Analyst puede escribir solo `tests/product/test_*.py` (`write_test_file`); Reviewer y
+  Security leen el diff con `inspect_git_diff` (solo lectura).
+- Context engineering: `select_context` elige secciones de REQUIREMENTS/SPEC, ARCHITECTURE,
+  fuentes y tests relevantes desde `docs/REPO_MAP.md` y deja `runs/<CR>/context-manifest.json`
+  (incluido y descartado).
+- Cada gate exige el rol correcto en `--by "Nombre (Rol)"` (`scripts/_roles.py`).
+- Un `ESCALATED` por ambigüedad se reanuda cuando el PO registra una decisión posterior; los
+  rechazos de gate no se reanudan.
+- Re-review: la ronda anterior se archiva (`08-review-report-roundN.md`), se escribe
+  `13-re-review.md`, y los reportes de una ronda no se regeneran al reanudar tras el gate.
+- Solo un MUST FIX / HIGH aceptado dispara fix; un SHOULD FIX aceptado queda registrado.
+- `traceability.md` solo enlaza lo evidenciable; lo demás es `UNMAPPED` y se cuenta en
+  `traceability_gaps` de `factory-run.json`.
+
 Capa LLM desacoplada (`factory_app/orchestrator.py`): `FakeExecutor` (CI/sin cuota,
 comportamiento determinista) ↔ `ADKExecutor` (Gemini real). Cambiar de proveedor no toca
 gates, permisos, evidencia ni estado.
@@ -68,7 +86,7 @@ regresión, API alucinada, defecto de seguridad, abuso de prompt, scope control)
 métricas `factory_planning_quality` + `adversarial_compliance`:
 
 ```bash
-agents-cli eval run        # requiere GOOGLE_API_KEY
+agents-cli eval run        # requiere GEMINI_API_KEY
 ```
 
 ## Change Requests

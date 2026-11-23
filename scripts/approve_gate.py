@@ -6,6 +6,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _roles import validate_role  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 VALID_GATES = {"requirements", "plan", "review", "release"}
 VALID_DECISIONS = {"APPROVED", "MODIFIED", "REJECTED", "DEFERRED"}
@@ -38,6 +41,7 @@ def main() -> None:
         raise SystemExit("Human decision requires a reason")
     if "TODO" in recorded_by:
         raise SystemExit('Identifique al humano: --by "Nombre (Rol)" (o export HUMAN_ROLE)')
+    role = validate_role(gate, recorded_by)
     run = ROOT / "runs" / change_id
     state_path = run / "factory-state.json"
     if not state_path.exists():
@@ -52,6 +56,7 @@ def main() -> None:
         "reason": reason,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "recorded_by": recorded_by,
+        "role": role,
         "note": "Decision humana explícita; la fábrica no interpreta silencio.",
     }
     path = run / f"human-{gate}-decision.json"
