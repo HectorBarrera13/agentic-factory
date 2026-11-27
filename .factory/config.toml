@@ -32,7 +32,7 @@ kind = "pytest"
 
 [[verify.commands]]
 name = "lint"
-cmd = ["{python}", "-m", "ruff", "check", "campusflow", "tests", "factory_app", "scripts"]
+cmd = ["{python}", "-m", "ruff", "check", "campusflow", "tests", "factory_app", "factory_ui", "scripts"]
 kind = "ruff"
 
 [git]

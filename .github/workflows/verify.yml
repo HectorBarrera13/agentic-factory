@@ -17,7 +17,7 @@ jobs:
       # semgrep en entorno aislado: incompatible con google-adk (opentelemetry).
       - run: uv tool install semgrep
       - run: uv run pytest -q
-      - run: uv run ruff check campusflow tests factory_app scripts
+      - run: uv run ruff check campusflow tests factory_app factory_ui scripts
       - run: uv run python scripts/verify_repo.py
       # Gates de seguridad deterministas (SAST/SCA/secrets) — HIGH bloquea el pipeline.
       - name: Security scanners (semgrep + pip-audit + detect-secrets)
@@ -29,3 +29,4 @@ jobs:
           raise SystemExit(1 if r['blocked'] else 0)"
       - name: Secret committed check
         run: "! git ls-files | grep -qx .env"
+
