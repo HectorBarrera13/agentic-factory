@@ -509,7 +509,7 @@ def _try_resume_escalation(run_dir: Path, state: dict) -> dict | None:
     return None
 
 
-def _commit_product_changes(change_id: str, fix_reason: str) -> str:
+def _commit_product_changes(change_id: str, message: str) -> str:
     """Git evidence: comitea cambios de producto SOLO en la rama factory/<CR>.
 
     Sin repo git o sin rama de run => no comitea (nunca en main: regla dura).
@@ -519,19 +519,14 @@ def _commit_product_changes(change_id: str, fix_reason: str) -> str:
     if _git(["rev-parse", "--verify", "HEAD"]).returncode != 0:
         return ""
     branch = f"factory/{change_id}"
-    current = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-    if current != branch:
-        if _git(["rev-parse", "--verify", branch]).returncode != 0:
-            return ""
-        _git(["checkout", "-q", branch])
+    if _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
+        return ""  # _prepare_branch ya hizo checkout; fuera de la rama del run no se comitea
     for path in ("campusflow", "tests/product"):
         if (REPO_ROOT / path).exists():
             _git(["add", path])
     if _git(["diff", "--cached", "--quiet"]).returncode == 0:
         return ""
-    msg = f"factory({change_id}): " + (
-        "apply accepted findings" if fix_reason else "implement approved plan"
-    )
+    msg = f"factory({change_id}): {message}"
     r = subprocess.run(
         [
             "git",
@@ -554,6 +549,16 @@ def _commit_product_changes(change_id: str, fix_reason: str) -> str:
     return _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
 
 
+def _git_evidence(commit: str, state: dict, rng: str) -> str:
+    if not commit:
+        return ""
+    stat = _git(["diff", rng, "--stat"]).stdout
+    return (
+        f"\n\n## Git evidence\n\n- commit: `{commit}` (rama {state.get('branch')}, "
+        f"diff {rng})\n```text\n{stat}```\n"
+    )
+
+
 def _last_verification_file(run_dir: Path) -> str:
     return (
         "12-re-verification.txt"
@@ -562,11 +567,54 @@ def _last_verification_file(run_dir: Path) -> str:
     )
 
 
+def _has_git() -> bool:
+    return _git(["rev-parse", "--verify", "HEAD"]).returncode == 0
+
+
 def _create_run_branch(change_id: str, state: dict) -> dict:
+    """Crea factory/<CR> desde HEAD (sin cambiar de rama) y guarda su base: todos los
+    diffs del run son <base_commit>...factory/<CR>, este donde este el HEAD."""
     branch = f"factory/{change_id}"
+    if not _has_git():
+        return {"branch": branch}
     if _git(["rev-parse", "--verify", branch]).returncode != 0:
-        _git(["checkout", "-b", branch])
-    return {"branch": branch}
+        base = _git(["rev-parse", "HEAD"]).stdout.strip()
+        r = _git(["branch", branch])
+        if r.returncode != 0:
+            raise Blocked(f"{change_id}: no se pudo crear {branch}: {r.stderr.strip()}")
+    else:
+        base = state.get("base_commit") or _git(["merge-base", "HEAD", branch]).stdout.strip()
+    return {"branch": branch, "base_commit": base}
+
+
+def _prepare_branch(change_id: str, state: dict, require_clean: bool) -> None:
+    """Deja el arbol en factory/<CR> antes de que un agente lo lea o escriba.
+    require_clean: cambios sin commitear en producto/tests bloquean el run (el commit de
+    maquina nunca debe llevarse trabajo humano ajeno al plan)."""
+    if not _has_git():
+        return
+    branch = state.get("branch") or f"factory/{change_id}"
+    if require_clean:
+        dirty = _git(["status", "--porcelain", "--", "campusflow", "tests/product"]).stdout
+        if dirty.strip():
+            raise Blocked(
+                f"{change_id}: hay cambios sin commitear en campusflow/ o tests/product:\n"
+                f"{dirty.rstrip()}\nComitealos o descartalos y reanuda; la fabrica no los "
+                "mezcla con el trabajo del Coder."
+            )
+    if _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
+        r = _git(["checkout", "-q", branch])
+        if r.returncode != 0:
+            raise Blocked(f"{change_id}: no se pudo cambiar a {branch}: {r.stderr.strip()}")
+
+
+def _diff_range(state: dict) -> str:
+    base = state.get("base_commit") or "main"
+    return f"{base}...{state.get('branch') or 'HEAD'}"
+
+
+def _run_diff_range(run_dir: Path) -> str:
+    return _diff_range(_load_state(run_dir) if _state_path(run_dir).is_file() else {})
 
 
 # ================================================================= avance
@@ -685,18 +733,18 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 else ""
             ),
         }
+        _prepare_branch(change_id, state, require_clean=True)
+        rng = _diff_range(state)
         phase = "fix" if fix_reason else "implement"
         out = executor.run_agent(phase, ctx)
         target = "11-fix-report.md" if fix_reason else "05-coder-report.md"
-        commit = _commit_product_changes(change_id, fix_reason)
-        diff_stat = _git(["diff", "main...HEAD", "--stat"]).stdout if commit else ""
-        report = out["report"]
-        if commit:
-            report += (
-                f"\n\n## Git evidence\n\n- commit: `{commit}` "
-                f"(rama {state.get('branch', 'factory/' + change_id)})\n```text\n{diff_stat}```\n"
-            )
-        (run_dir / target).write_text(report, encoding="utf-8")
+        commit = _commit_product_changes(
+            change_id, "apply accepted findings" if fix_reason else "implement approved plan"
+        )
+        (run_dir / target).write_text(
+            out["report"] + _git_evidence(commit, state, rng), encoding="utf-8"
+        )
+        last = commit
         if not fix_reason:
             out2 = executor.run_agent(
                 "test_analysis",
@@ -704,16 +752,21 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                     "change_id": change_id,
                     "cr_text": cr_text,
                     "implementation_plan": ctx["implementation_plan"],
-                    "git_diff": _git(["diff", "main...HEAD"]).stdout,
+                    "git_diff": _git(["diff", rng]).stdout,
                 },
             )
-            (run_dir / "06-test-analysis.md").write_text(out2["report"], encoding="utf-8")
+            # los tests del analista tambien se comitean: el arbol vuelve a quedar limpio
+            test_commit = _commit_product_changes(change_id, "add test analyst tests")
+            (run_dir / "06-test-analysis.md").write_text(
+                out2["report"] + _git_evidence(test_commit, state, rng), encoding="utf-8"
+            )
+            last = test_commit or commit
         _update_state(
             run_dir,
             status="VERIFY_PENDING",
             fix_reason="",
             fix_details="",
-            last_commit=commit or state.get("last_commit", ""),
+            last_commit=last or state.get("last_commit", ""),
         )
         return advance(change_id, executor)
 
@@ -771,7 +824,8 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 n = len(list(run_dir.glob("08-review-report-round*.md")))
                 _archive(run_dir, "08-review-report.md", n)
                 _archive(run_dir, "09-security-report.md", n)
-            diff = _git(["diff", "main...HEAD"]).stdout
+            _prepare_branch(change_id, state, require_clean=False)
+            diff = _git(["diff", _diff_range(state)]).stdout
             review_ctx = {
                 "change_id": change_id,
                 "cr_text": cr_text,
@@ -1109,7 +1163,7 @@ def compute_traceability(run_dir: Path) -> list[dict]:
     plan_lines = _read(run_dir / "03-implementation-plan.md").splitlines()
     diff_files = {
         f
-        for f in _git(["diff", "--name-only", "main...HEAD"]).stdout.split()
+        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
         if f.startswith(("campusflow/", "tests/product/"))
     }
     tests_by_ac: dict[str, list[str]] = {}
@@ -1164,7 +1218,7 @@ def build_traceability(run: dict, run_dir: Path) -> str:
     rows = compute_traceability(run_dir)
     diff_files = [
         f
-        for f in _git(["diff", "--name-only", "main...HEAD"]).stdout.split()
+        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
         if f.startswith(("campusflow/", "tests/product/"))
     ]
     table = [
@@ -1187,7 +1241,7 @@ def build_traceability(run: dict, run_dir: Path) -> str:
                 if gaps
                 else "Traceability gaps: 0",
                 "",
-                "Files changed in the run (git diff main...HEAD): "
+                f"Files changed in the run (git diff {_run_diff_range(run_dir)}): "
                 + (", ".join(diff_files) or "none recorded"),
                 f"Gates: {json.dumps(run['human_gates'])}",
                 f"Estado final: {run['status']} — el merge final es exclusivamente humano.",

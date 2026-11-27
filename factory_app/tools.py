@@ -178,9 +178,25 @@ def write_test_file(relative_path: str, content: str) -> dict:
 
 
 # --- Reviewer/Security: diff de solo lectura (curso §8: inspect_git_diff) ---
+def _active_diff_range() -> str:
+    """`<base_commit>...HEAD` del run cuya rama factory/<CR> esta activa; si no hay run
+    activo o no tiene base guardada, `main...HEAD`."""
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=REPO_ROOT, text=True, capture_output=True, check=False,
+    ).stdout.strip()
+    if head.startswith("factory/"):
+        state_path = REPO_ROOT / "runs" / head.split("/", 1)[1] / "factory-state.json"
+        if state_path.is_file():
+            base = json.loads(state_path.read_text(encoding="utf-8")).get("base_commit")
+            if base:
+                return f"{base}...HEAD"
+    return "main...HEAD"
+
+
 def inspect_git_diff(stat_only: bool = False) -> dict:
-    """Read-only: `git diff main...HEAD` de la rama del run. Sin argumentos libres."""
-    cmd = ["git", "diff", "main...HEAD"] + (["--stat"] if stat_only else [])
+    """Read-only: diff de la rama del run contra su base guardada. Sin argumentos libres."""
+    cmd = ["git", "diff", _active_diff_range()] + (["--stat"] if stat_only else [])
     completed = subprocess.run(
         cmd, cwd=REPO_ROOT, text=True, capture_output=True, timeout=60, check=False
     )

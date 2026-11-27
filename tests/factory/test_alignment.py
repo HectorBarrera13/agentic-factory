@@ -261,6 +261,29 @@ def test_inspect_git_diff_is_read_only_and_shows_branch_changes(tools_sandbox):
     assert "a.py" in tools.inspect_git_diff(stat_only=True)["diff"]
 
 
+@pytest.mark.skipif(shutil.which("git") is None, reason="git no disponible")
+def test_inspect_git_diff_uses_the_run_base_when_there_is_no_main(tools_sandbox):
+    def git(*args):
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", *args],
+            cwd=tools_sandbox, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-q", "-b", "trunk")  # sin rama main
+    (tools_sandbox / "a.py").write_text("x = 1\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-qb", "factory/CR-T")
+    (tools_sandbox / "a.py").write_text("x = 2\n")
+    git("commit", "-qam", "change")
+    run = tools_sandbox / "runs" / "CR-T"
+    run.mkdir(parents=True)
+    (run / "factory-state.json").write_text(json.dumps({"base_commit": base}))
+    out = tools.inspect_git_diff()
+    assert out["ok"] and "+x = 2" in out["diff"]
+
+
 # ---------------------------------------------------------------- #9 context engineering
 def test_select_context_picks_relevant_sections_and_writes_manifest(tools_sandbox):
     docs = tools_sandbox / "docs"

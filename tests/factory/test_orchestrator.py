@@ -401,3 +401,64 @@ def test_git_commit_and_diff_evidence_on_factory_branch(sandbox):
         [git, "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp, capture_output=True, text=True
     ).stdout.strip()
     assert head == "factory/CR-T"  # el commit de maquina jamas toca main
+
+
+def _sh(git: str, tmp: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(
+        [git, "-c", "user.name=t", "-c", "user.email=t@t", *args],
+        cwd=tmp, capture_output=True, text=True, check=True,
+    ).stdout.strip()
+
+
+def test_dirty_product_tree_blocks_the_coder(sandbox):
+    """Cambios humanos sin commitear en producto nunca se mezclan en el commit de maquina."""
+    run = sandbox()
+    tmp = run.parents[1]
+    git = _git_repo(tmp)
+    drive(run, FakeExecutor(), stop_at="plan")
+    approve(run, "plan")
+    (tmp / "campusflow" / "service.py").write_text("VALUE = 99  # trabajo humano\n")
+    with pytest.raises(Blocked, match="sin commitear"):
+        ORCH.advance("CR-T", FakeExecutor())
+    assert state(run)["status"] == "IMPLEMENT_PENDING"  # reanudable tras limpiar
+    assert not (run / "05-coder-report.md").exists()
+    assert _sh(git, tmp, "rev-parse", "--abbrev-ref", "HEAD") == "main"  # ni siquiera cambio
+
+
+class CoderAndAnalystWrite(FakeExecutor):
+    def __init__(self, root: Path):
+        super().__init__()
+        self.root = root
+        self.ctx: dict[str, dict] = {}
+
+    def run_agent(self, phase, context):
+        self.ctx[phase] = context
+        if phase == "implement":
+            (self.root / "campusflow" / "service.py").write_text("VALUE = 2\n")
+        if phase == "test_analysis":
+            (self.root / "tests" / "product" / "test_value.py").write_text(
+                "def test_value():\n    assert True\n"
+            )
+        return super().run_agent(phase, context)
+
+
+def test_diffs_use_the_saved_base_even_without_main(sandbox):
+    run = sandbox()
+    tmp = run.parents[1]
+    git = _git_repo(tmp)
+    _sh(git, tmp, "branch", "-m", "main", "develop")  # no existe main
+    base = _sh(git, tmp, "rev-parse", "HEAD")
+    ex = CoderAndAnalystWrite(tmp)
+    drive(run, ex, stop_at="review")
+    st = state(run)
+    assert st["base_commit"] == base and st["branch"] == "factory/CR-T"
+    assert "+VALUE = 2" in ex.ctx["review"]["git_diff"]
+    assert "+VALUE = 2" in ex.ctx["test_analysis"]["git_diff"]
+    changed = ORCH._git(["diff", "--name-only", ORCH._run_diff_range(run)]).stdout.split()
+    assert {"campusflow/service.py", "tests/product/test_value.py"} <= set(changed)
+    # los tests del Test Analyst quedan comiteados: el arbol vuelve a estar limpio
+    assert _sh(git, tmp, "status", "--porcelain", "--", "campusflow", "tests/product") == ""
+    assert "test_value.py" in _sh(git, tmp, "show", "--stat", "HEAD")
+    assert "## Git evidence" in (run / "06-test-analysis.md").read_text()
