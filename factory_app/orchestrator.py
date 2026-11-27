@@ -62,6 +62,9 @@ class TransientModelError(Exception):
 
 _TRANSIENT_MARKERS = (
     "429", "503", "resource_exhausted", "unavailable", "high demand", "rate limit",
+    # anthropic / litellm (OpenAI, Ollama, compatibles): RateLimitError, 529 overloaded,
+    # ServiceUnavailableError. Auth / modelo inexistente NO son transitorios.
+    "ratelimit", "529", "overloaded", "serviceunavailable",
 )
 
 
@@ -258,6 +261,8 @@ class ADKExecutor(AgentExecutor):
 
         # Instancia NUEVA por fase: sin padre, sin estado compartido con otras fases.
         agent = A.AGENT_FACTORIES[self.AGENT_FOR_PHASE[phase]]()
+        _record_model(context["change_id"], A.ROLE_OF[agent.name],
+                      A.model_settings(A.ROLE_OF[agent.name]))
         # Context engineering (§12): solo lo relevante, con manifiesto auditable en el run.
         context = {**context, "selected_context": select_context(context["change_id"])["text"]}
         prompt = self._prompt(phase, context)
@@ -395,6 +400,17 @@ def _update_state(run_dir: Path, **kw) -> dict:
     state.setdefault("transitions", []).append({"status": state["status"], "at": _now()})
     _state_path(run_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
     return state
+
+
+def _record_model(change_id: str, role: str, settings: dict) -> None:
+    """Evidencia: con que proveedor/modelo/temperatura corrio cada rol (sin transicion)."""
+    run_dir = project().run_dir(change_id)
+    path = _state_path(run_dir)
+    if not path.is_file():
+        return
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state.setdefault("models", {})[role] = settings
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def _read(path: Path) -> str:
@@ -1308,6 +1324,8 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
         "iterations": state.get("iterations", 0),
         "traceability_gaps": traceability_gaps(compute_traceability(run_dir)),
         "history": state.get("transitions", []),
+        # solo runs --adk: proveedor/modelo/temperatura pedida y efectiva por rol
+        **({"models": state["models"]} if state.get("models") else {}),
     }
 
 
@@ -1467,11 +1485,14 @@ if __name__ == "__main__":
         args = args[:i] + args[i + 2 :]
     mode = "adk" if "--adk" in args else "fake"
     args = [a for a in args if a != "--adk"]
-    if mode == "adk":  # las credenciales viven SOLO en .env (gitignoreado)
+    if mode == "adk":  # credenciales: .env (gitignoreado) o ~/.agentic-factory/credentials.json
         from dotenv import load_dotenv
+
+        from . import credentials
 
         load_dotenv(FACTORY_REPO / ".env")
         load_dotenv(project().root / ".env")
+        credentials.apply_to_env()
     ex: AgentExecutor = ADKExecutor() if mode == "adk" else FakeExecutor()
     try:
         st = advance(args[0], ex)

@@ -36,6 +36,12 @@ DEFAULT_GATE_ROLES: dict[str, list[str]] = {
     "release": ["release manager"],
 }
 
+# Catalogo cerrado de roles humanos que pueden firmar (perfiles y gates eligen de aqui).
+ROLE_CATALOG = ("product owner", "tech lead", "human reviewer", "reviewer", "release manager")
+# Proveedores de modelos (ver factory_app/providers.py).
+PROVIDER_IDS = ("gemini", "anthropic", "openai", "ollama", "openai_compatible")
+ProviderId = Literal["gemini", "anthropic", "openai", "ollama", "openai_compatible"]
+
 # Lo que ningun agente escribe en ningun proyecto (ademas de `code.never_write`).
 ALWAYS_NEVER_WRITE = (".git", ".factory", ".env")
 
@@ -160,14 +166,41 @@ class Git(BaseModel):
 
 
 class AgentSettings(BaseModel):
+    # None = hereda el valor por defecto de [agents]
+    provider: ProviderId | None = None
     model: str | None = None
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
+    @field_validator("model")
+    @classmethod
+    def _model_name(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None  # vacio = hereda
+        if any(c.isspace() for c in v.strip()):
+            raise ValueError("nombre de modelo con espacios")
+        return v.strip()
+
 
 class Agents(BaseModel):
+    provider: ProviderId = "gemini"
     model: str = "gemini-3.8-flash"
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     roles: dict[str, AgentSettings] = Field(default_factory=dict)
+
+    @field_validator("model")
+    @classmethod
+    def _model_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v or any(c.isspace() for c in v):
+            raise ValueError("nombre de modelo vacio o con espacios")
+        return v
+
+    @model_validator(mode="after")
+    def _override_needs_model(self) -> Agents:
+        for role, s in self.roles.items():
+            if s.provider and s.provider != self.provider and not s.model:
+                raise ValueError(f"el agente {role!r} cambia de proveedor: elige tambien su modelo")
+        return self
 
     @field_validator("roles")
     @classmethod
@@ -177,10 +210,30 @@ class Agents(BaseModel):
             raise ValueError(f"roles de agente desconocidos: {unknown}")
         return v
 
+    def provider_for(self, role: str) -> str:
+        return (self.roles.get(role) or AgentSettings()).provider or self.provider
+
     def model_for(self, role: str) -> str:
         override = (self.roles.get(role) or AgentSettings()).model
-        # FACTORY_MODEL (env) gana: cambiar de pool de cuota sin tocar el proyecto (§20)
-        return override or os.getenv("FACTORY_MODEL") or self.model
+        if override:
+            return override
+        # FACTORY_MODEL (env) cambia el pool de cuota de Gemini sin tocar el proyecto (§20);
+        # no aplica a otros proveedores (un nombre de Gemini no sirve ahi).
+        if self.provider_for(role) == "gemini" and os.getenv("FACTORY_MODEL"):
+            return os.environ["FACTORY_MODEL"]
+        return self.model
+
+    def provider_model_for(self, role: str) -> tuple[str, str]:
+        return self.provider_for(role), self.model_for(role)
+
+    def in_use(self) -> list[tuple[str, str]]:
+        """Pares (proveedor, modelo) distintos que usan los 7 agentes."""
+        seen: list[tuple[str, str]] = []
+        for role in ROLES:
+            pair = self.provider_model_for(role)
+            if pair not in seen:
+                seen.append(pair)
+        return seen
 
     def temperature_for(self, role: str) -> float:
         override = (self.roles.get(role) or AgentSettings()).temperature
@@ -203,9 +256,14 @@ class Gates(BaseModel):
         if unknown:
             raise ValueError(f"gates desconocidos: {unknown}")
         for gate, roles in merged.items():
-            cleaned = [r.strip().lower() for r in roles if r.strip()]
+            cleaned = list(dict.fromkeys(r.strip().lower() for r in roles if r.strip()))
             if not cleaned:
                 raise ValueError(f"el gate {gate!r} necesita al menos un rol firmante")
+            extra = [r for r in cleaned if r not in ROLE_CATALOG]
+            if extra:
+                raise ValueError(
+                    f"roles fuera del catalogo en {gate!r}: {extra} (validos: {list(ROLE_CATALOG)})"
+                )
             merged[gate] = cleaned
         return merged
 

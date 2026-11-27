@@ -15,11 +15,12 @@ Configuracion comun:
 """
 
 from google.adk.agents.llm_agent import LlmAgent
-from google.adk.models.google_llm import Gemini
 from google.genai import types
 
 from .audit import record_tool_call, record_tool_error
 from .context import project
+from .models import build_llm
+from .probe import temperature_supported
 from .prompts import (
     CODER_INSTRUCTION,
     EVIDENCE_INSTRUCTION,
@@ -30,6 +31,7 @@ from .prompts import (
     TEST_ANALYST_INSTRUCTION,
     render,
 )
+from .providers import effective_temperature
 from .tools import (
     inspect_git_diff,
     list_repo_files,
@@ -53,18 +55,30 @@ ROLE_OF = {
 }
 
 
-def _model(role: str) -> Gemini:
-    # attempts=1: sin reintentos internos de google-genai; el backoff del orquestador es
-    # el unico que reintenta (evita reintentos multiplicados y cuota gastada a ciegas).
-    return Gemini(
-        model=project().config.agents.model_for(role),
-        retry_options=types.HttpRetryOptions(attempts=1),
-    )
+def _model(role: str):
+    # Sin reintentos internos del SDK (genai attempts=1, anthropic/litellm 0): el backoff
+    # del orquestador es el unico que reintenta (evita reintentos multiplicados).
+    return build_llm(*project().config.agents.provider_model_for(role))
+
+
+def model_settings(role: str) -> dict:
+    """Proveedor, modelo y temperatura pedida/efectiva de un rol (va a la evidencia)."""
+    agents = project().config.agents
+    provider, model = agents.provider_model_for(role)
+    requested = agents.temperature_for(role)
+    effective = effective_temperature(
+        provider, requested, temperature_supported(provider, model))
+    return {"provider": provider, "model": model, "temperature_requested": requested,
+            "temperature_effective": effective}
 
 
 def _agent(name: str, description: str, instruction: str, tools: list, output_key: str):
     role = ROLE_OF[name]
-    temperature = project().config.agents.temperature_for(role)
+    temperature = model_settings(role)["temperature_effective"]
+    config = types.GenerateContentConfig(
+        # None = no se envia (el probe detecto que el modelo no acepta temperatura)
+        **({} if temperature is None else {"temperature": temperature})
+    )
     return LlmAgent(
         name=name,
         model=_model(role),
@@ -72,7 +86,7 @@ def _agent(name: str, description: str, instruction: str, tools: list, output_ke
         instruction=render(instruction, project()),
         tools=list(tools),
         output_key=output_key,
-        generate_content_config=types.GenerateContentConfig(temperature=temperature),
+        generate_content_config=config,
         # Auditoria: cada llamada a tool queda en runs/<CR>/tool-calls.jsonl.
         after_tool_callback=record_tool_call,
         on_tool_error_callback=record_tool_error,
@@ -162,10 +176,29 @@ AGENT_FACTORIES = {
 }
 
 # Solo introspeccion (contratos/permisos); el orquestador usa AGENT_FACTORIES.
-intake_agent = make_intake_agent()
-planner_agent = make_planner_agent()
-coder_agent = make_coder_agent()
-test_analyst_agent = make_test_analyst_agent()
-reviewer_agent = make_reviewer_agent()
-security_agent = make_security_agent()
-evidence_agent = make_evidence_agent()
+# Se construyen con el proyecto por defecto y, si su proveedor no esta configurado (sin
+# clave), con Gemini: importar este modulo nunca debe fallar por credenciales.
+def _introspection_project():
+    from .context import default_project
+    from .project import Project, ProjectConfig
+    from .roles import FactoryError
+
+    base = default_project()
+    try:
+        for role in ROLE_OF.values():
+            build_llm(*base.config.agents.provider_model_for(role))
+        return base
+    except FactoryError:
+        return Project(base.root, ProjectConfig.model_validate(
+            {**base.config.model_dump(), "agents": {}}))
+
+
+def _build_introspection():
+    from .context import use_project
+
+    with use_project(_introspection_project()):
+        return [factory() for factory in AGENT_FACTORIES.values()]
+
+
+(intake_agent, planner_agent, coder_agent, test_analyst_agent, reviewer_agent, security_agent,
+ evidence_agent) = _build_introspection()
