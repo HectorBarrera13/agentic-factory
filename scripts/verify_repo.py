@@ -7,7 +7,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 COMMANDS = [
     [sys.executable, "-m", "pytest", "-q"],
-    [sys.executable, "-m", "ruff", "check", "campusflow", "tests", "factory_app", "scripts"],
+    [
+        sys.executable, "-m", "ruff", "check",
+        "campusflow", "tests", "factory_app", "factory_ui", "scripts",
+    ],
 ]
 
 

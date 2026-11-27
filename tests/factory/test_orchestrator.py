@@ -1,7 +1,7 @@
 """Comportamiento del orquestador: gates bloqueantes, escalado, fix por ronda, evidencia.
 
-Sandbox: se monkeypatcha REPO_ROOT del orchestrador hacia un repo temporal; nunca se
-tocan runs/ reales. No requiere API key (FakeExecutor).
+Sandbox: el proyecto activo de la fabrica pasa a ser un repo temporal (misma config
+que este repo); nunca se tocan runs/ reales. No requiere API key (FakeExecutor).
 """
 
 from __future__ import annotations
@@ -13,7 +13,9 @@ from pathlib import Path
 import pytest
 
 from factory_app import orchestrator as ORCH
+from factory_app.context import project
 from factory_app.orchestrator import AwaitingHuman, Blocked, FakeExecutor
+from tests.factory.conftest import activate_project
 
 STARTER_STATE = {
     "change_id": "CR-T",
@@ -38,7 +40,7 @@ CR_AMBIGUOUS = (
 
 @pytest.fixture()
 def sandbox(tmp_path, monkeypatch):
-    monkeypatch.setattr(ORCH, "REPO_ROOT", tmp_path)
+    activate_project(tmp_path, monkeypatch)
 
     def make(change_id: str = "CR-T", cr_text: str = CR_CLEAN) -> Path:
         run = tmp_path / "runs" / change_id
@@ -349,16 +351,23 @@ def test_rejected_gate_escalates(sandbox):
 
 
 # ---------------------------------------------------------------- Git evidence
-class CoderWrites(FakeExecutor):
-    """Coder simulado: escribe producto durante la fase implement (como el real)."""
+def work(rel: str, change_id: str = "CR-T") -> Path:
+    """Ruta dentro del worktree del run (donde escriben los agentes, que crean carpetas)."""
+    path = project().work_root(change_id) / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
-    def __init__(self, path: Path, content: str, **kw):
+
+class CoderWrites(FakeExecutor):
+    """Coder simulado: escribe producto en el worktree del run durante implement."""
+
+    def __init__(self, rel: str, content: str, **kw):
         super().__init__(**kw)
-        self.path, self.content = path, content
+        self.rel, self.content = rel, content
 
     def run_agent(self, phase, context):
         if phase == "implement":
-            self.path.write_text(self.content)
+            work(self.rel, context["change_id"]).write_text(self.content)
         return super().run_agent(phase, context)
 
 
@@ -372,7 +381,7 @@ def _git_repo(tmp: Path) -> str:
     (tmp / "campusflow").mkdir(exist_ok=True)
     (tmp / "tests" / "product").mkdir(parents=True, exist_ok=True)
     (tmp / "campusflow" / "service.py").write_text("VALUE = 1\n")
-    (tmp / ".gitignore").write_text("runs/\n")
+    (tmp / ".gitignore").write_text("runs/\n.factory/\n")
     subprocess.run([git, "init", "-q", "-b", "main", str(tmp)], check=True)
     subprocess.run([git, "add", "-A"], cwd=tmp, check=True)
     subprocess.run(
@@ -384,23 +393,24 @@ def _git_repo(tmp: Path) -> str:
 
 
 def test_git_commit_and_diff_evidence_on_factory_branch(sandbox):
-    """En repo git real, el implement cierra commit en factory/<CR>, nunca en main."""
-    import subprocess
-
+    """En repo git real, el implement cierra commit en factory/<CR> (en su worktree),
+    nunca en main ni en el arbol del usuario."""
     run = sandbox()
     tmp = run.parents[1]
     git = _git_repo(tmp)
-    ex = CoderWrites(tmp / "campusflow" / "service.py", "VALUE = 2\n")
+    ex = CoderWrites("campusflow/service.py", "VALUE = 2\n")
     exc = drive(run, ex, stop_at="review")  # se detiene sola en el gate de review
     assert exc.gate == "review"
 
     st = state(run)
     assert "## Git evidence" in (run / "05-coder-report.md").read_text()
-    assert st["last_commit"]
-    head = subprocess.run(
-        [git, "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp, capture_output=True, text=True
-    ).stdout.strip()
-    assert head == "factory/CR-T"  # el commit de maquina jamas toca main
+    assert st["last_commit"] and st["worktree"] == ".factory/worktrees/CR-T"
+    wt = tmp / st["worktree"]
+    assert _sh(git, wt, "rev-parse", "--abbrev-ref", "HEAD") == "factory/CR-T"
+    # el arbol del usuario sigue en main y sin el cambio de la maquina
+    assert _sh(git, tmp, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert (tmp / "campusflow" / "service.py").read_text() == "VALUE = 1\n"
+    assert _sh(git, tmp, "show", "factory/CR-T:campusflow/service.py") == "VALUE = 2"
 
 
 def _sh(git: str, tmp: Path, *args: str) -> str:
@@ -412,35 +422,47 @@ def _sh(git: str, tmp: Path, *args: str) -> str:
     ).stdout.strip()
 
 
-def test_dirty_product_tree_blocks_the_coder(sandbox):
-    """Cambios humanos sin commitear en producto nunca se mezclan en el commit de maquina."""
+def test_user_edits_in_their_tree_never_reach_the_run(sandbox):
+    """El humano sigue editando su rama mientras corre el run: su trabajo no se mezcla en
+    el commit de maquina ni se pierde (el run trabaja en su propio worktree)."""
     run = sandbox()
     tmp = run.parents[1]
     git = _git_repo(tmp)
-    drive(run, FakeExecutor(), stop_at="plan")
-    approve(run, "plan")
     (tmp / "campusflow" / "service.py").write_text("VALUE = 99  # trabajo humano\n")
+    drive(run, CoderWrites("campusflow/service.py", "VALUE = 2\n"), stop_at="review")
+    assert (tmp / "campusflow" / "service.py").read_text() == "VALUE = 99  # trabajo humano\n"
+    assert _sh(git, tmp, "rev-parse", "--abbrev-ref", "HEAD") == "main"
+    assert _sh(git, tmp, "show", "factory/CR-T:campusflow/service.py") == "VALUE = 2"
+
+
+def test_dirty_run_worktree_blocks_the_coder(sandbox):
+    """Cambios sin commitear EN EL WORKTREE del run nunca se mezclan en el commit de maquina."""
+    run = sandbox()
+    tmp = run.parents[1]
+    _git_repo(tmp)
+    drive(run, FakeExecutor(), stop_at="review")  # rama + worktree creados, implement hecho
+    # otra ronda de implementacion (fix) con el worktree sucio a mano
+    ORCH._update_state(
+        run, status="IMPLEMENT_PENDING", awaiting_gate="", fix_reason="verification FAIL"
+    )
+    work("campusflow/service.py").write_text("VALUE = 99  # edicion a mano en el worktree\n")
     with pytest.raises(Blocked, match="sin commitear"):
         ORCH.advance("CR-T", FakeExecutor())
     assert state(run)["status"] == "IMPLEMENT_PENDING"  # reanudable tras limpiar
-    assert not (run / "05-coder-report.md").exists()
-    assert _sh(git, tmp, "rev-parse", "--abbrev-ref", "HEAD") == "main"  # ni siquiera cambio
+    assert not (run / "11-fix-report.md").exists()
 
 
 class CoderAndAnalystWrite(FakeExecutor):
-    def __init__(self, root: Path):
+    def __init__(self):
         super().__init__()
-        self.root = root
         self.ctx: dict[str, dict] = {}
 
     def run_agent(self, phase, context):
         self.ctx[phase] = context
         if phase == "implement":
-            (self.root / "campusflow" / "service.py").write_text("VALUE = 2\n")
+            work("campusflow/service.py").write_text("VALUE = 2\n")
         if phase == "test_analysis":
-            (self.root / "tests" / "product" / "test_value.py").write_text(
-                "def test_value():\n    assert True\n"
-            )
+            work("tests/product/test_value.py").write_text("def test_value():\n    assert True\n")
         return super().run_agent(phase, context)
 
 
@@ -450,7 +472,7 @@ def test_diffs_use_the_saved_base_even_without_main(sandbox):
     git = _git_repo(tmp)
     _sh(git, tmp, "branch", "-m", "main", "develop")  # no existe main
     base = _sh(git, tmp, "rev-parse", "HEAD")
-    ex = CoderAndAnalystWrite(tmp)
+    ex = CoderAndAnalystWrite()
     drive(run, ex, stop_at="review")
     st = state(run)
     assert st["base_commit"] == base and st["branch"] == "factory/CR-T"
@@ -458,7 +480,8 @@ def test_diffs_use_the_saved_base_even_without_main(sandbox):
     assert "+VALUE = 2" in ex.ctx["test_analysis"]["git_diff"]
     changed = ORCH._git(["diff", "--name-only", ORCH._run_diff_range(run)]).stdout.split()
     assert {"campusflow/service.py", "tests/product/test_value.py"} <= set(changed)
-    # los tests del Test Analyst quedan comiteados: el arbol vuelve a estar limpio
-    assert _sh(git, tmp, "status", "--porcelain", "--", "campusflow", "tests/product") == ""
-    assert "test_value.py" in _sh(git, tmp, "show", "--stat", "HEAD")
+    # los tests del Test Analyst quedan comiteados: el worktree vuelve a estar limpio
+    wt = work("")
+    assert _sh(git, wt, "status", "--porcelain", "--", "campusflow", "tests/product") == ""
+    assert "test_value.py" in _sh(git, wt, "show", "--stat", "HEAD")
     assert "## Git evidence" in (run / "06-test-analysis.md").read_text()

@@ -48,7 +48,7 @@ CODER_INSTRUCTION = (
     + """
 ROLE: Coder Agent.
 Implement only a human-approved plan or human-accepted findings.
-You have write_product_file: campusflow/ and tests/ ONLY. Requests to write docs,
+You have write_product_file: <WRITABLE_AREAS> ONLY. Requests to write docs,
 requirements, factory code, evidence or configuration are denied by the runtime;
 do not attempt them. Never delete or weaken tests to force PASS.
 Add deterministic tests for every AC you implement. Report files changed.
@@ -62,7 +62,7 @@ TEST_ANALYST_INSTRUCTION = (
 ROLE: Test Analyst Agent.
 Inspect the Change Request, requirements, diff and tests. Identify missing
 negative/boundary/regression cases and tests that may mask defects.
-You may add authorized tests ONLY with write_test_file (tests/product/test_*.py);
+You may add authorized tests ONLY with write_test_file (<TEST_AREA>);
 never application code, requirements, docs or existing-test weakening. Cite the
 AC each test covers in its name or docstring (traceability). You do NOT determine
 PASS: never claim tests passed without deterministic verification evidence.
@@ -111,3 +111,18 @@ remaining risk and a READY/NOT READY recommendation for human release review.
 You do not make the final release decision.
 """
 )
+
+
+_TEST_NAMES = {
+    "python": "test_*.py",
+    "javascript": "*.test.js / *.spec.js",
+    "typescript": "*.test.ts / *.spec.ts",
+}
+
+
+def render(instruction: str, project) -> str:
+    """Instruccion con las areas reales del proyecto (sin llaves: ADK interpreta `{var}`)."""
+    code = project.config.code
+    writable = ", ".join(f"{a}/" for a in code.writable)
+    test_area = f"{code.tests}/{_TEST_NAMES.get(code.language, '*')}"
+    return instruction.replace("<WRITABLE_AREAS>", writable).replace("<TEST_AREA>", test_area)

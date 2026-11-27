@@ -1,4 +1,4 @@
-"""Auditoria de tools ADK: cada llamada de un agente queda en runs/<CR>/tool-calls.jsonl.
+"""Auditoria de tools ADK: cada llamada de un agente queda en <runs>/<CR>/tool-calls.jsonl.
 
 Los callbacks leen `change_id` y `phase` del estado de la sesion (los pone ADKExecutor al
 crearla). Sin `change_id` valido no se escribe nada. Los callbacks nunca alteran la
@@ -11,7 +11,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from .tools import REPO_ROOT
+from .context import project
 
 AUDIT_FILE = "tool-calls.jsonl"
 ARG_CAP = 300  # el contenido completo ya queda en el diff/artefactos; aqui solo la traza
@@ -24,10 +24,10 @@ def _short(value: Any) -> Any:
 
 
 def _append(tool_context, entry: dict) -> None:
-    change_id = str(tool_context.state.get("change_id") or "")
-    if not change_id.startswith("CR-") or "/" in change_id or "\\" in change_id:
+    try:
+        folder = project().run_dir(str(tool_context.state.get("change_id") or ""))
+    except ValueError:  # sin run valido (sesion de playground, id raro): no se escribe nada
         return
-    folder = REPO_ROOT / "runs" / change_id
     folder.mkdir(parents=True, exist_ok=True)
     line = {
         "ts": datetime.now(timezone.utc).isoformat(timespec="microseconds"),

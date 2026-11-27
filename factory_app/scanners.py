@@ -49,8 +49,9 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> dict:
         }
 
 
-def semgrep_scan(root: Path) -> dict:
-    r = _run(["semgrep", "scan", "--config", "auto", "--json", "campusflow"], root, timeout=420)
+def semgrep_scan(root: Path, targets: list[str] | None = None) -> dict:
+    targets = [t for t in (targets or ["."]) if (root / t).exists()] or ["."]
+    r = _run(["semgrep", "scan", "--config", "auto", "--json", *targets], root, timeout=420)
     if r["status"] != "OK":
         return {"scanner": "semgrep", **{k: r[k] for k in ("status", "stderr")}, "findings": []}
     findings = []
@@ -76,12 +77,13 @@ def semgrep_scan(root: Path) -> dict:
 
 
 def pip_audit_scan(root: Path) -> dict:
-    req = root / "requirements.txt"
-    target = (
-        ["pip-audit", "--format", "json", "-r", "requirements.txt"]
-        if req.is_file()
-        else ["pip-audit", "--format", "json"]
-    )
+    # Solo dependencias DECLARADAS del proyecto; nunca el entorno de la fabrica.
+    if (root / "requirements.txt").is_file():
+        target = ["pip-audit", "--format", "json", "-r", "requirements.txt"]
+    elif (root / "pyproject.toml").is_file():
+        target = ["pip-audit", "--format", "json", "."]
+    else:
+        return {"scanner": "pip-audit", "status": "NOT_APPLICABLE", "findings": []}
     r = _run(target, root)
     if r["status"] != "OK":
         return {"scanner": "pip-audit", "status": r["status"], "findings": []}
@@ -116,7 +118,7 @@ def secret_scan(root: Path) -> dict:
             if (
                 f.is_file()
                 and f.suffix in {".py", ".md", ".json", ".yaml", ".yml", ".toml", ".txt"}
-                and ".venv" not in f.parts
+                and not ({".venv", "node_modules", ".git", ".factory"} & set(f.parts))
             ):
                 try:
                     for i, line in enumerate(
@@ -160,10 +162,10 @@ def _parse_error(scanner: str, r: dict) -> dict:
     }
 
 
-def run_security_scans(root: Path) -> dict:
-    scans = [semgrep_scan(root), pip_audit_scan(root), secret_scan(root)]
+def run_security_scans(root: Path, targets: list[str] | None = None) -> dict:
+    scans = [semgrep_scan(root, targets), pip_audit_scan(root), secret_scan(root)]
     high = [f for scan in scans for f in scan.get("findings", []) if f.get("severity") == "HIGH"]
     for i, finding in enumerate(high, 1):  # id clasificable por el Human Reviewer
         finding["id"] = f"SEC-SCAN-{i:02d}"
-    degraded = [scan["scanner"] for scan in scans if scan["status"] != "OK"]
+    degraded = [scan["scanner"] for scan in scans if scan["status"] not in {"OK", "NOT_APPLICABLE"}]
     return {"scans": scans, "high": len(high), "blocked": bool(high), "degraded_scanners": degraded}

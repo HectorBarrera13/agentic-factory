@@ -1,31 +1,26 @@
-"""Los tests de la fabrica no dependen de que semgrep/pip-audit/detect-secrets esten
-instalados ni de la red: por defecto los escaneres externos se ven como TOOL_MISSING
-(semgrep --config auto descarga reglas en cada review y multiplicaba x6 la duracion de la
-suite, rompiendo el timeout de la verificacion de la propia fabrica).
-
-Los tests de escaneres que necesitan el `_run` real se marcan con `real_scanner_run`.
-"""
+"""Sandbox de proyecto para los tests de la fabrica (los escaneres externos se stubean en
+tests/conftest.py para toda la suite)."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from factory_app import scanners
+from factory_app import context
+from factory_app.project import Project, ProjectConfig, load_project
+
+# Misma configuracion que este repo (CampusFlow): campusflow/ + tests/product, runs/ ...
+REPO_CONFIG: ProjectConfig = load_project(context.FACTORY_REPO).config
 
 
-def pytest_configure(config):
-    config.addinivalue_line("markers", "real_scanner_run: usa scanners._run real")
+def activate_project(root: Path, monkeypatch, config: ProjectConfig | None = None) -> Project:
+    """El proyecto activo de la fabrica pasa a ser `root` (sandbox temporal)."""
+    project = Project(root, config or REPO_CONFIG)
+    monkeypatch.setattr(context, "_default", project)
+    return project
 
 
-@pytest.fixture(autouse=True)
-def _no_external_scanners(request, monkeypatch):
-    if request.node.get_closest_marker("real_scanner_run"):
-        return
-    monkeypatch.setattr(
-        scanners,
-        "_run",
-        lambda cmd, cwd, timeout=300: {
-            "tool": cmd[0], "status": "TOOL_MISSING", "returncode": None,
-            "stdout": "", "stderr": "",
-        },
-    )
+@pytest.fixture()
+def project_at(monkeypatch):
+    return lambda root, config=None: activate_project(root, monkeypatch, config)

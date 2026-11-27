@@ -13,6 +13,7 @@ import pytest
 from factory_app import orchestrator as ORCH
 from factory_app import tools
 from factory_app.orchestrator import FakeExecutor
+from tests.factory.conftest import activate_project
 from tests.factory.test_orchestrator import (
     drive,
     sandbox,  # noqa: F401  (fixture)
@@ -113,7 +114,7 @@ def test_decide_findings_rejects_unknown_ids(review_run):
 # ---------------------------------------------------------------- tools
 @pytest.fixture()
 def tools_root(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "REPO_ROOT", tmp_path)
+    activate_project(tmp_path, monkeypatch)
     return tmp_path
 
 
@@ -151,7 +152,7 @@ def test_list_repo_files_skips_pycache(tools_root):
     (tools_root / "tests" / "__pycache__").mkdir(parents=True)
     (tools_root / "tests" / "__pycache__" / "x.pyc").write_bytes(b"\x00")
     (tools_root / "tests" / "test_a.py").write_text("x = 1\n")
-    assert tools.list_repo_files("tests")["files"] == [str(Path("tests") / "test_a.py")]
+    assert tools.list_repo_files("tests")["files"] == ["tests/test_a.py"]
 
 
 # ---------------------------------------------------------------- start_run / export
@@ -159,9 +160,7 @@ def test_start_run_state_has_the_engine_shape(tmp_path, monkeypatch):
     mod = _script("start_run")
     (tmp_path / "change_requests").mkdir()
     (tmp_path / "change_requests" / "CR-T-x.md").write_text("# CR-T\n")
-    monkeypatch.setattr(mod, "ROOT", tmp_path)
-    monkeypatch.setattr(mod, "CR_DIR", tmp_path / "change_requests")
-    monkeypatch.setattr(mod, "RUNS", tmp_path / "runs")
+    activate_project(tmp_path, monkeypatch)
     monkeypatch.setattr(sys, "argv", ["start_run.py", "CR-T"])
     mod.main()
     st = json.loads((tmp_path / "runs" / "CR-T" / "factory-state.json").read_text())
@@ -183,7 +182,6 @@ def test_escalated_run_can_be_exported(sandbox, monkeypatch):  # noqa: F811
     assert state(run)["status"] == "ESCALATED"
     mod = _script("export_evidence")
     root = run.parents[1]
-    monkeypatch.setattr(mod, "ROOT", root)
     monkeypatch.setattr(sys, "argv", ["export_evidence.py", "CR-T"])
     mod.main()
     exported = {p.name for p in (root / "evidence" / "CR-T").iterdir()}

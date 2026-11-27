@@ -18,7 +18,9 @@ from google.adk.runners import InMemoryRunner  # noqa: E402
 from google.genai import types  # noqa: E402
 
 from factory_app import agents, audit, tools, workflows  # noqa: E402
+from factory_app.context import project  # noqa: E402
 from factory_app.orchestrator import ADKExecutor, final_text  # noqa: E402
+from tests.factory.conftest import activate_project  # noqa: E402
 
 
 class FakeLlm(BaseLlm):
@@ -57,7 +59,9 @@ def fake_model(monkeypatch, tmp_path):
         return agent
 
     monkeypatch.setattr(agents, "_agent", with_fake)  # las fabricas lo resuelven al llamar
-    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    activate_project(tmp_path, monkeypatch)
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "SPEC.md").write_text("# Spec\n", encoding="utf-8")
     closed = {"n": 0}
     real_close = InMemoryRunner.close
 
@@ -86,7 +90,7 @@ def test_executor_keeps_the_whole_report_and_closes_the_runner(fake_model):
     assert "razonamiento interno" not in out["report"]
     assert out["recommendation"] == "PROCEED"
     assert closed["n"] == 1
-    assert llm.requests[0].config.temperature == agents.TEMPERATURE
+    assert llm.requests[0].config.temperature == project().config.agents.temperature
 
 
 def test_tool_calls_are_audited_per_run(fake_model):
@@ -100,7 +104,7 @@ def test_tool_calls_are_audited_per_run(fake_model):
 
 
 def test_audit_truncates_long_args_and_ignores_sessions_without_run(tmp_path, monkeypatch):
-    monkeypatch.setattr(audit, "REPO_ROOT", tmp_path)
+    activate_project(tmp_path, monkeypatch)
 
     class Ctx:
         agent_name = "CoderAgent"
@@ -132,7 +136,7 @@ def test_each_phase_gets_a_fresh_parentless_agent():
 def test_agents_use_low_temperature_and_no_internal_retries():
     for factory in agents.AGENT_FACTORIES.values():
         agent = factory()
-        assert agent.generate_content_config.temperature == agents.TEMPERATURE
+        assert agent.generate_content_config.temperature == project().config.agents.temperature
         assert agent.model.retry_options.attempts == 1  # solo reintenta el orquestador
         assert agent.after_tool_callback is audit.record_tool_call
 

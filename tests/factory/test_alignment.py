@@ -16,6 +16,7 @@ import pytest
 from factory_app import orchestrator as ORCH
 from factory_app import tools
 from factory_app.orchestrator import AwaitingHuman, FakeExecutor
+from tests.factory.conftest import activate_project
 from tests.factory.test_orchestrator import (
     CR_AMBIGUOUS,
     approve,
@@ -222,7 +223,7 @@ def test_traceability_links_only_what_evidence_supports(sandbox, monkeypatch):  
 # ---------------------------------------------------------------- tools acotadas
 @pytest.fixture()
 def tools_sandbox(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "REPO_ROOT", tmp_path)
+    activate_project(tmp_path, monkeypatch)
     return tmp_path
 
 
