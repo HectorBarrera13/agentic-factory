@@ -10,5 +10,8 @@ runs/*
 # worktrees de cada run de la fabrica (Factory Studio / orquestador)
 .factory/worktrees/
 .factory/runs/
+# build del frontend (se genera con `npm run build` en ui/)
+factory_ui/static/
+ui/node_modules/
 *.db
 .DS_Store
