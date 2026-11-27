@@ -271,3 +271,120 @@ def test_events_stream_reports_changes(client):
     with client.stream("GET", "/api/events?max_events=1") as r:
         body = "".join(r.iter_text())
     assert "event: change" in body and '"version"' in body
+    assert '"probes"' in body
+
+
+# ---------------------------------------------------------------- roles del catalogo
+def test_profiles_only_accept_catalog_roles(client):
+    r = client.post("/api/profiles", json={"name": "Ana", "roles": ["CTO"]})
+    assert r.status_code == 422
+    meta = client.get("/api/meta").json()
+    assert meta["role_catalog"] == ["product owner", "tech lead", "human reviewer", "reviewer",
+                                    "release manager"]
+    assert {p["id"] for p in meta["providers"]} == {"gemini", "anthropic", "openai", "ollama",
+                                                    "openai_compatible"}
+
+
+def test_old_profiles_with_unknown_roles_load_as_incomplete(client, tmp_path):
+    import json as _json
+
+    (tmp_path / "home").mkdir(exist_ok=True)
+    (tmp_path / "home" / "profiles.json").write_text(_json.dumps([
+        {"id": "p1", "name": "Ana", "roles": ["CTO", "Tech Lead"]}]))
+    items = client.get("/api/profiles").json()["items"]
+    assert items == [{"id": "p1", "name": "Ana", "roles": ["tech lead"], "incomplete": True}]
+
+
+# ---------------------------------------------------------------- proveedores
+@pytest.fixture()
+def mock_http():
+    import httpx
+
+    from factory_app import providers
+
+    def install(handler):
+        providers.transport = httpx.MockTransport(handler)
+
+    yield install
+    providers.transport = None
+
+
+def test_providers_never_return_the_key(client, mock_http, monkeypatch):
+    import httpx
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    mock_http(lambda r: httpx.Response(200, json={"data": [{"id": "gpt-4.1"}]}))
+    r = client.put("/api/providers/openai", json={"api_key": "sk-test-SECRET1234"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["test"] == {"ok": True, "kind": "OK", "message": "1 modelos", "models": 1}
+    assert body["status"]["last4"] == "1234" and body["status"]["key_source"] == "file"
+    listing = client.get("/api/providers").text
+    assert "SECRET" not in listing and "SECRET" not in r.text
+    models = client.get("/api/providers/openai/models").json()
+    assert models == {"items": [{"id": "gpt-4.1", "label": "gpt-4.1", "created": None}],
+                      "error": None}
+    assert client.delete("/api/providers/openai/key").json()["status"]["has_key"] is False
+
+
+def test_invalid_key_is_reported_and_models_endpoint_does_not_crash(client, mock_http,
+                                                                     monkeypatch):
+    import httpx
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    mock_http(lambda r: httpx.Response(401, json={"error": "bad"}))
+    body = client.put("/api/providers/anthropic", json={"api_key": "sk-ant-wrong000"}).json()
+    assert body["test"]["ok"] is False and body["test"]["kind"] == "INVALID_KEY"
+    models = client.get("/api/providers/anthropic/models?refresh=true").json()
+    assert models["items"] == [] and models["error"]["kind"] == "INVALID_KEY"
+
+
+def test_env_keys_are_read_only_from_the_ui(client, monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "AIzaFROMENV12345")
+    gem = next(p for p in client.get("/api/providers").json()["items"] if p["id"] == "gemini")
+    assert gem["status"]["key_source"] == "env" and "FROMENV" not in str(gem)
+    r = client.delete("/api/providers/gemini/key")
+    assert r.status_code == 400 and "variable de entorno" in r.json()["error"]
+    r = client.put("/api/providers/gemini", json={"api_key": "AIzaOTHER0000"})
+    assert r.status_code == 400
+
+
+def test_bad_urls_and_unknown_providers_are_rejected(client):
+    assert client.put("/api/providers/ollama", json={"url": "ftp://x"}).status_code == 400
+    assert client.post("/api/providers/mistral/test").status_code == 400
+
+
+def test_probe_endpoint_and_probes_listing(client, monkeypatch):
+    from google.adk.models.base_llm import BaseLlm
+    from google.adk.models.llm_response import LlmResponse
+    from google.genai import types
+
+    from factory_app import models
+
+    class ToolLlm(BaseLlm):
+        model: str = "stub"
+
+        async def generate_content_async(self, llm_request, stream=False):  # noqa: ARG002
+            call = types.FunctionCall(name="ping", args={})
+            yield LlmResponse(content=types.Content(role="model",
+                                                    parts=[types.Part(function_call=call)]))
+
+    monkeypatch.setattr(models, "build_llm", lambda p, m: ToolLlm())
+    r = client.post("/api/models/probe", json={"provider": "ollama", "model": "llama3"})
+    assert r.status_code == 200 and r.json()["status"] == "OK"
+    listing = client.get("/api/models/probes").json()
+    assert listing["items"]["ollama:llama3"]["status"] == "OK" and listing["running"] == []
+
+
+def test_saving_config_probes_the_models_in_use(client, monkeypatch):
+    from factory_app import probe
+
+    launched = []
+    monkeypatch.setattr(probe, "probe_in_background",
+                        lambda pairs, max_age=3600: launched.append(pairs) or [])
+    cfg = client.get("/api/config").json()["config"]
+    cfg["agents"] = {"provider": "ollama", "model": "llama3", "temperature": 0.2,
+                     "roles": {"reviewer": {"provider": "openai", "model": "gpt-4.1"}}}
+    r = client.put("/api/config", json=cfg)
+    assert r.status_code == 200, r.text
+    assert launched == [[("ollama", "llama3"), ("openai", "gpt-4.1")]]

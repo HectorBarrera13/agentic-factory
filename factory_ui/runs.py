@@ -61,6 +61,9 @@ class RunManager:
                 load_dotenv(FACTORY_REPO / ".env")
             except ImportError:  # pragma: no cover
                 pass
+            from factory_app import credentials
+
+            credentials.apply_to_env()  # claves guardadas desde la UI (el entorno real gana)
             return ORCH.ADKExecutor()
         raise FactoryError(f"modo desconocido: {mode!r} (fake | adk)")
 

@@ -25,11 +25,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
-from factory_app import services
+from factory_app import credentials, providers, services
+from factory_app import probe as probe_mod
 from factory_app.orchestrator import remove_worktree
 from factory_app.project import (
     GATES,
     LANGUAGES,
+    ROLE_CATALOG,
     ROLES,
     VERIFY_KINDS,
     Project,
@@ -129,6 +131,39 @@ class ProfileBody(BaseModel):
     roles: list[str]
 
 
+class ProviderBody(BaseModel):
+    api_key: str | None = None
+    url: str | None = None
+
+
+class ProbeBody(BaseModel):
+    provider: str
+    model: str
+
+
+def _provider_list() -> list[dict]:
+    """Catalogo + estado de cada proveedor. Nunca incluye la clave."""
+    out = []
+    for pid, info in providers.PROVIDERS.items():
+        out.append({
+            "id": pid,
+            "label": info.label,
+            "description": info.description,
+            "needs_key": info.needs_key,
+            "needs_url": info.needs_url,
+            "key_optional": not info.needs_key and bool(credentials.ENV_VARS[pid][0]),
+            "temperature_range": list(info.temperature_range),
+            "default_url": credentials.DEFAULT_URLS.get(pid),
+            "status": credentials.status(pid),
+        })
+    return out
+
+
+def _probes() -> dict:
+    return {"items": probe_mod.results(), "running": sorted(probe_mod.running),
+            "version": probe_mod.version}
+
+
 def _project_info(session: Session) -> dict | None:
     p = session.project
     if p is None:
@@ -146,6 +181,7 @@ def _signature(session: Session, profile_id: str, role: str) -> str:
     profile = session.store.profile(profile_id)
     if profile is None:
         raise FactoryError("Perfil no encontrado: crea o elige un perfil para firmar")
+    role = role.strip().lower()
     if role not in profile.roles:
         raise FactoryError(f"El perfil {profile.name} no tiene el rol {role!r}")
     return profile.signature(role)
@@ -207,6 +243,12 @@ def create_app(
             "gate_keys": list(GATES),
             "verify_kinds": list(VERIFY_KINDS),
             "languages": list(LANGUAGES),
+            "role_catalog": list(ROLE_CATALOG),
+            "providers": [
+                {"id": pid, "label": info.label,
+                 "temperature_range": list(info.temperature_range)}
+                for pid, info in providers.PROVIDERS.items()
+            ],
             "defaults": ProjectConfig().model_dump(),
         }
 
@@ -231,7 +273,52 @@ def create_app(
         p = session.require()
         config = ProjectConfig.model_validate(data)
         save_config(p, config)
+        # probe automatico de los modelos en uso (sin bloquear el guardado)
+        probe_mod.probe_in_background(config.agents.in_use())
         return _project_info(session)
+
+    # ------------------------------------------------------------ proveedores / modelos
+    @app.get("/api/providers")
+    def list_providers():
+        return {"items": _provider_list()}
+
+    @app.put("/api/providers/{provider_id}")
+    def save_provider(provider_id: str, body: ProviderBody):
+        providers.info(provider_id)
+        credentials.save(provider_id, api_key=body.api_key, url=body.url)
+        providers.clear_cache(provider_id)
+        return {"status": credentials.status(provider_id),
+                "test": providers.test_connection(provider_id)}
+
+    @app.delete("/api/providers/{provider_id}/key")
+    def delete_provider_key(provider_id: str):
+        providers.info(provider_id)
+        status = credentials.delete_key(provider_id)
+        providers.clear_cache(provider_id)
+        return {"status": status}
+
+    @app.post("/api/providers/{provider_id}/test")
+    def test_provider(provider_id: str):
+        return providers.test_connection(provider_id)
+
+    @app.get("/api/providers/{provider_id}/models")
+    def provider_models(provider_id: str, refresh: bool = False):
+        try:
+            return {"items": providers.list_models(provider_id, refresh=refresh), "error": None}
+        except providers.ConnectionProblem as exc:
+            return {"items": [], "error": {"kind": exc.kind, "message": str(exc)}}
+
+    @app.get("/api/models/probes")
+    def model_probes():
+        return _probes()
+
+    @app.post("/api/models/probe")
+    async def run_probe(body: ProbeBody):
+        providers.info(body.provider)
+        if not body.model.strip():
+            raise FactoryError("falta el modelo")
+        # en un hilo: el probe usa asyncio.run y puede tardar
+        return await asyncio.to_thread(probe_mod.probe, body.provider, body.model.strip())
 
     # ------------------------------------------------------------ archivos / git
     @app.get("/api/files/tree")
@@ -367,7 +454,8 @@ def create_app(
             while True:
                 if await request.is_disconnected():
                     break
-                snap = runs_mod.snapshot(session.project, session.runs)
+                snap = {**runs_mod.snapshot(session.project, session.runs),
+                        "probes": probe_mod.version}
                 if snap != last:
                     last = snap
                     sent += 1
