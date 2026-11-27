@@ -38,9 +38,10 @@ def main() -> None:
             "review": "PENDING",
             "release": "PENDING",
         },
-        "verification": "NOT_RUN",
-        "review": "NOT_RUN",
-        "security": "NOT_RUN",
+        # mismo shape que escribe el motor (factory-run.json nunca mezcla str y dict)
+        "verification": {"status": "NOT_RUN", "tests": 0, "failed": 0, "lint": "NOT_RUN"},
+        "review": {"status": "NOT_RUN", "must_fix": 0, "should_fix": 0},
+        "security": {"status": "NOT_RUN", "high": 0, "medium": 0},
         "iterations": 0,
     }
     (run / "factory-state.json").write_text(json.dumps(state, indent=2), encoding="utf-8")

@@ -36,7 +36,7 @@ def list_repo_files(prefix: str = "") -> dict:
         rel = path.relative_to(REPO_ROOT)
         if not prefix and rel.parts[0] not in READABLE_ROOTS:
             continue
-        if any(part.startswith(".") for part in rel.parts):
+        if any(part.startswith(".") or part == "__pycache__" for part in rel.parts):
             continue
         items.append(str(rel))
     return {"ok": True, "files": items[:250]}
@@ -52,7 +52,10 @@ def read_repo_file(relative_path: str) -> dict:
         return {"ok": False, "error": "file does not exist"}
     if path.suffix.lower() in {".db", ".png", ".jpg", ".jpeg", ".zip", ".pdf"}:
         return {"ok": False, "error": "binary file not supported"}
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return {"ok": False, "error": "file is not UTF-8 text"}
     if len(text) > 40_000:
         text = text[:40_000] + "\n...[TRUNCATED]..."
     return {"ok": True, "path": str(rel), "content": text}
@@ -101,12 +104,36 @@ def run_baseline_verification() -> dict:
 VERIFY_TIMEOUT = 120
 
 
+ENGINE_ARTIFACTS = {
+    "factory-state.json",
+    "factory-run.json",
+    "traceability.md",
+    "context-manifest.json",
+}
+
+
+def _is_engine_artifact(filename: str) -> bool:
+    """Decisiones humanas (human-*), estado/consolidados del motor y la evidencia
+    numerada NN-*: nadie salvo el motor o el humano los escribe (no se forjan aprobaciones)."""
+    name = filename.lower()
+    return (
+        name.startswith("human-")
+        or name in ENGINE_ARTIFACTS
+        or re.match(r"^\d{2}-", name) is not None
+    )
+
+
 def write_run_evidence(change_id: str, filename: str, content: str) -> dict:
     """Write only evidence files under runs/<CR-ID>/; never product code."""
     if not change_id.startswith("CR-"):
         return {"ok": False, "error": "change_id must start with CR-"}
     if "/" in filename or "\\" in filename or not filename.endswith((".md", ".json", ".txt")):
         return {"ok": False, "error": "invalid evidence filename"}
+    if _is_engine_artifact(filename):
+        return {
+            "ok": False,
+            "error": f"{filename!r} lo genera el motor o un humano; el agente no puede escribirlo",
+        }
     folder = REPO_ROOT / "runs" / change_id
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / filename

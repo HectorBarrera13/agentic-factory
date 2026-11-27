@@ -1148,6 +1148,13 @@ def _record_review_decisions(
         fh.write(header + "\n".join(lines) + "\n")
 
 
+def _as_dict(value: object, default: dict) -> dict:
+    """Estados antiguos guardaban "NOT_RUN" como str: el shape de salida es siempre dict."""
+    if isinstance(value, dict):
+        return {**default, **value}
+    return {**default, "status": value} if isinstance(value, str) else dict(default)
+
+
 def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
     """Shape del curso: contadores de evidencia real, nunca opinion del LLM."""
     ver = state.get("verification", {})
@@ -1172,8 +1179,10 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
             "failed": ver.get("failed", 0),
             "lint": ver.get("lint", "NOT_RUN"),
         },
-        "review": state.get("review", {"status": "NOT_RUN", "must_fix": 0, "should_fix": 0}),
-        "security": state.get("security", {"status": "NOT_RUN", "high": 0, "medium": 0}),
+        "review": _as_dict(
+            state.get("review"), {"status": "NOT_RUN", "must_fix": 0, "should_fix": 0}
+        ),
+        "security": _as_dict(state.get("security"), {"status": "NOT_RUN", "high": 0, "medium": 0}),
         "evidence": {
             "status": state.get("evidence", "PENDING"),
             "summary": "14-evidence-summary.md",

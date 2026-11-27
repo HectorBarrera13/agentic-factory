@@ -8,6 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _roles import validate_role  # noqa: E402
+from decide_findings import report_finding_ids  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 VALID_GATES = {"requirements", "plan", "review", "release"}
@@ -55,6 +56,21 @@ def main() -> None:
             "Las decisiones solo se registran cuando el run se detiene en su gate: "
             "avance con `python -m factory_app.orchestrator` primero."
         )
+    if gate == "review" and decision in {"APPROVED", "MODIFIED"}:
+        findings_path = run / "human-findings-decisions.json"
+        decided = (
+            {d["finding_id"] for d in json.loads(findings_path.read_text(encoding="utf-8"))
+             .get("decisions", [])}
+            if findings_path.is_file()
+            else set()
+        )
+        missing = sorted(report_finding_ids(run) - decided)
+        if missing:
+            raise SystemExit(
+                f"Findings sin clasificar en {change_id}: {', '.join(missing)}. "
+                'Clasificalos con scripts/decide_findings.py --by "Nombre (Human Reviewer)" '
+                "ID=ACCEPTED|REJECTED|MODIFIED|DEFERRED antes de cerrar el gate review."
+            )
     # human_gates lo actualiza el motor al CONSUMIR la decision, no este script.
     evidence = {
         "change_id": change_id,
