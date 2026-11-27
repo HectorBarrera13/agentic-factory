@@ -8,8 +8,10 @@ Fases (cada `advance()` ejecuta UNA fase y persiste factory-state.json):
 
 Reglas duras (AGENTS.md del curso):
     - Sin veredicto humano registrado, advance() se detiene: silence is never approval.
+    - Una decision solo vale si se registro DESPUES de que el run se detuvo en ese gate
+      (`awaiting_gate` + `gate_opened_at`): no hay pre-aprobaciones.
     - verification FAIL jamas llega a review (R4 del curso).
-    - MAX_FIX_ROUNDS acotado; al superarlo el run queda ESCALATED a humano.
+    - MAX_FIX_ROUNDS por tipo (verificacion / findings); al superarlo el run queda ESCALATED.
     - Ningun camino produce merge: el estado maximo es READY FOR HUMAN MERGE.
     - Los hallazgos se consumen por ronda: tras un fix, la nueva revision exige
       decisiones nuevas (no vale la decision anterior).
@@ -30,6 +32,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAX_FIX_ROUNDS = 3
+PROMPT_FIELD_CAP = 12_000
 
 TERMINAL = {"READY FOR HUMAN MERGE", "NOT READY", "ESCALATED"}
 GATE_ORDER = ("requirements", "plan", "review", "release")
@@ -54,13 +57,37 @@ class TransientModelError(Exception):
 
 
 _TRANSIENT_MARKERS = (
-    "429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "high demand", "rate limit",
+    "429", "503", "resource_exhausted", "unavailable", "high demand", "rate limit",
 )
 
 
 def _is_transient(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+_RECO_RE = re.compile(
+    r"^[\s>*_`#-]*RECOMMENDATION[\s*_`]*:[\s*_`]*(PROCEED|HUMAN_CLARIFICATION_REQUIRED)\b",
+    re.I | re.M,
+)
+
+
+def final_text(parts) -> str:
+    """Texto de la respuesta final: TODAS las partes de texto, sin los `thought` del modelo.
+
+    Antes se tomaba solo `parts[-1]`: con respuestas en varias partes el reporte perdia
+    el contenido y quedaba solo la linea RECOMMENDATION."""
+    return "".join(p.text for p in parts if getattr(p, "text", None) and not p.thought)
+
+
+def parse_recommendation(report: str) -> str:
+    """Lee SOLO la linea `RECOMMENDATION: ...` (la ultima si hay varias).
+    Devuelve PROCEED | HUMAN_CLARIFICATION_REQUIRED | EMPTY | MISSING: menciones sueltas
+    de STOP o HUMAN_CLARIFICATION_REQUIRED en el cuerpo ya no deciden nada."""
+    if not report.strip():
+        return "EMPTY"
+    hits = _RECO_RE.findall(report)
+    return hits[-1].upper() if hits else "MISSING"
 
 
 def _retry_hint_seconds(exc: BaseException) -> int | None:
@@ -71,6 +98,19 @@ def _retry_hint_seconds(exc: BaseException) -> int | None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _now_precise() -> str:
+    """Marca con microsegundos: ordena 'gate abierto' vs 'decision registrada'."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(value: object) -> datetime | None:
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
 def _git(args: list[str]) -> subprocess.CompletedProcess:
@@ -108,16 +148,19 @@ class FakeExecutor(AgentExecutor):
         cid = context["change_id"]
         cr_text = context.get("cr_text", "")
         if phase == "intake":
-            if self.ambiguous_cr or re.search(r"intentionally ambiguous|ambigu", cr_text, re.I):
+            if not context.get("po_clarification") and (
+                self.ambiguous_cr or re.search(r"intentionally ambiguous|ambigu", cr_text, re.I)
+            ):
                 return {
                     "recommendation": "HUMAN_CLARIFICATION_REQUIRED",
                     "report": f"# Intake {cid}\n\nSTOP: el CR no define politica; "
-                    "requiere decision del Product Owner.\n",
+                    "requiere decision del Product Owner.\n\n"
+                    "RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED\n",
                 }
             return {
                 "recommendation": "PROCEED",
-                "report": f"# Intake {cid}\n\nPROCEED: ACs identificados, "
-                "sin ambiguedad bloqueante.\n",
+                "report": f"# Intake {cid}\n\nACs identificados, "
+                "sin ambiguedad bloqueante.\n\nRECOMMENDATION: PROCEED\n",
             }
         if phase == "review":
             self._review_calls += 1
@@ -131,7 +174,7 @@ class FakeExecutor(AgentExecutor):
             "plan": (
                 f"# Plan {cid}\n\n| task | files | tests |\n|---|---|---|\n"
                 "| T1 | campusflow/service.py | tests/product/test_service.py |\n\n"
-                "Verificacion: pytest + ruff.\n"
+                "Verificacion: pytest + ruff.\n\nRECOMMENDATION: PROCEED\n"
             ),
             "implement": f"# Coder report {cid}\n\nfiles_changed: campusflow/service.py\n",
             "test_analysis": f"# Test analysis {cid}\n\nboundary/negativos/regresion cubiertos.\n",
@@ -201,36 +244,42 @@ class ADKExecutor(AgentExecutor):
         from google.genai import types
 
         from . import agents as A
+        from .tools import select_context
 
-        agent = getattr(A, self.AGENT_FOR_PHASE[phase])
+        # Instancia NUEVA por fase: sin padre, sin estado compartido con otras fases.
+        agent = A.AGENT_FACTORIES[self.AGENT_FOR_PHASE[phase]]()
+        # Context engineering (§12): solo lo relevante, con manifiesto auditable en el run.
+        context = {**context, "selected_context": select_context(context["change_id"])["text"]}
         prompt = self._prompt(phase, context)
 
         async def _run() -> str:
             runner = InMemoryRunner(agent=agent, app_name=f"factory_{phase}")
-            session = await runner.session_service.create_session(
-                app_name=runner.app_name, user_id=context["change_id"]
-            )
-            new_message = types.Content(role="user", parts=[types.Part(text=prompt)])
-            text = ""
-            async for event in runner.run_async(
-                user_id=session.user_id, session_id=session.id, new_message=new_message
-            ):
-                if event.is_final_response() and event.content and event.content.parts:
-                    text = event.content.parts[-1].text or ""
-            return text
+            try:
+                session = await runner.session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=context["change_id"],
+                    # lo leen los callbacks de auditoria (runs/<CR>/tool-calls.jsonl)
+                    state={"change_id": context["change_id"], "phase": phase},
+                )
+                new_message = types.Content(role="user", parts=[types.Part(text=prompt)])
+                text = ""
+                async for event in runner.run_async(
+                    user_id=session.user_id, session_id=session.id, new_message=new_message
+                ):
+                    if event.is_final_response() and event.content and event.content.parts:
+                        text = final_text(event.content.parts)
+                return text
+            finally:
+                await runner.close()
 
         def _call() -> str:
             return asyncio.run(_run())
 
         report = self._call_with_backoff(_call, phase, context["change_id"])
-        recommendation = (
-            "HUMAN_CLARIFICATION_REQUIRED"
-            if re.search(r"HUMAN_CLARIFICATION_REQUIRED|\bSTOP\b", report)
-            else "PROCEED"
-        )
         return {
             "report": report or f"# {phase} {context['change_id']} (respuesta vacía)",
-            "recommendation": recommendation,
+            # vacia o sin linea RECOMMENDATION => el run escala (nunca PROCEED por defecto)
+            "recommendation": parse_recommendation(report or ""),
         }
 
     def _call_with_backoff(self, fn, phase: str, change_id: str):
@@ -246,7 +295,7 @@ class ADKExecutor(AgentExecutor):
         attempt = 0
         while True:
             try:
-                return fn()
+                result = fn()
             except Exception as exc:
                 if not _is_transient(exc):
                     raise
@@ -271,6 +320,10 @@ class ADKExecutor(AgentExecutor):
                 print(f"  [llm] {phase}: transitorio ({type(exc).__name__}), "
                       f"intento {attempt}/{max_retries} en {delay:.1f}s")
                 time.sleep(delay)
+                continue
+            # exito: los reintentos que costo tambien cuentan en la metrica (§19.1)
+            self._record_retries(change_id, phase, attempt, exhausted=False)
+            return result
 
     @staticmethod
     def _record_retries(change_id: str, phase: str, n: int, exhausted: bool) -> None:
@@ -300,14 +353,24 @@ class ADKExecutor(AgentExecutor):
         bits = [f"Change ID: {context['change_id']}"]
         for key in (
             "cr_text",
+            "po_clarification",
+            "selected_context",
             "intake_report",
             "implementation_plan",
             "git_diff",
             "verification_summary",
+            "prior_findings",
             "accepted_blocking_findings",
         ):
             if context.get(key):
-                bits.append(f"{key.upper()}:\n{str(context[key])[:12000]}")
+                text = str(context[key])
+                if len(text) > PROMPT_FIELD_CAP:  # truncado VISIBLE: el agente sabe que falta
+                    text = (
+                        text[:PROMPT_FIELD_CAP]
+                        + f"\n...[TRUNCATED {len(text) - PROMPT_FIELD_CAP} chars; "
+                        "use the read tools / inspect_git_diff for the rest]"
+                    )
+                bits.append(f"{key.upper()}:\n{text}")
         return "\n\n".join(bits)
 
 
@@ -328,26 +391,140 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
-def _gate_decision(run_dir: Path, gate: str) -> dict | None:
+def _load_state(run_dir: Path) -> dict:
+    return json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
+
+
+def _gate_decision(run_dir: Path, gate: str, state: dict) -> dict | None:
+    """Decision humana VALIDA para `gate`: solo si la fabrica esta detenida en ese gate y
+    la decision se registro DESPUES de abrirse (nunca pre-aprobaciones ni decisiones
+    viejas de otra ronda). Lo demas se ignora: silence is never approval."""
     path = run_dir / f"human-{gate}-decision.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    if not path.is_file() or state.get("awaiting_gate") != gate:
+        return None
+    decision = json.loads(path.read_text(encoding="utf-8"))
+    opened, recorded = (
+        _parse_ts(state.get("gate_opened_at")),
+        _parse_ts(decision.get("recorded_at")),
+    )
+    if opened is None or recorded is None or recorded < opened:
+        return None
+    return decision
 
 
-def _apply_gate_decision(run_dir: Path, change_id: str, gate: str, decision: dict) -> None:
-    """REJECTED/DEFERRED en gates 1 escalan; no hay continuacion automatica."""
-    if decision["decision"] in {"APPROVED", "MODIFIED"}:
+def _open_gate(run_dir: Path, change_id: str, gate: str, why: str, state: dict, **kw) -> None:
+    """Detiene el run en `gate`. La marca de apertura se conserva si ya estaba abierto
+    (reanudar sin decision no invalida una decision registrada entre dos advance)."""
+    if state.get("awaiting_gate") != gate:
+        kw.update(awaiting_gate=gate, gate_opened_at=_now_precise())
+    if kw:
+        _update_state(run_dir, **kw)
+    raise AwaitingHuman(change_id, gate, why)
+
+
+def _escalate(run_dir: Path, change_id: str, reason: str, **kw) -> dict:
+    """ESCALATED + evidencia consolidada (factory-run.json, resumen, trazabilidad) para que
+    un escalamiento tambien sea exportable y auditable."""
+    kw.setdefault("awaiting_gate", "")
+    state = _update_state(
+        run_dir, status="ESCALATED", stop_reason=reason, escalated_at=_now(), **kw
+    )
+    _write_consolidated_evidence(change_id, state, run_dir)
+    return state
+
+
+def _write_consolidated_evidence(change_id: str, state: dict, run_dir: Path) -> dict:
+    run_json = build_factory_run(change_id, state, run_dir)
+    (run_dir / "factory-run.json").write_text(json.dumps(run_json, indent=2), encoding="utf-8")
+    (run_dir / "14-evidence-summary.md").write_text(
+        build_evidence_summary(run_json, run_dir), encoding="utf-8"
+    )
+    (run_dir / "traceability.md").write_text(
+        build_traceability(run_json, run_dir), encoding="utf-8"
+    )
+    return run_json
+
+
+# Artefactos de decision humana con el nombre exacto del instructivo (§17). Los
+# human-<gate>-decision.json internos siguen siendo la fuente que lee el motor.
+GATE_ARTIFACT = {
+    "requirements": "02-human-requirement-decision.md",
+    "plan": "04-human-plan-approval.md",
+}
+
+
+def _write_gate_artifact(run_dir: Path, gate: str, decision: dict, extra: str = "") -> None:
+    """Registro legible y auditable de una decision humana (quien, que, por que, cuando)."""
+    name = GATE_ARTIFACT.get(gate)
+    if name is None:
         return
-    _update_state(run_dir, status="ESCALATED", stop_reason=f"gate {gate}: {decision['decision']}")
+    (run_dir / name).write_text(
+        "\n".join(
+            [
+                f"# Human decision — gate {gate}",
+                "",
+                f"- Decision: **{decision.get('decision', '?')}**",
+                f"- Recorded by: {decision.get('recorded_by', 'unknown')}",
+                f"- Recorded at: {decision.get('recorded_at', 'unknown')}",
+                f"- Reason: {decision.get('reason', '')}",
+                "",
+                extra,
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def _apply_gate_decision(
+    run_dir: Path, change_id: str, gate: str, decision: dict, state: dict
+) -> dict:
+    """Consume la decision: cierra el gate y la registra en human_gates.
+    REJECTED/DEFERRED escalan (requirements, plan, review); no hay continuacion automatica."""
+    _write_gate_artifact(run_dir, gate, decision)
+    gates = {**state["human_gates"], gate: decision["decision"]}
+    if decision["decision"] in {"APPROVED", "MODIFIED"}:
+        return _update_state(run_dir, awaiting_gate="", human_gates=gates)
+    _escalate(run_dir, change_id, f"gate {gate}: {decision['decision']}", human_gates=gates)
     raise AwaitingHuman(change_id, gate, f"decision {decision['decision']}: intervenga un humano")
 
 
 def _archive(run_dir: Path, name: str, round_no: int) -> None:
     src = run_dir / name
     if src.is_file():
-        src.rename(run_dir / name.replace(".json", f"-round{round_no}.json"))
+        stem, dot, ext = name.rpartition(".")
+        src.rename(run_dir / f"{stem}-round{round_no}{dot}{ext}")
 
 
-def _commit_product_changes(change_id: str, fix_reason: str) -> str:
+def _try_resume_escalation(run_dir: Path, state: dict) -> dict | None:
+    """Un ESCALATED por ambiguedad (intake/planner) se reanuda SOLO cuando el humano
+    registra una decision APPROVED/MODIFIED POSTERIOR al escalamiento (curso §11.3:
+    STOP hasta recibir decision humana). Rechazos de gate (`gate ...`) no se reanudan.
+
+    La aclaracion SOLO reanuda: se archiva y el intake/plan regenerados vuelven a pasar
+    por su gate con una decision nueva (nadie aprueba un artefacto que no vio)."""
+    reason = str(state.get("stop_reason", ""))
+    resume = {"intake:": ("requirements", "INTAKE_PENDING"), "planner:": ("plan", "PLAN_PENDING")}
+    for prefix, (gate, target) in resume.items():
+        if not reason.startswith(prefix):
+            continue
+        decision = _gate_decision(run_dir, gate, state)
+        if decision and decision.get("decision") in {"APPROVED", "MODIFIED"}:
+            n = len(list(run_dir.glob(f"human-{gate}-decision-clarification*.json")))
+            (run_dir / f"human-{gate}-decision.json").rename(
+                run_dir / f"human-{gate}-decision-clarification{n or ''}.json"
+            )
+            return _update_state(
+                run_dir,
+                status=target,
+                stop_reason="",
+                awaiting_gate="",
+                planned=False,
+                po_clarification=str(decision.get("reason", ""))[:2000],
+            )
+    return None
+
+
+def _commit_product_changes(change_id: str, message: str) -> str:
     """Git evidence: comitea cambios de producto SOLO en la rama factory/<CR>.
 
     Sin repo git o sin rama de run => no comitea (nunca en main: regla dura).
@@ -357,19 +534,14 @@ def _commit_product_changes(change_id: str, fix_reason: str) -> str:
     if _git(["rev-parse", "--verify", "HEAD"]).returncode != 0:
         return ""
     branch = f"factory/{change_id}"
-    current = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-    if current != branch:
-        if _git(["rev-parse", "--verify", branch]).returncode != 0:
-            return ""
-        _git(["checkout", "-q", branch])
+    if _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
+        return ""  # _prepare_branch ya hizo checkout; fuera de la rama del run no se comitea
     for path in ("campusflow", "tests/product"):
         if (REPO_ROOT / path).exists():
             _git(["add", path])
     if _git(["diff", "--cached", "--quiet"]).returncode == 0:
         return ""
-    msg = f"factory({change_id}): " + (
-        "apply accepted findings" if fix_reason else "implement approved plan"
-    )
+    msg = f"factory({change_id}): {message}"
     r = subprocess.run(
         [
             "git",
@@ -392,6 +564,74 @@ def _commit_product_changes(change_id: str, fix_reason: str) -> str:
     return _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
 
 
+def _git_evidence(commit: str, state: dict, rng: str) -> str:
+    if not commit:
+        return ""
+    stat = _git(["diff", rng, "--stat"]).stdout
+    return (
+        f"\n\n## Git evidence\n\n- commit: `{commit}` (rama {state.get('branch')}, "
+        f"diff {rng})\n```text\n{stat}```\n"
+    )
+
+
+def _last_verification_file(run_dir: Path) -> str:
+    return (
+        "12-re-verification.txt"
+        if (run_dir / "12-re-verification.txt").is_file()
+        else "07-verification.txt"
+    )
+
+
+def _has_git() -> bool:
+    return _git(["rev-parse", "--verify", "HEAD"]).returncode == 0
+
+
+def _create_run_branch(change_id: str, state: dict) -> dict:
+    """Crea factory/<CR> desde HEAD (sin cambiar de rama) y guarda su base: todos los
+    diffs del run son <base_commit>...factory/<CR>, este donde este el HEAD."""
+    branch = f"factory/{change_id}"
+    if not _has_git():
+        return {"branch": branch}
+    if _git(["rev-parse", "--verify", branch]).returncode != 0:
+        base = _git(["rev-parse", "HEAD"]).stdout.strip()
+        r = _git(["branch", branch])
+        if r.returncode != 0:
+            raise Blocked(f"{change_id}: no se pudo crear {branch}: {r.stderr.strip()}")
+    else:
+        base = state.get("base_commit") or _git(["merge-base", "HEAD", branch]).stdout.strip()
+    return {"branch": branch, "base_commit": base}
+
+
+def _prepare_branch(change_id: str, state: dict, require_clean: bool) -> None:
+    """Deja el arbol en factory/<CR> antes de que un agente lo lea o escriba.
+    require_clean: cambios sin commitear en producto/tests bloquean el run (el commit de
+    maquina nunca debe llevarse trabajo humano ajeno al plan)."""
+    if not _has_git():
+        return
+    branch = state.get("branch") or f"factory/{change_id}"
+    if require_clean:
+        dirty = _git(["status", "--porcelain", "--", "campusflow", "tests/product"]).stdout
+        if dirty.strip():
+            raise Blocked(
+                f"{change_id}: hay cambios sin commitear en campusflow/ o tests/product:\n"
+                f"{dirty.rstrip()}\nComitealos o descartalos y reanuda; la fabrica no los "
+                "mezcla con el trabajo del Coder."
+            )
+    if _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
+        r = _git(["checkout", "-q", branch])
+        if r.returncode != 0:
+            raise Blocked(f"{change_id}: no se pudo cambiar a {branch}: {r.stderr.strip()}")
+
+
+def _diff_range(state: dict) -> str:
+    base = state.get("base_commit") or "main"
+    return f"{base}...{state.get('branch') or 'HEAD'}"
+
+
+def _run_diff_range(run_dir: Path) -> str:
+    return _diff_range(_load_state(run_dir) if _state_path(run_dir).is_file() else {})
+
+
 # ================================================================= avance
 def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
     executor = executor or FakeExecutor()
@@ -403,68 +643,92 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         )
     state = json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
     status = state["status"]
+    if status == "ESCALATED":
+        state = _try_resume_escalation(run_dir, state) or state
+        status = state["status"]
     if status in TERMINAL:
         return state
     cr_text = _read(run_dir / "00-change-request.md")
+    clarification = state.get("po_clarification", "")
 
     # ---- 1 INTAKE
     if status == "INTAKE_PENDING":
-        out = executor.run_agent("intake", {"change_id": change_id, "cr_text": cr_text})
-        (run_dir / "01-intake-report.md").write_text(out["report"], encoding="utf-8")
-        if out.get("recommendation") != "PROCEED":
-            _update_state(
-                run_dir,
-                status="ESCALATED",
-                stop_reason="intake: requiere clarificacion del Product Owner",
-            )
-            raise AwaitingHuman(
-                change_id,
-                "requirements",
-                "intake detecto ambiguedad; resuelva con approve_gate requirements",
-            )
-        decision = _gate_decision(run_dir, "requirements")
-        if decision is None:
-            _update_state(run_dir, status="PLAN_PENDING")
-            raise AwaitingHuman(
-                change_id, "requirements", "el PO debe validar interpretación/alcance"
-            )
-        _apply_gate_decision(run_dir, change_id, "requirements", decision)
-        state = _update_state(
-            run_dir,
-            status="PLAN_PENDING",
-            human_gates={**state["human_gates"], "requirements": decision["decision"]},
+        out = executor.run_agent(
+            "intake",
+            {"change_id": change_id, "cr_text": cr_text, "po_clarification": clarification},
         )
+        (run_dir / "01-intake-report.md").write_text(out["report"], encoding="utf-8")
+        reco = out.get("recommendation")
+        if reco != "PROCEED":
+            why = (
+                "requiere clarificacion del Product Owner"
+                if reco == "HUMAN_CLARIFICATION_REQUIRED"
+                else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+            )
+            _escalate(
+                run_dir,
+                change_id,
+                f"intake: {why}",
+                awaiting_gate="requirements",
+                gate_opened_at=_now_precise(),
+            )
+            raise AwaitingHuman(
+                change_id, "requirements", f"intake: {why}; resuelva con approve_gate requirements"
+            )
+        state = _update_state(run_dir, status="REQUIREMENTS_GATE")
+        return advance(change_id, executor)
+
+    # ---- 1b gate requirements (intake ya hecho: no se repite al reanudar)
+    if status == "REQUIREMENTS_GATE":
+        decision = _gate_decision(run_dir, "requirements", state)
+        if decision is None:
+            _open_gate(
+                run_dir, change_id, "requirements", "el PO debe validar interpretación/alcance",
+                state,
+            )
+        state = _apply_gate_decision(run_dir, change_id, "requirements", decision, state)
+        _update_state(run_dir, status="PLAN_PENDING", planned=False)
         return advance(change_id, executor)
 
     # ---- 2 PLANNER + gate plan (el Coder bloqueado hasta APPROVED)
     if status == "PLAN_PENDING":
-        out = executor.run_agent(
-            "plan",
-            {
-                "change_id": change_id,
-                "cr_text": cr_text,
-                "intake_report": _read(run_dir / "01-intake-report.md"),
-            },
-        )
-        (run_dir / "03-implementation-plan.md").write_text(out["report"], encoding="utf-8")
-        if out.get("recommendation") != "PROCEED":
-            _update_state(run_dir, status="ESCALATED", stop_reason="planner: ambiguedad residual")
-            raise AwaitingHuman(change_id, "plan", "planner pidio aclaracion")
-        decision = _gate_decision(run_dir, "plan")
-        if decision is None:
-            raise AwaitingHuman(
-                change_id, "plan", "el Coder permanece BLOQUEADO hasta plan APPROVED"
+        # El plan se genera UNA vez: al reanudar tras la decision NO se regenera
+        # (el Tech Lead aprobo ESTE plan, no uno nuevo).
+        if not state.get("planned"):
+            out = executor.run_agent(
+                "plan",
+                {
+                    "change_id": change_id,
+                    "cr_text": cr_text,
+                    "intake_report": _read(run_dir / "01-intake-report.md"),
+                    "po_clarification": clarification,
+                },
             )
-        _apply_gate_decision(run_dir, change_id, "plan", decision)
-        branch = f"factory/{change_id}"
-        if _git(["rev-parse", "--verify", branch]).returncode != 0:
-            _git(["checkout", "-b", branch])
-        _update_state(
-            run_dir,
-            status="IMPLEMENT_PENDING",
-            branch=branch,
-            human_gates={**state["human_gates"], "plan": decision["decision"]},
-        )
+            (run_dir / "03-implementation-plan.md").write_text(out["report"], encoding="utf-8")
+            reco = out.get("recommendation")
+            if reco != "PROCEED":
+                why = (
+                    "ambiguedad residual"
+                    if reco == "HUMAN_CLARIFICATION_REQUIRED"
+                    else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+                )
+                _escalate(
+                    run_dir,
+                    change_id,
+                    f"planner: {why}",
+                    awaiting_gate="plan",
+                    gate_opened_at=_now_precise(),
+                )
+                raise AwaitingHuman(change_id, "plan", f"planner: {why}")
+            state = _update_state(run_dir, planned=True)
+        decision = _gate_decision(run_dir, "plan", state)
+        if decision is None:
+            _open_gate(
+                run_dir, change_id, "plan", "el Coder permanece BLOQUEADO hasta plan APPROVED",
+                state,
+            )
+        state = _apply_gate_decision(run_dir, change_id, "plan", decision, state)
+        _update_state(run_dir, status="IMPLEMENT_PENDING", **_create_run_branch(change_id, state))
         return advance(change_id, executor)
 
     # ---- 3 CODER + TEST ANALYST
@@ -472,35 +736,64 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         fix_reason = state.get("fix_reason", "")
         ctx = {
             "change_id": change_id,
+            "cr_text": cr_text,
             "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
-            "accepted_blocking_findings": fix_reason,
+            # el Coder Fix recibe QUE corregir, no solo los ids
+            "accepted_blocking_findings": (
+                fix_reason + "\n\n" + state.get("fix_details", "") if fix_reason else ""
+            ),
+            "verification_summary": (
+                _read(run_dir / _last_verification_file(run_dir))
+                if fix_reason == "verification FAIL"
+                else ""
+            ),
         }
+        _prepare_branch(change_id, state, require_clean=True)
+        rng = _diff_range(state)
         phase = "fix" if fix_reason else "implement"
         out = executor.run_agent(phase, ctx)
         target = "11-fix-report.md" if fix_reason else "05-coder-report.md"
-        commit = _commit_product_changes(change_id, fix_reason)
-        diff_stat = _git(["diff", "main...HEAD", "--stat"]).stdout if commit else ""
-        report = out["report"]
-        if commit:
-            report += (
-                f"\n\n## Git evidence\n\n- commit: `{commit}` "
-                f"(rama {state.get('branch', 'factory/' + change_id)})\n```text\n{diff_stat}```\n"
-            )
-        (run_dir / target).write_text(report, encoding="utf-8")
+        commit = _commit_product_changes(
+            change_id, "apply accepted findings" if fix_reason else "implement approved plan"
+        )
+        (run_dir / target).write_text(
+            out["report"] + _git_evidence(commit, state, rng), encoding="utf-8"
+        )
+        last = commit
         if not fix_reason:
-            out2 = executor.run_agent("test_analysis", ctx)
-            (run_dir / "06-test-analysis.md").write_text(out2["report"], encoding="utf-8")
+            out2 = executor.run_agent(
+                "test_analysis",
+                {
+                    "change_id": change_id,
+                    "cr_text": cr_text,
+                    "implementation_plan": ctx["implementation_plan"],
+                    "git_diff": _git(["diff", rng]).stdout,
+                },
+            )
+            # los tests del analista tambien se comitean: el arbol vuelve a quedar limpio
+            test_commit = _commit_product_changes(change_id, "add test analyst tests")
+            (run_dir / "06-test-analysis.md").write_text(
+                out2["report"] + _git_evidence(test_commit, state, rng), encoding="utf-8"
+            )
+            last = test_commit or commit
         _update_state(
             run_dir,
             status="VERIFY_PENDING",
             fix_reason="",
-            last_commit=commit or state.get("last_commit", ""),
+            fix_details="",
+            last_commit=last or state.get("last_commit", ""),
         )
         return advance(change_id, executor)
 
     # ---- 4 VERIFICATION determinista (FAIL nunca llega a review)
     if status == "VERIFY_PENDING":
         v = executor.run_verification()
+        integrity = check_test_integrity(state)
+        if integrity is not None:  # guardia determinista: nadie debilita tests existentes
+            v = {
+                "ok": bool(v.get("ok")) and integrity["returncode"] == 0,
+                "results": [*v.get("results", []), integrity],
+            }
         round_no = state.get("iterations", 0)
         (
             run_dir / "07-verification.txt" if round_no == 0 else run_dir / "12-re-verification.txt"
@@ -509,18 +802,20 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         verdict = "PASS" if v.get("ok") else "FAIL"
         ver = {"status": verdict, "tests": tests, "failed": failed, "lint": lint}
         if verdict == "FAIL":
-            if round_no >= MAX_FIX_ROUNDS:
-                _update_state(
+            verify_rounds = state.get("verify_rounds", 0)
+            if verify_rounds >= MAX_FIX_ROUNDS:
+                _escalate(
                     run_dir,
-                    status="FIX_ROUNDS_EXCEEDED",
+                    change_id,
+                    f"verification FAIL tras {verify_rounds} rondas de fix (tope {MAX_FIX_ROUNDS})",
                     verification=ver,
-                    stop_reason=f"verification FAIL tras {round_no} rondas",
                 )
-                raise Blocked(f"{change_id}: verification FAIL persistente -> intervencion humana")
+                raise Blocked(f"{change_id}: verification FAIL persistente -> ESCALATED a humano")
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
                 iterations=round_no + 1,
+                verify_rounds=verify_rounds + 1,
                 verification=ver,
                 fix_reason="verification FAIL",
             )
@@ -530,82 +825,153 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
 
     # ---- 5 REVIEWER + SECURITY independientes + gate findings
     if status == "REVIEW_PENDING":
-        diff = _git(["diff", "main...HEAD"]).stdout
-        review_ctx = {
-            "change_id": change_id,
-            "cr_text": cr_text,
-            "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
-            "git_diff": diff,
-            "verification_summary": _read(run_dir / "07-verification.txt"),
-        }
-        review = executor.run_agent("review", review_ctx)  # sesion propia
-        (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
-        sec = executor.run_agent(
-            "security", {"change_id": change_id, "cr_text": cr_text, "git_diff": diff}
-        )  # sesion propia distinta
-        from .scanners import run_security_scans
-
-        scans = run_security_scans(REPO_ROOT)
-        (run_dir / "09-security-report.md").write_text(
-            sec["report"]
-            + "\n\n## Escaneos deterministas\n\n```json\n"
-            + json.dumps(scans, indent=2)
-            + "\n```\n",
-            encoding="utf-8",
-        )
-        counts = count_findings(review["report"] + "\n" + sec["report"])
-        review_status = "PASS" if counts["must_fix"] == 0 else "CHANGES_REQUESTED"
-        security_status = "BLOCKED" if (counts["high"] > 0 or scans["blocked"]) else "PASS"
-        state = _update_state(
-            run_dir,
-            review={"status": review_status, **{k: counts[k] for k in ("must_fix", "should_fix")}},
-            security={
-                "status": security_status,
-                "high": counts["high"],
-                "medium": counts["medium"],
-            },
-        )
-        decision = _gate_decision(run_dir, "review")
-        if decision is None:
-            raise AwaitingHuman(
-                change_id, "review", "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)"
-            )
-        blocking = accepted_blocking(run_dir)
         rounds = state.get("iterations", 0)
+        # Los reportes se generan UNA vez por ronda: al reanudar tras la decision humana
+        # NO se re-ejecutan (el humano clasifico ESTOS findings, no unos nuevos).
+        fresh = not (
+            state.get("reviewed_round") == rounds and (run_dir / "08-review-report.md").is_file()
+        )
+        if fresh:
+            prior_findings = ""
+            re_review = (run_dir / "08-review-report.md").is_file()
+            if re_review:  # re-review: conservar la ronda anterior, no sobrescribirla
+                prior_findings = (
+                    _read(run_dir / "08-review-report.md")
+                    + "\n"
+                    + _read(run_dir / "09-security-report.md")
+                    + "\nFIX AUTORIZADO: "
+                    + str(state.get("last_fix_reason", ""))
+                )
+                n = len(list(run_dir.glob("08-review-report-round*.md")))
+                _archive(run_dir, "08-review-report.md", n)
+                _archive(run_dir, "09-security-report.md", n)
+            _prepare_branch(change_id, state, require_clean=False)
+            diff = _git(["diff", _diff_range(state)]).stdout
+            review_ctx = {
+                "change_id": change_id,
+                "cr_text": cr_text,
+                "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
+                "git_diff": diff,
+                "verification_summary": _read(run_dir / _last_verification_file(run_dir)),
+                "prior_findings": prior_findings,
+            }
+            review = executor.run_agent("review", review_ctx)  # sesion propia
+            (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
+            sec = executor.run_agent(
+                "security",
+                {
+                    "change_id": change_id,
+                    "cr_text": cr_text,
+                    "git_diff": diff,
+                    "prior_findings": prior_findings,
+                },
+            )  # sesion propia distinta
+            from .scanners import run_security_scans
+
+            scans = run_security_scans(REPO_ROOT)
+            scan_rows = [
+                f"{f['id']} | HIGH | - | {f.get('file')}:{f.get('line')} | "
+                f"{f.get('rule')} ({scan['scanner']})"
+                for scan in scans["scans"]
+                for f in scan.get("findings", [])
+                if f.get("id")
+            ]
+            (run_dir / "09-security-report.md").write_text(
+                sec["report"]
+                + "\n\n## Hallazgos HIGH de escaner (clasificables en el gate review)\n\n"
+                + ("\n".join(scan_rows) if scan_rows else "ninguno")
+                + f"\n\nDegradados: {', '.join(scans['degraded_scanners']) or 'ninguno'}"
+                + "\n\n## Escaneos deterministas\n\n```json\n"
+                + json.dumps(scans, indent=2)
+                + "\n```\n",
+                encoding="utf-8",
+            )
+            if re_review:
+                (run_dir / "13-re-review.md").write_text(
+                    f"# Re-review — {change_id} (ronda {rounds})\n\n"
+                    "Reviewer y Security re-chequean los findings autorizados y buscan "
+                    "regresiones/riesgos nuevos introducidos por el fix.\n\n"
+                    "## Reviewer\n\n" + review["report"] + "\n\n## Security\n\n"
+                    + sec["report"] + "\n",
+                    encoding="utf-8",
+                )
+            counts = count_findings(review["report"] + "\n" + sec["report"])
+            review_status = "PASS" if counts["must_fix"] == 0 else "CHANGES_REQUESTED"
+            security_status = "BLOCKED" if (counts["high"] > 0 or scans["blocked"]) else "PASS"
+            state = _update_state(
+                run_dir,
+                reviewed_round=rounds,
+                review={
+                    "status": review_status,
+                    **{k: counts[k] for k in ("must_fix", "should_fix")},
+                },
+                security={
+                    "status": security_status,
+                    "high": counts["high"],
+                    "medium": counts["medium"],
+                },
+            )
+        decision = _gate_decision(run_dir, "review", state)
+        if decision is None:
+            _open_gate(
+                run_dir,
+                change_id,
+                "review",
+                "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)",
+                state,
+            )
+        blocking = (
+            accepted_blocking(run_dir, state)
+            if decision["decision"] in {"APPROVED", "MODIFIED"}
+            else []
+        )
+        _record_review_decisions(run_dir, rounds, decision, blocking, state)
+        state = _apply_gate_decision(run_dir, change_id, "review", decision, state)
         if blocking:
+            review_rounds = state.get("review_rounds", 0)
+            if review_rounds >= MAX_FIX_ROUNDS:
+                _escalate(
+                    run_dir,
+                    change_id,
+                    f"findings bloqueantes aceptados tras {review_rounds} rondas de fix "
+                    f"(tope {MAX_FIX_ROUNDS}): " + ", ".join(blocking),
+                )
+                raise Blocked(f"{change_id}: findings bloqueantes persistentes -> ESCALATED")
             _archive(run_dir, "human-review-decision.json", rounds)
             _archive(run_dir, "human-findings-decisions.json", rounds)
+            reason = "findings bloqueantes aceptados: " + ", ".join(blocking)
+            segments = finding_segments(
+                _read(run_dir / "08-review-report.md")
+                + "\n"
+                + _read(run_dir / "09-security-report.md")
+            )
+            details = "\n".join(segments.get(fid, fid).strip() for fid in blocking)
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
                 iterations=rounds + 1,
-                human_gates={**state["human_gates"], "review": decision["decision"]},
-                fix_reason="findings bloqueantes aceptados: " + ", ".join(blocking),
+                review_rounds=review_rounds + 1,
+                fix_reason=reason,
+                fix_details=details[:8000],
+                last_fix_reason=reason,
             )
             return advance(change_id, executor)
-        _update_state(
-            run_dir,
-            status="EVIDENCE_PENDING",
-            human_gates={**state["human_gates"], "review": decision["decision"]},
-        )
+        _update_state(run_dir, status="EVIDENCE_PENDING")
         return advance(change_id, executor)
 
     # ---- 6 EVIDENCIA + gate release
     if status == "EVIDENCE_PENDING":
-        state = json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
-        run_json = build_factory_run(change_id, state, run_dir)
-        (run_dir / "factory-run.json").write_text(json.dumps(run_json, indent=2), encoding="utf-8")
-        (run_dir / "14-evidence-summary.md").write_text(
-            build_evidence_summary(run_json, run_dir), encoding="utf-8"
-        )
-        (run_dir / "traceability.md").write_text(
-            build_traceability(run_json, run_dir), encoding="utf-8"
-        )
-        decision = _gate_decision(run_dir, "release")
+        state = _load_state(run_dir)
+        _write_consolidated_evidence(change_id, state, run_dir)
+        decision = _gate_decision(run_dir, "release", state)
         if decision is None:
-            _update_state(run_dir, status="EVIDENCE_PENDING", evidence="CONSOLIDATED")
-            raise AwaitingHuman(
-                change_id, "release", "Release Manager decide con evidencia consolidada"
+            _open_gate(
+                run_dir,
+                change_id,
+                "release",
+                "Release Manager decide con evidencia consolidada",
+                state,
+                **({} if state.get("evidence") == "CONSOLIDATED" else {"evidence": "CONSOLIDATED"}),
             )
         verdict = decision["decision"]
         final = {"APPROVED": "READY FOR HUMAN MERGE", "REJECTED": "NOT READY"}.get(
@@ -615,8 +981,13 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             run_dir,
             status=final,
             evidence="CONSOLIDATED",
+            awaiting_gate="",
             human_gates={**state["human_gates"], "release": verdict},
             release_decision=decision,
+            **({"stop_reason": f"gate release: {verdict}"} if final == "ESCALATED" else {}),
+        )
+        (run_dir / "15-release-decision.json").write_text(
+            json.dumps({**decision, "final_status": final}, indent=2), encoding="utf-8"
         )
         (run_dir / "factory-run.json").write_text(
             json.dumps(build_factory_run(change_id, state, run_dir), indent=2), encoding="utf-8"
@@ -627,16 +998,62 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
 
 
 # ================================================================= parsing/consolidacion
+_SKIP_RE = re.compile(
+    r"pytest\.mark\.(?:skip|skipif|xfail)\b|pytest\.(?:skip|xfail|importorskip)\(|unittest\.skip"
+)
+_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def (test_\w+)", re.M)
+
+
+def check_test_integrity(state: dict) -> dict | None:
+    """Compara tests/product contra la base del run: un `test_*` desaparecido o una marca
+    skip/xfail NUEVA => FAIL con el motivo (AGENTS.md: no debilitar tests). Quitar un
+    xfail esta permitido (p.ej. CR-003 arregla el defecto). Sin git/base: None."""
+    base = state.get("base_commit")
+    if not base or not _has_git():
+        return None
+    listed = _git(["ls-tree", "-r", "--name-only", base, "--", "tests/product"])
+    base_files = set(listed.stdout.split()) if listed.returncode == 0 else set()
+    tests_dir = REPO_ROOT / "tests" / "product"
+    current = (
+        {p.relative_to(REPO_ROOT).as_posix() for p in tests_dir.rglob("*.py")}
+        if tests_dir.is_dir()
+        else set()
+    )
+    problems = []
+    for path in sorted(p for p in base_files | current if p.endswith(".py")):
+        old = _git(["show", f"{base}:{path}"]).stdout if path in base_files else ""
+        cur_path = REPO_ROOT / path
+        new = cur_path.read_text(encoding="utf-8", errors="replace") if cur_path.is_file() else ""
+        removed = set(_TEST_DEF_RE.findall(old)) - set(_TEST_DEF_RE.findall(new))
+        if removed:
+            problems.append(f"{path}: tests eliminados o renombrados {sorted(removed)}")
+        added = len(_SKIP_RE.findall(new)) - len(_SKIP_RE.findall(old))
+        if added > 0:
+            problems.append(f"{path}: {added} marca(s) skip/xfail nuevas")
+    return {
+        "command": "test-integrity (tests/product vs base del run)",
+        "returncode": 1 if problems else 0,
+        "stdout": "" if problems else "test-integrity: OK",
+        "stderr": "\n".join(problems),
+    }
+
+
 def parse_verification(v: dict) -> tuple[int, int, str]:
     out = " ".join(r.get("stdout", "") + r.get("stderr", "") for r in v.get("results", []))
     tests = int(m.group(1)) if (m := re.search(r"(\d+) passed", out)) else 0
     m2 = re.search(r"(\d+) failed", out)
-    tests += int(m2.group(1)) if m2 else 0
+    pytest_out = " ".join(
+        r.get("stdout", "") for r in v.get("results", []) if "pytest" in r.get("command", "")
+    )
+    # errores de coleccion/fixture tambien fallan (solo salida de pytest: ruff dice "1 error")
+    m3 = re.search(r"(\d+) errors?\b", pytest_out)
+    failed = (int(m2.group(1)) if m2 else 0) + (int(m3.group(1)) if m3 else 0)
+    tests += failed
     ruff_ok = any(
         "ruff" in r.get("command", "") and r.get("returncode", 1) == 0 for r in v.get("results", [])
     )
     lint = "PASS" if ruff_ok or "All checks passed" in out else "FAIL"
-    return tests, (int(m2.group(1)) if m2 else 0), lint
+    return tests, failed, lint
 
 
 def count_findings(text: str) -> dict:
@@ -648,20 +1065,109 @@ def count_findings(text: str) -> dict:
         "must_fix": num(r"MUST FIX:?\s*(\d+)"),
         "should_fix": num(r"SHOULD FIX:?\s*(\d+)"),
         "high": num(r"HIGH:?\s*(\d+)"),
-        "medium": len(re.findall(r"\bMEDIUM\b", text)),
+        # la linea resumen manda ("MEDIUM: 0" ya no cuenta como 1); sin resumen, filas SEC
+        "medium": num(r"MEDIUM:\s*(\d+)")
+        if re.search(r"MEDIUM:\s*\d+", text, re.I)
+        else len(re.findall(r"\|\s*MEDIUM\s*\|", text, re.I)),
     }
 
 
-def accepted_blocking(run_dir: Path) -> list[str]:
+FINDING_ID_RE = re.compile(r"\b(?:RF|SEC(?:-SCAN)?)-\d{2,}\b")
+SEVERITY_RE = re.compile(r"\b(?:MUST FIX|SHOULD FIX|OPTIONAL|CRITICAL|HIGH|MEDIUM|LOW)\b", re.I)
+BLOCKING_SEVERITIES = {"MUST FIX", "CRITICAL", "HIGH"}
+
+
+def finding_segments(text: str) -> dict[str, str]:
+    """finding id -> texto desde su primera aparicion hasta el siguiente finding distinto."""
+    hits: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for m in FINDING_ID_RE.finditer(text):
+        if m.group(0) not in seen:
+            seen.add(m.group(0))
+            hits.append((m.group(0), m.start()))
+    return {
+        fid: text[start : hits[i + 1][1] if i + 1 < len(hits) else len(text)]
+        for i, (fid, start) in enumerate(hits)
+    }
+
+
+def finding_severities(run_dir: Path) -> dict[str, str]:
+    """Severidad de cada finding segun los reportes de la ronda actual (misma linea del id
+    primero; si no, dentro de su segmento). Sin severidad detectable => no se incluye."""
+    text = _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
+    out: dict[str, str] = {}
+    for fid, segment in finding_segments(text).items():
+        line_start = text.find(segment)
+        line_end = text.find("\n", line_start)
+        line = text[text.rfind("\n", 0, line_start) + 1 : line_end if line_end != -1 else None]
+        m = SEVERITY_RE.search(line) or SEVERITY_RE.search(segment)
+        if m:
+            out[fid] = m.group(0).upper()
+    return out
+
+
+def findings_decisions(run_dir: Path, state: dict) -> dict:
+    """Decisiones por finding VALIDAS: registradas con el gate review abierto (no antes)."""
     path = run_dir / "human-findings-decisions.json"
-    if not path.is_file():
-        return []  # sin decision explicita, ningun finding se auto-aplica (Gate 2 real)
+    if not path.is_file() or state.get("awaiting_gate") != "review":
+        return {}
     data = json.loads(path.read_text(encoding="utf-8"))
+    opened, recorded = _parse_ts(state.get("gate_opened_at")), _parse_ts(data.get("recorded_at"))
+    if opened is None or recorded is None or recorded < opened:
+        return {}
+    return data
+
+
+def accepted_blocking(run_dir: Path, state: dict) -> list[str]:
+    """Findings que el humano ACEPTO/MODIFICO Y que son bloqueantes (MUST FIX / HIGH).
+    Un SHOULD FIX aceptado NO dispara un ciclo de fix; sin severidad parseable se trata
+    como bloqueante (conservador)."""
+    data = findings_decisions(run_dir, state)
+    if not data:
+        return []  # sin decision explicita, ningun finding se auto-aplica (Gate 2 real)
+    severities = finding_severities(run_dir)
     return [
         d["finding_id"]
         for d in data.get("decisions", [])
         if d.get("decision") in {"ACCEPTED", "MODIFIED"}
+        and severities.get(d["finding_id"], "MUST FIX") in BLOCKING_SEVERITIES
     ]
+
+
+def _record_review_decisions(
+    run_dir: Path, round_no: int, decision: dict, blocking: list[str], state: dict
+) -> None:
+    """10-human-review-decisions.md (§17): decisiones por finding de cada ronda, append-only."""
+    path = run_dir / "10-human-review-decisions.md"
+    data = findings_decisions(run_dir, state)
+    severities = finding_severities(run_dir)
+    lines = [
+        f"## Round {round_no} — gate review: {decision.get('decision')}",
+        "",
+        f"- Recorded by: {decision.get('recorded_by', 'unknown')} "
+        f"at {decision.get('recorded_at', 'unknown')}",
+        f"- Reason: {decision.get('reason', '')}",
+        f"- Blocking accepted (authorize Coder Fix): {', '.join(blocking) or 'none'}",
+        "",
+        "| Finding | Severity | Human decision |",
+        "|---|---|---|",
+        *[
+            f"| {d['finding_id']} | {severities.get(d['finding_id'], 'unknown')} "
+            f"| {d['decision']} |"
+            for d in data.get("decisions", [])
+        ],
+        "",
+    ]
+    header = "" if path.is_file() else f"# Human review decisions — {run_dir.name}\n\n"
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(header + "\n".join(lines) + "\n")
+
+
+def _as_dict(value: object, default: dict) -> dict:
+    """Estados antiguos guardaban "NOT_RUN" como str: el shape de salida es siempre dict."""
+    if isinstance(value, dict):
+        return {**default, **value}
+    return {**default, "status": value} if isinstance(value, str) else dict(default)
 
 
 def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
@@ -688,8 +1194,10 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
             "failed": ver.get("failed", 0),
             "lint": ver.get("lint", "NOT_RUN"),
         },
-        "review": state.get("review", {"status": "NOT_RUN", "must_fix": 0, "should_fix": 0}),
-        "security": state.get("security", {"status": "NOT_RUN", "high": 0, "medium": 0}),
+        "review": _as_dict(
+            state.get("review"), {"status": "NOT_RUN", "must_fix": 0, "should_fix": 0}
+        ),
+        "security": _as_dict(state.get("security"), {"status": "NOT_RUN", "high": 0, "medium": 0}),
         "evidence": {
             "status": state.get("evidence", "PENDING"),
             "summary": "14-evidence-summary.md",
@@ -703,6 +1211,7 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
             "release_manager": state["human_gates"].get("release", "PENDING"),
         },
         "iterations": state.get("iterations", 0),
+        "traceability_gaps": traceability_gaps(compute_traceability(run_dir)),
         "history": state.get("transitions", []),
     }
 
@@ -720,6 +1229,7 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
                 f"- Security: {run['security']}",
                 f"- Gates humanos: {run['human_gates']}",
                 f"- Iteraciones fix: {run['iterations']}",
+                f"- Traceability gaps ({UNMAPPED}): {run.get('traceability_gaps', 0)}",
                 f"- Artefactos ({len(present)}): {', '.join(present)}",
                 "",
                 "> Generado por factory_app/orchestrator desde evidencia real del run.",
@@ -730,33 +1240,82 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
     )
 
 
-def build_traceability(run: dict, run_dir: Path) -> str:
-    acs = sorted(set(re.findall(r"AC-CR\d+\.\d+", _read(run_dir / "00-change-request.md"))))
-    coder = _read(run_dir / "05-coder-report.md") + _read(run_dir / "11-fix-report.md")
-    code_files = re.findall(r"(campusflow/[\w/\.]+\.py)", coder) or ["campusflow/service.py"]
-    findings = sorted(
-        set(
-            re.findall(
-                r"(RF-\d+|SEC-\d+)",
-                _read(run_dir / "08-review-report.md") + _read(run_dir / "09-security-report.md"),
-            )
-        )
+AC_RE = re.compile(r"AC-[A-Za-z0-9]+\.\d+")
+UNMAPPED = "UNMAPPED"
+
+
+def compute_traceability(run_dir: Path) -> list[dict]:
+    """Req/AC -> Task -> Code -> Test -> Finding -> Human decision, solo con vinculos
+    EVIDENCIABLES (el plan cita el AC; el diff contiene el archivo; un test cita el AC;
+    un finding cita el AC). Si no hay vinculo => UNMAPPED, nunca relleno."""
+    acs = sorted(set(AC_RE.findall(_read(run_dir / "00-change-request.md"))))
+    plan_lines = _read(run_dir / "03-implementation-plan.md").splitlines()
+    diff_files = {
+        f
+        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
+        if f.startswith(("campusflow/", "tests/product/"))
+    }
+    tests_by_ac: dict[str, list[str]] = {}
+    tests_dir = REPO_ROOT / "tests" / "product"
+    for tf in sorted(tests_dir.glob("test_*.py")) if tests_dir.is_dir() else []:
+        for chunk in re.split(r"(?m)^(?=def test_|    def test_)", tf.read_text(encoding="utf-8")):
+            name = re.match(r"\s*def (test_\w+)", chunk)
+            if not name:
+                continue
+            for ac in set(AC_RE.findall(chunk)):
+                tests_by_ac.setdefault(ac, []).append(f"{tf.name}::{name.group(1)}")
+    reports = (
+        _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
     )
+    segments = finding_segments(reports)
     dec_path = run_dir / "human-findings-decisions.json"
     decisions = (
         {
             d["finding_id"]: d["decision"]
-            for d in json.loads(dec_path.read_text()).get("decisions", [])
+            for d in json.loads(dec_path.read_text(encoding="utf-8")).get("decisions", [])
         }
         if dec_path.is_file()
         else {}
     )
     rows = []
-    for i, ac in enumerate(acs):
-        f = findings[i] if i < len(findings) else "-"
+    for ac in acs:
+        cited = [line for line in plan_lines if ac in line]
+        tasks = sorted({t for line in cited for t in re.findall(r"\b(?:TASK-\d+|T\d+)\b", line)})
+        planned_files = {f for line in cited for f in re.findall(r"[\w/]+\.py", line)}
+        code = sorted(planned_files & diff_files)  # planeado Y realmente cambiado
+        findings = sorted(fid for fid, seg in segments.items() if ac in seg)
         rows.append(
-            f"| {ac} | T1 | {code_files[0]} | tests/product/ | {f} | {decisions.get(f, '-')} |"
+            {
+                "ac": ac,
+                "tasks": tasks or [UNMAPPED],
+                "code": code or [UNMAPPED],
+                "tests": tests_by_ac.get(ac) or [UNMAPPED],
+                "findings": findings or ["-"],
+                "decisions": [decisions.get(f, "-") for f in findings] or ["-"],
+            }
         )
+    return rows
+
+
+def traceability_gaps(rows: list[dict]) -> int:
+    return sum(
+        1 for r in rows for col in ("tasks", "code", "tests") if r[col] == [UNMAPPED]
+    )
+
+
+def build_traceability(run: dict, run_dir: Path) -> str:
+    rows = compute_traceability(run_dir)
+    diff_files = [
+        f
+        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
+        if f.startswith(("campusflow/", "tests/product/"))
+    ]
+    table = [
+        f"| {r['ac']} | {', '.join(r['tasks'])} | {', '.join(r['code'])} | "
+        f"{', '.join(r['tests'])} | {', '.join(r['findings'])} | {', '.join(r['decisions'])} |"
+        for r in rows
+    ]
+    gaps = traceability_gaps(rows)
     return (
         "\n".join(
             [
@@ -764,8 +1323,15 @@ def build_traceability(run: dict, run_dir: Path) -> str:
                 "",
                 "| Req / AC | Task | Code | Test | Finding | Human decision |",
                 "|---|---|---|---|---|---|",
-                *rows,
+                *(table or ["| (no AC-* in the Change Request) | - | - | - | - | - |"]),
                 "",
+                f"**Traceability gaps ({UNMAPPED}): {gaps}** — vinculos que la evidencia del "
+                "run no sustenta; el Release Manager debe considerarlos antes de decidir."
+                if gaps
+                else "Traceability gaps: 0",
+                "",
+                f"Files changed in the run (git diff {_run_diff_range(run_dir)}): "
+                + (", ".join(diff_files) or "none recorded"),
                 f"Gates: {json.dumps(run['human_gates'])}",
                 f"Estado final: {run['status']} — el merge final es exclusivamente humano.",
                 "",

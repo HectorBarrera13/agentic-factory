@@ -14,3 +14,16 @@
 - [ ] T12 Create 5+ agent eval cases. (dataset 7 casos + métrica adversarial listos; falta `agents-cli eval run` real con key)
 
 Restante principal = correr de verdad con Gemini (T02→T03/T04/T08), 3 CRs completos, evals y defensa.
+
+## Runbook de corridas reales (requiere GEMINI_API_KEY y cuota; no ejecutado)
+
+Pendiente del humano; la fábrica ya soporta checkpoint/resume (`docs/RATE_LIMIT_PLAYBOOK.md`).
+Un run completo gasta ~15-40 llamadas: repartir en ventanas de cuota y rotar roles entre CRs.
+
+1. Feature normal: `CR-001` → `start_run.py`, `orchestrator CR-001 --adk`, gates con rol correcto,
+   `export_evidence.py CR-001`.
+2. Bug/regresión: `CR-003` (el xfail strict debe pasar a PASS sin debilitar tests).
+3. Autorización/ambigüedad: `CR-002` o `CR-005` (debe STOPear; el PO decide y el run reanuda).
+4. Evals: `agents-cli eval run` → guardar `baseline.json`; mejorar; `eval run` →
+   `improved.json`; `agents-cli eval compare baseline.json improved.json`.
+5. Defensa: CR sorpresa con el mismo flujo; registrar roles que firmaron cada gate.

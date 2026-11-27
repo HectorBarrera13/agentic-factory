@@ -26,8 +26,11 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> dict:
             "stderr": "",
         }
     try:
+        # utf-8 explicito: en Windows el locale (cp1252) rompe el hilo lector con la salida
+        # de semgrep y stdout quedaba vacio => "OK con 0 hallazgos" falso.
         p = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout, check=False,
         )
         return {
             "tool": cmd[0],
@@ -52,7 +55,7 @@ def semgrep_scan(root: Path) -> dict:
         return {"scanner": "semgrep", **{k: r[k] for k in ("status", "stderr")}, "findings": []}
     findings = []
     try:
-        data = json.loads(r["stdout"] or "{}")
+        data = json.loads(r["stdout"])  # vacio => PARSE_ERROR, nunca "OK"
         for item in data.get("results", []):
             sev = str(item.get("extra", {}).get("severity", "INFO")).upper()
             findings.append(
@@ -68,7 +71,7 @@ def semgrep_scan(root: Path) -> dict:
                 }
             )
     except json.JSONDecodeError:
-        findings = [{"rule": "parse_error", "severity": "LOW", "file": "-", "line": 0}]
+        return _parse_error("semgrep", r)
     return {"scanner": "semgrep", "status": "OK", "findings": findings}
 
 
@@ -84,7 +87,7 @@ def pip_audit_scan(root: Path) -> dict:
         return {"scanner": "pip-audit", "status": r["status"], "findings": []}
     findings = []
     try:
-        data = json.loads(r["stdout"] or "{}")
+        data = json.loads(r["stdout"])  # vacio => PARSE_ERROR, nunca "OK"
         for dep in data.get("dependencies", []):
             for vuln in dep.get("vulns", []):
                 findings.append(
@@ -96,7 +99,7 @@ def pip_audit_scan(root: Path) -> dict:
                     }
                 )
     except json.JSONDecodeError:
-        pass
+        return _parse_error("pip-audit", r)  # nunca "OK con 0 hallazgos" si no se pudo leer
     return {"scanner": "pip-audit", "status": "OK", "findings": findings}
 
 
@@ -135,7 +138,10 @@ def secret_scan(root: Path) -> dict:
             "status": "FALLBACK_REGEX" if r["status"] == "TOOL_MISSING" else r["status"],
             "findings": hits,
         }
-    data = json.loads(r["stdout"] or "{}")
+    try:
+        data = json.loads(r["stdout"])  # vacio => PARSE_ERROR, nunca "OK"
+    except json.JSONDecodeError:
+        return _parse_error("secrets", r)
     findings = [
         {"rule": s.get("type", "?"), "severity": "HIGH", "file": f, "line": s.get("line_number")}
         for f, secrets in data.get("results", {}).items()
@@ -144,8 +150,20 @@ def secret_scan(root: Path) -> dict:
     return {"scanner": "secrets", "status": "OK", "findings": findings}
 
 
+def _parse_error(scanner: str, r: dict) -> dict:
+    """Salida ilegible: degradado y explicito (no bloquea, pero jamas se reporta OK)."""
+    return {
+        "scanner": scanner,
+        "status": "PARSE_ERROR",
+        "stderr": (r.get("stderr") or "")[-500:],
+        "findings": [],
+    }
+
+
 def run_security_scans(root: Path) -> dict:
     scans = [semgrep_scan(root), pip_audit_scan(root), secret_scan(root)]
     high = [f for scan in scans for f in scan.get("findings", []) if f.get("severity") == "HIGH"]
+    for i, finding in enumerate(high, 1):  # id clasificable por el Human Reviewer
+        finding["id"] = f"SEC-SCAN-{i:02d}"
     degraded = [scan["scanner"] for scan in scans if scan["status"] != "OK"]
     return {"scans": scans, "high": len(high), "blocked": bool(high), "degraded_scanners": degraded}
