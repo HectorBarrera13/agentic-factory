@@ -259,7 +259,8 @@ def test_select_context_picks_relevant_sections_and_writes_manifest(tools_sandbo
     docs.mkdir()
     (docs / "REQUIREMENTS.md").write_text(
         "# R\n\n## FR-01 — Events\ncreate\n\n## FR-03 — Registration\nregister\n\n"
-        "## FR-04 — Cancellation\ncancel\n\n## NFR-01 — Architecture\nlayers\n"
+        "## FR-04 — Cancellation\ncancel\n\n## NFR-01 — Architecture\nlayers\n",
+        encoding="utf-8",
     )
     (docs / "SPEC.md").write_text("# S\n\n## Register\nfull -> error. Covers FR-03.\n")
     (docs / "ARCHITECTURE.md").write_text("# Architecture\nAPI -> Service\n")
@@ -284,5 +285,5 @@ def test_select_context_picks_relevant_sections_and_writes_manifest(tools_sandbo
     assert inc["tests"] == ["tests/product/test_service.py"]
     assert ctx["manifest"]["whole_repo_sent"] is False
     assert "cancel" not in ctx["text"] and "register" in ctx["text"]
-    saved = json.loads((run / "context-manifest.json").read_text())
+    saved = json.loads((run / "context-manifest.json").read_text(encoding="utf-8"))
     assert saved["included"] == inc

@@ -266,7 +266,7 @@ def select_context(change_id: str) -> dict:
     stems = {p.rsplit("/", 1)[-1][:-3] for p in source}
     tests_dir = REPO_ROOT / "tests" / "product"
     tests = [
-        str(t.relative_to(REPO_ROOT))
+        t.relative_to(REPO_ROOT).as_posix()
         for t in sorted(tests_dir.glob("test_*.py"))
         if tests_dir.is_dir()
         and (
@@ -278,7 +278,7 @@ def select_context(change_id: str) -> dict:
     text = "\n\n".join([*requirements.values(), *spec.values(), architecture])[:_CONTEXT_CAP]
     manifest = {
         "change_id": change_id,
-        "change_request": str(cr_path.relative_to(REPO_ROOT)) if cr_path.is_file() else None,
+        "change_request": cr_path.relative_to(REPO_ROOT).as_posix() if cr_path.is_file() else None,
         "discovery": "docs/REPO_MAP.md",
         "included": {
             "requirements_sections": sorted(requirements),
