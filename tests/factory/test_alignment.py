@@ -256,7 +256,7 @@ def test_inspect_git_diff_is_read_only_and_shows_branch_changes(tools_sandbox):
     git("checkout", "-qb", "factory/CR-T")
     (tools_sandbox / "a.py").write_text("x = 2\n")
     git("commit", "-qam", "change")
-    out = tools.inspect_git_diff()
+    out = tools.inspect_git_diff(stat_only=False)
     assert out["ok"] and "+x = 2" in out["diff"]
     assert "a.py" in tools.inspect_git_diff(stat_only=True)["diff"]
 
@@ -280,7 +280,7 @@ def test_inspect_git_diff_uses_the_run_base_when_there_is_no_main(tools_sandbox)
     run = tools_sandbox / "runs" / "CR-T"
     run.mkdir(parents=True)
     (run / "factory-state.json").write_text(json.dumps({"base_commit": base}))
-    out = tools.inspect_git_diff()
+    out = tools.inspect_git_diff(stat_only=False)
     assert out["ok"] and "+x = 2" in out["diff"]
 
 

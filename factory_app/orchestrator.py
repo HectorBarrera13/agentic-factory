@@ -72,6 +72,14 @@ _RECO_RE = re.compile(
 )
 
 
+def final_text(parts) -> str:
+    """Texto de la respuesta final: TODAS las partes de texto, sin los `thought` del modelo.
+
+    Antes se tomaba solo `parts[-1]`: con respuestas en varias partes el reporte perdia
+    el contenido y quedaba solo la linea RECOMMENDATION."""
+    return "".join(p.text for p in parts if getattr(p, "text", None) and not p.thought)
+
+
 def parse_recommendation(report: str) -> str:
     """Lee SOLO la linea `RECOMMENDATION: ...` (la ultima si hay varias).
     Devuelve PROCEED | HUMAN_CLARIFICATION_REQUIRED | EMPTY | MISSING: menciones sueltas
@@ -238,24 +246,31 @@ class ADKExecutor(AgentExecutor):
         from . import agents as A
         from .tools import select_context
 
-        agent = getattr(A, self.AGENT_FOR_PHASE[phase])
+        # Instancia NUEVA por fase: sin padre, sin estado compartido con otras fases.
+        agent = A.AGENT_FACTORIES[self.AGENT_FOR_PHASE[phase]]()
         # Context engineering (§12): solo lo relevante, con manifiesto auditable en el run.
         context = {**context, "selected_context": select_context(context["change_id"])["text"]}
         prompt = self._prompt(phase, context)
 
         async def _run() -> str:
             runner = InMemoryRunner(agent=agent, app_name=f"factory_{phase}")
-            session = await runner.session_service.create_session(
-                app_name=runner.app_name, user_id=context["change_id"]
-            )
-            new_message = types.Content(role="user", parts=[types.Part(text=prompt)])
-            text = ""
-            async for event in runner.run_async(
-                user_id=session.user_id, session_id=session.id, new_message=new_message
-            ):
-                if event.is_final_response() and event.content and event.content.parts:
-                    text = event.content.parts[-1].text or ""
-            return text
+            try:
+                session = await runner.session_service.create_session(
+                    app_name=runner.app_name,
+                    user_id=context["change_id"],
+                    # lo leen los callbacks de auditoria (runs/<CR>/tool-calls.jsonl)
+                    state={"change_id": context["change_id"], "phase": phase},
+                )
+                new_message = types.Content(role="user", parts=[types.Part(text=prompt)])
+                text = ""
+                async for event in runner.run_async(
+                    user_id=session.user_id, session_id=session.id, new_message=new_message
+                ):
+                    if event.is_final_response() and event.content and event.content.parts:
+                        text = final_text(event.content.parts)
+                return text
+            finally:
+                await runner.close()
 
         def _call() -> str:
             return asyncio.run(_run())

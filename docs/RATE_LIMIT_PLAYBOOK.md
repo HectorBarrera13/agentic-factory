@@ -20,6 +20,7 @@ de "Resilience: manejo documentado de rate limit / retry / resume" (Definition o
 | `RetryInfo.retryDelay > 10 min` (cuota diaria) | **No reintenta** (gastaría quota en vano); eleva `TransientModelError` con la ventana de resume y la sugerencia de cambiar modelo |
 | Agotados reintentos | Estado del run **intacto en su checkpoint** (`INTAKE_PENDING` verificado: cero escrituras parciales); exit 4 |
 | Reanudación | El MISMO comando `--adk` continúa desde el último checkpoint; fases ya completas no se repiten |
+| Reintentos internos de google-genai | **Desactivados** (`Gemini(retry_options=HttpRetryOptions(attempts=1))` en `factory_app/agents.py`): solo reintenta el backoff de la fábrica, así no se multiplican los reintentos ni se esconde la métrica |
 | Métrica | `llm_retries` y `last_llm_note` persistidos en `factory-state.json` (medible en evals §19.1); cuenta tanto los reintentos que terminaron en éxito como los agotados |
 | Respuesta vacía o sin línea `RECOMMENDATION:` (Intake/Planner) | **No** se toma como PROCEED: el run queda `ESCALATED` (`stop_reason` "sin RECOMMENDATION valida") y se reanuda con una decisión del gate correspondiente |
 | Error no transitorio (p. ej. `KeyError` de plantilla ADK) | Sin reintento: se propaga y el run sigue en su checkpoint |

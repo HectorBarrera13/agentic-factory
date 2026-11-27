@@ -17,8 +17,16 @@ def _safe_repo_path(relative_path: str) -> Path:
     return candidate
 
 
-def list_repo_files(prefix: str = "") -> dict:
-    """List files under an allowlisted read-only area."""
+def list_repo_files(prefix: str) -> dict:
+    """List files under an allowlisted read-only area.
+
+    Args:
+        prefix: Folder relative to the repo root (docs, change_requests, campusflow,
+            tests or runs). Use "" to list every readable area.
+
+    Returns:
+        {"ok": True, "files": [...]} (max 250) or {"ok": False, "error": "..."}.
+    """
     prefix = prefix.strip().strip("/")
     if prefix:
         top = prefix.split("/", 1)[0]
@@ -43,7 +51,15 @@ def list_repo_files(prefix: str = "") -> dict:
 
 
 def read_repo_file(relative_path: str) -> dict:
-    """Read UTF-8 text from an allowlisted repository area."""
+    """Read UTF-8 text from an allowlisted repository area.
+
+    Args:
+        relative_path: File path relative to the repo root, e.g. "docs/SPEC.md".
+
+    Returns:
+        {"ok": True, "path": ..., "content": ...} (truncated at 40000 chars) or
+        {"ok": False, "error": "..."}.
+    """
     path = _safe_repo_path(relative_path)
     rel = path.relative_to(REPO_ROOT)
     if not rel.parts or rel.parts[0] not in READABLE_ROOTS:
@@ -62,7 +78,11 @@ def read_repo_file(relative_path: str) -> dict:
 
 
 def run_baseline_verification() -> dict:
-    """Run an allowlisted deterministic baseline. No arbitrary shell input."""
+    """Run an allowlisted deterministic baseline (pytest + ruff). No arbitrary shell input.
+
+    Returns:
+        {"ok": bool, "results": [{"command", "returncode", "stdout", "stderr"}, ...]}.
+    """
     # sys.executable: el interprete del venv que corre la fabrica (un `python` del PATH
     # puede ser otro sin pytest/ruff y daria FAIL falsos).
     commands = [
@@ -124,7 +144,17 @@ def _is_engine_artifact(filename: str) -> bool:
 
 
 def write_run_evidence(change_id: str, filename: str, content: str) -> dict:
-    """Write only evidence files under runs/<CR-ID>/; never product code."""
+    """Write only evidence files under runs/<CR-ID>/; never product code.
+
+    Args:
+        change_id: Change Request id, e.g. "CR-001".
+        filename: Plain file name (.md, .json or .txt), no folders. Engine artifacts
+            (NN-*.md, human-*, factory-*.json, traceability.md...) are denied.
+        content: Full text to write.
+
+    Returns:
+        {"ok": True, "path": ...} or {"ok": False, "error": "..."}.
+    """
     if not change_id.startswith("CR-"):
         return {"ok": False, "error": "change_id must start with CR-"}
     if "/" in filename or "\\" in filename or not filename.endswith((".md", ".json", ".txt")):
@@ -162,6 +192,13 @@ def write_product_file(relative_path: str, content: str) -> dict:
     Denies requirements/spec/docs, the factory itself, evidence, secrets and
     configuration. El motor ademas registra intentos y corre verificacion
     determinista despues; el Coder nunca puede autoaprobarse.
+
+    Args:
+        relative_path: Path under campusflow/ or tests/product/.
+        content: Full new file content (max 60000 chars).
+
+    Returns:
+        {"ok": True, "path": ..., "bytes": n} or {"ok": False, "error": "..."}.
     """
     candidate = (REPO_ROOT / relative_path).resolve()
     if REPO_ROOT not in candidate.parents:
@@ -192,6 +229,9 @@ def run_security_scans_tool() -> dict:
 
     Solo lectura; el agente interpreta la salida, jams la reemplaza con opinion.
     Herramienta ausente => TOOL_MISSING reportado honestamente (nunca simulado).
+
+    Returns:
+        {"scans": [...], "high": n, "blocked": bool, "degraded_scanners": [...]}.
     """
     from .scanners import run_security_scans
 
@@ -207,6 +247,13 @@ def write_test_file(relative_path: str, content: str) -> dict:
 
     Nunca codigo de aplicacion (campusflow/), requisitos, fabrica ni evidencia:
     delega en write_product_file para heredar TODAS sus denegaciones.
+
+    Args:
+        relative_path: Path tests/product/test_*.py.
+        content: Full new file content.
+
+    Returns:
+        {"ok": True, "path": ..., "bytes": n} or {"ok": False, "error": "..."}.
     """
     candidate = (REPO_ROOT / relative_path).resolve()
     try:
@@ -241,8 +288,15 @@ def _active_diff_range() -> str:
     return "main...HEAD"
 
 
-def inspect_git_diff(stat_only: bool = False) -> dict:
-    """Read-only: diff de la rama del run contra su base guardada. Sin argumentos libres."""
+def inspect_git_diff(stat_only: bool) -> dict:
+    """Read-only: diff de la rama del run contra su base guardada. Sin argumentos libres.
+
+    Args:
+        stat_only: True for only the per-file summary (--stat), False for the full diff.
+
+    Returns:
+        {"ok": True, "diff": ...} (truncated at 40000 chars) or {"ok": False, "error": ...}.
+    """
     cmd = ["git", "diff", _active_diff_range()] + (["--stat"] if stat_only else [])
     completed = subprocess.run(
         cmd, cwd=REPO_ROOT, text=True, capture_output=True, timeout=60, check=False

@@ -23,6 +23,7 @@ runs/CR-001/
   factory-run.json
   15-release-decision.json              # gate 3 (Release Manager)
   context-manifest.json                 # contexto seleccionado: incluido / descartado
+  tool-calls.jsonl                      # solo --adk: cada llamada a tool (fase, agente, args truncados, ok/error)
   factory-state.json                    # estado/checkpoint del motor (awaiting_gate, base_commit, rondas)
   human-<gate>-decision.json            # fuente maquina de cada decision humana
   human-<gate>-decision-clarification*.json  # aclaraciones del PO que reanudaron un ESCALATED

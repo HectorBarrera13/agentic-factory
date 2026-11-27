@@ -16,7 +16,7 @@ Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) · Agents CLI · 
 ```bash
 uv sync
 cp .env.example .env        # pegar GEMINI_API_KEY de Google AI Studio (GOOGLE_API_KEY tambien vale)
-uv run pytest -q            # 157 passed + 1 xfailed (defecto intencional CR-003)
+uv run pytest -q            # 175 passed + 1 xfailed (defecto intencional CR-003)
 uv run ruff check campusflow tests factory_app scripts
 python scripts/verify_repo.py
 ```
