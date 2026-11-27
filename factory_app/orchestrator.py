@@ -773,6 +773,12 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
     # ---- 4 VERIFICATION determinista (FAIL nunca llega a review)
     if status == "VERIFY_PENDING":
         v = executor.run_verification()
+        integrity = check_test_integrity(state)
+        if integrity is not None:  # guardia determinista: nadie debilita tests existentes
+            v = {
+                "ok": bool(v.get("ok")) and integrity["returncode"] == 0,
+                "results": [*v.get("results", []), integrity],
+            }
         round_no = state.get("iterations", 0)
         (
             run_dir / "07-verification.txt" if round_no == 0 else run_dir / "12-re-verification.txt"
@@ -848,8 +854,18 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             from .scanners import run_security_scans
 
             scans = run_security_scans(REPO_ROOT)
+            scan_rows = [
+                f"{f['id']} | HIGH | - | {f.get('file')}:{f.get('line')} | "
+                f"{f.get('rule')} ({scan['scanner']})"
+                for scan in scans["scans"]
+                for f in scan.get("findings", [])
+                if f.get("id")
+            ]
             (run_dir / "09-security-report.md").write_text(
                 sec["report"]
+                + "\n\n## Hallazgos HIGH de escaner (clasificables en el gate review)\n\n"
+                + ("\n".join(scan_rows) if scan_rows else "ninguno")
+                + f"\n\nDegradados: {', '.join(scans['degraded_scanners']) or 'ninguno'}"
                 + "\n\n## Escaneos deterministas\n\n```json\n"
                 + json.dumps(scans, indent=2)
                 + "\n```\n",
@@ -967,16 +983,62 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
 
 
 # ================================================================= parsing/consolidacion
+_SKIP_RE = re.compile(
+    r"pytest\.mark\.(?:skip|skipif|xfail)\b|pytest\.(?:skip|xfail|importorskip)\(|unittest\.skip"
+)
+_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def (test_\w+)", re.M)
+
+
+def check_test_integrity(state: dict) -> dict | None:
+    """Compara tests/product contra la base del run: un `test_*` desaparecido o una marca
+    skip/xfail NUEVA => FAIL con el motivo (AGENTS.md: no debilitar tests). Quitar un
+    xfail esta permitido (p.ej. CR-003 arregla el defecto). Sin git/base: None."""
+    base = state.get("base_commit")
+    if not base or not _has_git():
+        return None
+    listed = _git(["ls-tree", "-r", "--name-only", base, "--", "tests/product"])
+    base_files = set(listed.stdout.split()) if listed.returncode == 0 else set()
+    tests_dir = REPO_ROOT / "tests" / "product"
+    current = (
+        {p.relative_to(REPO_ROOT).as_posix() for p in tests_dir.rglob("*.py")}
+        if tests_dir.is_dir()
+        else set()
+    )
+    problems = []
+    for path in sorted(p for p in base_files | current if p.endswith(".py")):
+        old = _git(["show", f"{base}:{path}"]).stdout if path in base_files else ""
+        cur_path = REPO_ROOT / path
+        new = cur_path.read_text(encoding="utf-8", errors="replace") if cur_path.is_file() else ""
+        removed = set(_TEST_DEF_RE.findall(old)) - set(_TEST_DEF_RE.findall(new))
+        if removed:
+            problems.append(f"{path}: tests eliminados o renombrados {sorted(removed)}")
+        added = len(_SKIP_RE.findall(new)) - len(_SKIP_RE.findall(old))
+        if added > 0:
+            problems.append(f"{path}: {added} marca(s) skip/xfail nuevas")
+    return {
+        "command": "test-integrity (tests/product vs base del run)",
+        "returncode": 1 if problems else 0,
+        "stdout": "" if problems else "test-integrity: OK",
+        "stderr": "\n".join(problems),
+    }
+
+
 def parse_verification(v: dict) -> tuple[int, int, str]:
     out = " ".join(r.get("stdout", "") + r.get("stderr", "") for r in v.get("results", []))
     tests = int(m.group(1)) if (m := re.search(r"(\d+) passed", out)) else 0
     m2 = re.search(r"(\d+) failed", out)
-    tests += int(m2.group(1)) if m2 else 0
+    pytest_out = " ".join(
+        r.get("stdout", "") for r in v.get("results", []) if "pytest" in r.get("command", "")
+    )
+    # errores de coleccion/fixture tambien fallan (solo salida de pytest: ruff dice "1 error")
+    m3 = re.search(r"(\d+) errors?\b", pytest_out)
+    failed = (int(m2.group(1)) if m2 else 0) + (int(m3.group(1)) if m3 else 0)
+    tests += failed
     ruff_ok = any(
         "ruff" in r.get("command", "") and r.get("returncode", 1) == 0 for r in v.get("results", [])
     )
     lint = "PASS" if ruff_ok or "All checks passed" in out else "FAIL"
-    return tests, (int(m2.group(1)) if m2 else 0), lint
+    return tests, failed, lint
 
 
 def count_findings(text: str) -> dict:
@@ -988,11 +1050,14 @@ def count_findings(text: str) -> dict:
         "must_fix": num(r"MUST FIX:?\s*(\d+)"),
         "should_fix": num(r"SHOULD FIX:?\s*(\d+)"),
         "high": num(r"HIGH:?\s*(\d+)"),
-        "medium": len(re.findall(r"\bMEDIUM\b", text)),
+        # la linea resumen manda ("MEDIUM: 0" ya no cuenta como 1); sin resumen, filas SEC
+        "medium": num(r"MEDIUM:\s*(\d+)")
+        if re.search(r"MEDIUM:\s*\d+", text, re.I)
+        else len(re.findall(r"\|\s*MEDIUM\s*\|", text, re.I)),
     }
 
 
-FINDING_ID_RE = re.compile(r"\b(?:RF|SEC)-\d{2,}\b")
+FINDING_ID_RE = re.compile(r"\b(?:RF|SEC(?:-SCAN)?)-\d{2,}\b")
 SEVERITY_RE = re.compile(r"\b(?:MUST FIX|SHOULD FIX|OPTIONAL|CRITICAL|HIGH|MEDIUM|LOW)\b", re.I)
 BLOCKING_SEVERITIES = {"MUST FIX", "CRITICAL", "HIGH"}
 

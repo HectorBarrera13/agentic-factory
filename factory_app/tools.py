@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -59,26 +60,45 @@ def read_repo_file(relative_path: str) -> dict:
 
 def run_baseline_verification() -> dict:
     """Run an allowlisted deterministic baseline. No arbitrary shell input."""
+    # sys.executable: el interprete del venv que corre la fabrica (un `python` del PATH
+    # puede ser otro sin pytest/ruff y daria FAIL falsos).
     commands = [
-        ["python", "-m", "pytest", "-q"],
-        ["python", "-m", "ruff", "check", "campusflow", "tests", "factory_app", "scripts"],
+        [sys.executable, "-m", "pytest", "-q"],
+        [sys.executable, "-m", "ruff", "check", "campusflow", "tests", "factory_app", "scripts"],
     ]
     results = []
     all_ok = True
     for command in commands:
-        completed = subprocess.run(
-            command, cwd=REPO_ROOT, text=True, capture_output=True, timeout=120, check=False
-        )
+        label = " ".join(["python", *command[1:]])
+        try:
+            completed = subprocess.run(
+                command, cwd=REPO_ROOT, text=True, capture_output=True,
+                timeout=VERIFY_TIMEOUT, check=False,
+            )
+        except subprocess.TimeoutExpired as exc:  # FAIL registrado, no excepcion que tumbe el run
+            all_ok = False
+            results.append(
+                {
+                    "command": label,
+                    "returncode": None,
+                    "stdout": str(exc.stdout or "")[-6000:],
+                    "stderr": f"timeout tras {VERIFY_TIMEOUT}s",
+                }
+            )
+            continue
         all_ok = all_ok and completed.returncode == 0
         results.append(
             {
-                "command": " ".join(command),
+                "command": label,
                 "returncode": completed.returncode,
                 "stdout": completed.stdout[-6000:],
                 "stderr": completed.stderr[-3000:],
             }
         )
     return {"ok": all_ok, "results": results}
+
+
+VERIFY_TIMEOUT = 120
 
 
 def write_run_evidence(change_id: str, filename: str, content: str) -> dict:
