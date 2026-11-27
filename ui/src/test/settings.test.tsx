@@ -48,7 +48,7 @@ describe("ProvidersPanel", () => {
     expect(input).toHaveAttribute("type", "password");
     await userEvent.type(input, "sk-ant-test-1234");
     await userEvent.click(submit);
-    expect(save).toHaveBeenCalledWith("anthropic", { api_key: "sk-ant-test-1234" });
+    expect(save).toHaveBeenCalledWith("anthropic", { api_key: "sk-ant-test-1234" });  // pragma: allowlist secret
     expect(await screen.findByText(/clave inválida/i)).toBeInTheDocument();
     expect(input).toHaveValue(""); // la clave no queda en pantalla
     expect(onChanged).toHaveBeenCalled();

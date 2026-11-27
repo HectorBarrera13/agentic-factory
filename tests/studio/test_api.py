@@ -314,6 +314,7 @@ def test_providers_never_return_the_key(client, mock_http, monkeypatch):
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     mock_http(lambda r: httpx.Response(200, json={"data": [{"id": "gpt-4.1"}]}))
+    # pragma: allowlist nextline secret
     r = client.put("/api/providers/openai", json={"api_key": "sk-test-SECRET1234"})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -333,6 +334,7 @@ def test_invalid_key_is_reported_and_models_endpoint_does_not_crash(client, mock
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     mock_http(lambda r: httpx.Response(401, json={"error": "bad"}))
+    # pragma: allowlist nextline secret
     body = client.put("/api/providers/anthropic", json={"api_key": "sk-ant-wrong000"}).json()
     assert body["test"]["ok"] is False and body["test"]["kind"] == "INVALID_KEY"
     models = client.get("/api/providers/anthropic/models?refresh=true").json()
@@ -345,6 +347,7 @@ def test_env_keys_are_read_only_from_the_ui(client, monkeypatch):
     assert gem["status"]["key_source"] == "env" and "FROMENV" not in str(gem)
     r = client.delete("/api/providers/gemini/key")
     assert r.status_code == 400 and "variable de entorno" in r.json()["error"]
+    # pragma: allowlist nextline secret
     r = client.put("/api/providers/gemini", json={"api_key": "AIzaOTHER0000"})
     assert r.status_code == 400
 

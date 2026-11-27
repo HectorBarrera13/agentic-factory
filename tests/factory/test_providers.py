@@ -41,7 +41,7 @@ def _reset_transport():
 
 # ---------------------------------------------------------------- credenciales
 def test_saved_key_is_masked_and_never_returned():
-    st = credentials.save("anthropic", api_key="sk-ant-abcdef123456")
+    st = credentials.save("anthropic", api_key="sk-ant-abcdef123456")  # pragma: allowlist secret
     assert st == {"has_key": True, "key_source": "file", "last4": "3456", "url": None,
                   "url_source": "none"}
     assert "sk-ant" not in json.dumps(credentials.status("anthropic"))
@@ -50,19 +50,19 @@ def test_saved_key_is_masked_and_never_returned():
 
 
 def test_real_env_var_wins_and_cannot_be_changed_from_the_ui(monkeypatch):
-    credentials.save("openai", api_key="sk-file-0000aaaa")
+    credentials.save("openai", api_key="sk-file-0000aaaa")  # pragma: allowlist secret
     monkeypatch.setenv("OPENAI_API_KEY", "sk-env-1111bbbb")
     assert credentials.get_key("openai") == "sk-env-1111bbbb"
     assert credentials.status("openai")["key_source"] == "env"
     with pytest.raises(FactoryError, match="variable de entorno"):
-        credentials.save("openai", api_key="sk-new-2222cccc")
+        credentials.save("openai", api_key="sk-new-2222cccc")  # pragma: allowlist secret
     with pytest.raises(FactoryError, match="variable de entorno"):
         credentials.delete_key("openai")
 
 
 def test_file_key_is_applied_to_env_and_removed_on_delete():
-    credentials.save("gemini", api_key="AIzaFAKEKEY12345")
-    assert os.environ["GEMINI_API_KEY"] == "AIzaFAKEKEY12345"
+    credentials.save("gemini", api_key="AIzaFAKEKEY12345")  # pragma: allowlist secret
+    assert os.environ["GEMINI_API_KEY"] == "AIzaFAKEKEY12345"  # pragma: allowlist secret
     # lo que pusimos nosotros no cuenta como "entorno real"
     assert credentials.status("gemini")["key_source"] == "file"
     st = credentials.delete_key("gemini")
@@ -82,7 +82,7 @@ def test_urls_must_be_http_and_have_defaults():
     st = credentials.save("openai_compatible", url="http://127.0.0.1:1234/v1/")
     assert st["url"] == "http://127.0.0.1:1234/v1"
     with pytest.raises(FactoryError):
-        credentials.save("ollama", api_key="nope")  # ollama no usa clave
+        credentials.save("ollama", api_key="nope")  # pragma: allowlist secret (ollama no usa clave)
 
 
 def test_unknown_provider_is_rejected():
@@ -109,7 +109,7 @@ def test_gemini_lists_only_generate_content_models_with_pagination():
             {"name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"]},
         ]})
 
-    credentials.save("gemini", api_key="AIzaFAKEKEY12345")
+    credentials.save("gemini", api_key="AIzaFAKEKEY12345")  # pragma: allowlist secret
     _mock(handler)
     ids = [m["id"] for m in providers.list_models("gemini")]
     assert ids == ["gemini-2.5-flash", "gemini-2.5-pro"] and len(calls) == 2
@@ -126,7 +126,7 @@ def test_anthropic_paginates_and_sends_version_header():
                                              "has_more": True, "last_id": "claude-a"})
         return httpx.Response(200, json={"data": [{"id": "claude-b"}], "has_more": False})
 
-    credentials.save("anthropic", api_key="sk-ant-abcdef123456")
+    credentials.save("anthropic", api_key="sk-ant-abcdef123456")  # pragma: allowlist secret
     _mock(handler)
     assert [m["id"] for m in providers.list_models("anthropic")] == ["claude-a", "claude-b"]
 
@@ -136,7 +136,7 @@ def test_openai_filters_non_chat_models():
         {"id": "gpt-4.1"}, {"id": "text-embedding-3-small"}, {"id": "whisper-1"},
         {"id": "tts-1"}, {"id": "dall-e-3"}, {"id": "omni-moderation-latest"},
     ]}))
-    credentials.save("openai", api_key="sk-test-00001111")
+    credentials.save("openai", api_key="sk-test-00001111")  # pragma: allowlist secret
     assert [m["id"] for m in providers.list_models("openai")] == ["gpt-4.1"]
 
 
@@ -168,7 +168,7 @@ def test_ollama_and_openai_compatible_use_the_configured_url():
 )
 def test_test_connection_reports_problems(response, kind):
     _mock(lambda r: response)
-    credentials.save("openai", api_key="sk-test-00001111")
+    credentials.save("openai", api_key="sk-test-00001111")  # pragma: allowlist secret
     out = providers.test_connection("openai")
     assert out["ok"] is False and out["kind"] == kind
 
@@ -212,9 +212,9 @@ def test_build_llm_per_provider():
     from google.adk.models.lite_llm import LiteLlm
 
     assert isinstance(build_llm("gemini", "gemini-2.5-flash"), Gemini)
-    credentials.save("anthropic", api_key="sk-ant-abcdef123456")
+    credentials.save("anthropic", api_key="sk-ant-abcdef123456")  # pragma: allowlist secret
     assert isinstance(build_llm("anthropic", "claude-x"), AnthropicLlm)
-    credentials.save("openai", api_key="sk-test-00001111")
+    credentials.save("openai", api_key="sk-test-00001111")  # pragma: allowlist secret
     llm = build_llm("openai", "gpt-4.1")
     assert isinstance(llm, LiteLlm) and llm.model == "openai/gpt-4.1"
     assert build_llm("ollama", "llama3").model == "ollama_chat/llama3"
@@ -281,7 +281,7 @@ def test_probe_classifies_and_caches(llm, status, temp):
 
 
 def test_probe_redacts_keys_from_messages():
-    credentials.save("openai", api_key="sk-proj-SECRETSECRET99")
+    credentials.save("openai", api_key="sk-proj-SECRETSECRET99")  # pragma: allowlist secret
     out = probe.probe("openai", "gpt-x", llm=StubLlm(
         mode="error", error="401 Incorrect API key provided: sk-proj-SECRETSECRET99"))
     assert "SECRETSECRET" not in out["message"]
