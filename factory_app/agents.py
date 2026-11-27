@@ -10,16 +10,16 @@ Configuracion comun:
   transferencia; cada fase es una sesion aislada.
 - Reintentos: los hace SOLO el backoff del orquestador (metricas + deteccion de cuota diaria),
   asi que el cliente genai se fija explicitamente a 1 intento.
-- Temperatura baja: los roles son deterministas (planes, revisiones, findings).
+- Modelo y temperatura por rol salen de `[agents]` del proyecto activo (temperatura baja
+  por defecto: los roles son deterministas) y las instrucciones nombran sus areas reales.
 """
-
-import os
 
 from google.adk.agents.llm_agent import LlmAgent
 from google.adk.models.google_llm import Gemini
 from google.genai import types
 
 from .audit import record_tool_call, record_tool_error
+from .context import project
 from .prompts import (
     CODER_INSTRUCTION,
     EVIDENCE_INSTRUCTION,
@@ -28,6 +28,7 @@ from .prompts import (
     REVIEWER_INSTRUCTION,
     SECURITY_INSTRUCTION,
     TEST_ANALYST_INSTRUCTION,
+    render,
 )
 from .tools import (
     inspect_git_diff,
@@ -40,26 +41,38 @@ from .tools import (
     write_test_file,
 )
 
-GEMINI_MODEL = os.getenv("FACTORY_MODEL", "gemini-3.8-flash")
-TEMPERATURE = 0.2
 READ_TOOLS = [list_repo_files, read_repo_file]
+ROLE_OF = {
+    "IntakeAgent": "intake",
+    "PlannerAgent": "planner",
+    "CoderAgent": "coder",
+    "TestAnalystAgent": "test_analyst",
+    "ReviewerAgent": "reviewer",
+    "SecurityAgent": "security",
+    "EvidenceAgent": "evidence",
+}
 
 
-def _model() -> Gemini:
+def _model(role: str) -> Gemini:
     # attempts=1: sin reintentos internos de google-genai; el backoff del orquestador es
     # el unico que reintenta (evita reintentos multiplicados y cuota gastada a ciegas).
-    return Gemini(model=GEMINI_MODEL, retry_options=types.HttpRetryOptions(attempts=1))
+    return Gemini(
+        model=project().config.agents.model_for(role),
+        retry_options=types.HttpRetryOptions(attempts=1),
+    )
 
 
 def _agent(name: str, description: str, instruction: str, tools: list, output_key: str):
+    role = ROLE_OF[name]
+    temperature = project().config.agents.temperature_for(role)
     return LlmAgent(
         name=name,
-        model=_model(),
+        model=_model(role),
         description=description,
-        instruction=instruction,
+        instruction=render(instruction, project()),
         tools=list(tools),
         output_key=output_key,
-        generate_content_config=types.GenerateContentConfig(temperature=TEMPERATURE),
+        generate_content_config=types.GenerateContentConfig(temperature=temperature),
         # Auditoria: cada llamada a tool queda en runs/<CR>/tool-calls.jsonl.
         after_tool_callback=record_tool_call,
         on_tool_error_callback=record_tool_error,

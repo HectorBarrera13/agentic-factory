@@ -30,8 +30,11 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-MAX_FIX_ROUNDS = 3
+from .context import project, run_scope
+from .project import Limits
+
+# Tope por defecto (cada proyecto lo configura en [limits]).
+MAX_FIX_ROUNDS = Limits().verify_rounds
 PROMPT_FIELD_CAP = 12_000
 
 TERMINAL = {"READY FOR HUMAN MERGE", "NOT READY", "ESCALATED"}
@@ -42,7 +45,8 @@ class AwaitingHuman(Exception):
     def __init__(self, change_id: str, gate: str, why: str):
         super().__init__(
             f"{change_id}: STOP en human gate '{gate}' — {why}. "
-            f"Registre con scripts/approve_gate.py / scripts/decide_findings.py y reanude."
+            "Registre la decision (Factory Studio o scripts/approve_gate.py / "
+            "scripts/decide_findings.py) y reanude."
         )
         self.change_id, self.gate, self.why = change_id, gate, why
 
@@ -113,9 +117,10 @@ def _parse_ts(value: object) -> datetime | None:
     return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
-def _git(args: list[str]) -> subprocess.CompletedProcess:
+def _git(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=False
+        ["git", *args], cwd=cwd or project().root, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", check=False,
     )
 
 
@@ -170,13 +175,15 @@ class FakeExecutor(AgentExecutor):
                 else f"# Review {cid}\n\nMUST FIX: 0\nSHOULD FIX: 0\n"
             )
             return {"report": text}
+        code = project().config.code
+        src, tests = f"{code.source[0]}/service.py", f"{code.tests}/test_service.py"
         content = {
             "plan": (
                 f"# Plan {cid}\n\n| task | files | tests |\n|---|---|---|\n"
-                "| T1 | campusflow/service.py | tests/product/test_service.py |\n\n"
-                "Verificacion: pytest + ruff.\n\nRECOMMENDATION: PROCEED\n"
+                f"| T1 | {src} | {tests} |\n\n"
+                "Verificacion: comandos de verify del proyecto.\n\nRECOMMENDATION: PROCEED\n"
             ),
-            "implement": f"# Coder report {cid}\n\nfiles_changed: campusflow/service.py\n",
+            "implement": f"# Coder report {cid}\n\nfiles_changed: {src}\n",
             "test_analysis": f"# Test analysis {cid}\n\nboundary/negativos/regresion cubiertos.\n",
             "security": f"# Security {cid}\n\nHIGH: 0\nMEDIUM: 0\n",
             "fix": f"# Fix {cid}\n\nSolo findings autorizados corregidos.\n",
@@ -192,6 +199,7 @@ class FakeExecutor(AgentExecutor):
                 "results": [
                     {
                         "command": "pytest (fake)",
+                        "kind": "pytest",
                         "returncode": 1,
                         "stdout": "2 failed, 10 passed",
                         "stderr": "",
@@ -203,12 +211,14 @@ class FakeExecutor(AgentExecutor):
             "results": [
                 {
                     "command": "pytest (fake)",
+                    "kind": "pytest",
                     "returncode": 0,
                     "stdout": "12 passed in 0.10s",
                     "stderr": "",
                 },
                 {
                     "command": "ruff (fake)",
+                    "kind": "ruff",
                     "returncode": 0,
                     "stdout": "All checks passed!",
                     "stderr": "",
@@ -330,7 +340,7 @@ class ADKExecutor(AgentExecutor):
         """Persiste la metrica de rate-limit retries en factory-state.json."""
         if n == 0 and not exhausted:
             return
-        run_dir = REPO_ROOT / "runs" / str(change_id).strip().upper()
+        run_dir = project().run_dir(change_id)
         if not _state_path(run_dir).is_file():
             return
         prior = json.loads(_state_path(run_dir).read_text(encoding="utf-8")).get(
@@ -524,22 +534,29 @@ def _try_resume_escalation(run_dir: Path, state: dict) -> dict | None:
     return None
 
 
-def _commit_product_changes(change_id: str, message: str) -> str:
-    """Git evidence: comitea cambios de producto SOLO en la rama factory/<CR>.
+def _code_paths() -> list[str]:
+    return list(project().config.code.writable)
 
-    Sin repo git o sin rama de run => no comitea (nunca en main: regla dura).
+
+def _commit_product_changes(change_id: str, message: str) -> str:
+    """Git evidence: comitea cambios de producto SOLO en la rama del run, dentro de su
+    worktree (el arbol del usuario nunca recibe commits de la fabrica).
+
+    Sin repo git o sin worktree del run => no comitea (nunca en la rama base: regla dura).
     Autoria 'Agentic Software Factory': commit de maquina que espera review humano.
     Retorna hash corto o ''.
     """
-    if _git(["rev-parse", "--verify", "HEAD"]).returncode != 0:
+    p = project()
+    wt = p.worktree(change_id)
+    if not (wt / ".git").exists():
         return ""
-    branch = f"factory/{change_id}"
-    if _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
-        return ""  # _prepare_branch ya hizo checkout; fuera de la rama del run no se comitea
-    for path in ("campusflow", "tests/product"):
-        if (REPO_ROOT / path).exists():
-            _git(["add", path])
-    if _git(["diff", "--cached", "--quiet"]).returncode == 0:
+    branch = p.branch(change_id)
+    if _git(["rev-parse", "--abbrev-ref", "HEAD"], wt).stdout.strip() != branch:
+        return ""  # fuera de la rama del run no se comitea
+    for path in _code_paths():
+        if (wt / path).exists():
+            _git(["add", "--", path], wt)
+    if _git(["diff", "--cached", "--quiet"], wt).returncode == 0:
         return ""
     msg = f"factory({change_id}): {message}"
     r = subprocess.run(
@@ -554,14 +571,14 @@ def _commit_product_changes(change_id: str, message: str) -> str:
             "-m",
             msg,
         ],
-        cwd=REPO_ROOT,
+        cwd=wt,
         capture_output=True,
         text=True,
         check=False,
     )
     if r.returncode != 0:
         return ""
-    return _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
+    return _git(["rev-parse", "--short", "HEAD"], wt).stdout.strip()
 
 
 def _git_evidence(commit: str, state: dict, rng: str) -> str:
@@ -586,45 +603,78 @@ def _has_git() -> bool:
     return _git(["rev-parse", "--verify", "HEAD"]).returncode == 0
 
 
+def _ensure_worktree(change_id: str) -> Path:
+    """Worktree del run en <worktrees>/<CR> sobre la rama del run (lo recrea si se borro)."""
+    p = project()
+    wt, branch = p.worktree(change_id), p.branch(change_id)
+    if (wt / ".git").exists():
+        return wt
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    _git(["worktree", "prune"])
+    r = _git(["worktree", "add", "-q", str(wt), branch])
+    if r.returncode != 0:
+        raise Blocked(f"{change_id}: no se pudo crear el worktree {wt}: {r.stderr.strip()}")
+    return wt
+
+
 def _create_run_branch(change_id: str, state: dict) -> dict:
-    """Crea factory/<CR> desde HEAD (sin cambiar de rama) y guarda su base: todos los
-    diffs del run son <base_commit>...factory/<CR>, este donde este el HEAD."""
-    branch = f"factory/{change_id}"
+    """Crea la rama del run desde HEAD (sin tocar el arbol del usuario) y su worktree, y
+    guarda la base: todos los diffs del run son <base_commit>...<rama del run>."""
+    p = project()
+    branch = p.branch(change_id)
     if not _has_git():
         return {"branch": branch}
     if _git(["rev-parse", "--verify", branch]).returncode != 0:
         base = _git(["rev-parse", "HEAD"]).stdout.strip()
-        r = _git(["branch", branch])
+        r = _git(["branch", branch, base])
         if r.returncode != 0:
             raise Blocked(f"{change_id}: no se pudo crear {branch}: {r.stderr.strip()}")
     else:
         base = state.get("base_commit") or _git(["merge-base", "HEAD", branch]).stdout.strip()
-    return {"branch": branch, "base_commit": base}
+    wt = _ensure_worktree(change_id)
+    return {
+        "branch": branch,
+        "base_commit": base,
+        "worktree": wt.relative_to(p.root).as_posix(),
+    }
 
 
 def _prepare_branch(change_id: str, state: dict, require_clean: bool) -> None:
-    """Deja el arbol en factory/<CR> antes de que un agente lo lea o escriba.
-    require_clean: cambios sin commitear en producto/tests bloquean el run (el commit de
-    maquina nunca debe llevarse trabajo humano ajeno al plan)."""
+    """Deja listo el worktree del run antes de que un agente lo lea o escriba.
+    require_clean: cambios sin commitear en el codigo DEL WORKTREE bloquean el run (el
+    commit de maquina nunca se lleva trabajo ajeno al plan). El arbol del usuario no se
+    mira ni se toca: el humano puede seguir editando su rama."""
     if not _has_git():
         return
-    branch = state.get("branch") or f"factory/{change_id}"
+    wt = _ensure_worktree(change_id)
     if require_clean:
-        dirty = _git(["status", "--porcelain", "--", "campusflow", "tests/product"]).stdout
+        dirty = _git(["status", "--porcelain", "--", *_code_paths()], wt).stdout
         if dirty.strip():
             raise Blocked(
-                f"{change_id}: hay cambios sin commitear en campusflow/ o tests/product:\n"
-                f"{dirty.rstrip()}\nComitealos o descartalos y reanuda; la fabrica no los "
-                "mezcla con el trabajo del Coder."
+                f"{change_id}: hay cambios sin commitear en el worktree del run "
+                f"({', '.join(_code_paths())}):\n{dirty.rstrip()}\nComitealos o descartalos "
+                "en el worktree y reanuda; la fabrica no los mezcla con el trabajo del Coder."
             )
-    if _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
-        r = _git(["checkout", "-q", branch])
+    branch = state.get("branch") or project().branch(change_id)
+    if _git(["rev-parse", "--abbrev-ref", "HEAD"], wt).stdout.strip() != branch:
+        r = _git(["checkout", "-q", branch], wt)
         if r.returncode != 0:
             raise Blocked(f"{change_id}: no se pudo cambiar a {branch}: {r.stderr.strip()}")
 
 
+def remove_worktree(change_id: str) -> bool:
+    """Accion EXPLICITA del humano: borra el worktree del run (la rama queda intacta)."""
+    wt = project().worktree(change_id)
+    if not wt.exists():
+        return False
+    r = _git(["worktree", "remove", "--force", str(wt)])
+    if r.returncode != 0:
+        raise Blocked(f"{change_id}: no se pudo borrar el worktree: {r.stderr.strip()}")
+    return True
+
+
 def _diff_range(state: dict) -> str:
-    base = state.get("base_commit") or "main"
+    base = state.get("base_commit") or project().config.git.base_branch
     return f"{base}...{state.get('branch') or 'HEAD'}"
 
 
@@ -634,9 +684,16 @@ def _run_diff_range(run_dir: Path) -> str:
 
 # ================================================================= avance
 def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
-    executor = executor or FakeExecutor()
+    """Avanza el run hasta el siguiente gate o estado terminal, en el proyecto activo.
+    Durante el avance el run queda activo: las tools trabajan en SU worktree."""
     change_id = change_id.strip().upper()
-    run_dir = REPO_ROOT / "runs" / change_id
+    with run_scope(change_id):
+        return _advance(change_id, executor or FakeExecutor())
+
+
+def _advance(change_id: str, executor: AgentExecutor) -> dict:
+    run_dir = project().run_dir(change_id)
+    limits = project().config.limits
     if not _state_path(run_dir).is_file():
         raise SystemExit(
             f"No existe run {change_id}. Ejecute: python scripts/start_run.py {change_id}"
@@ -676,7 +733,7 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 change_id, "requirements", f"intake: {why}; resuelva con approve_gate requirements"
             )
         state = _update_state(run_dir, status="REQUIREMENTS_GATE")
-        return advance(change_id, executor)
+        return _advance(change_id, executor)
 
     # ---- 1b gate requirements (intake ya hecho: no se repite al reanudar)
     if status == "REQUIREMENTS_GATE":
@@ -688,7 +745,7 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             )
         state = _apply_gate_decision(run_dir, change_id, "requirements", decision, state)
         _update_state(run_dir, status="PLAN_PENDING", planned=False)
-        return advance(change_id, executor)
+        return _advance(change_id, executor)
 
     # ---- 2 PLANNER + gate plan (el Coder bloqueado hasta APPROVED)
     if status == "PLAN_PENDING":
@@ -729,7 +786,7 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             )
         state = _apply_gate_decision(run_dir, change_id, "plan", decision, state)
         _update_state(run_dir, status="IMPLEMENT_PENDING", **_create_run_branch(change_id, state))
-        return advance(change_id, executor)
+        return _advance(change_id, executor)
 
     # ---- 3 CODER + TEST ANALYST
     if status == "IMPLEMENT_PENDING":
@@ -783,7 +840,7 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             fix_details="",
             last_commit=last or state.get("last_commit", ""),
         )
-        return advance(change_id, executor)
+        return _advance(change_id, executor)
 
     # ---- 4 VERIFICATION determinista (FAIL nunca llega a review)
     if status == "VERIFY_PENDING":
@@ -803,11 +860,12 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         ver = {"status": verdict, "tests": tests, "failed": failed, "lint": lint}
         if verdict == "FAIL":
             verify_rounds = state.get("verify_rounds", 0)
-            if verify_rounds >= MAX_FIX_ROUNDS:
+            if verify_rounds >= limits.verify_rounds:
                 _escalate(
                     run_dir,
                     change_id,
-                    f"verification FAIL tras {verify_rounds} rondas de fix (tope {MAX_FIX_ROUNDS})",
+                    f"verification FAIL tras {verify_rounds} rondas de fix "
+                    f"(tope {limits.verify_rounds})",
                     verification=ver,
                 )
                 raise Blocked(f"{change_id}: verification FAIL persistente -> ESCALATED a humano")
@@ -819,9 +877,9 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 verification=ver,
                 fix_reason="verification FAIL",
             )
-            return advance(change_id, executor)
+            return _advance(change_id, executor)
         _update_state(run_dir, status="REVIEW_PENDING", verification=ver)
-        return advance(change_id, executor)
+        return _advance(change_id, executor)
 
     # ---- 5 REVIEWER + SECURITY independientes + gate findings
     if status == "REVIEW_PENDING":
@@ -868,7 +926,9 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             )  # sesion propia distinta
             from .scanners import run_security_scans
 
-            scans = run_security_scans(REPO_ROOT)
+            scans = run_security_scans(
+                project().work_root(change_id), project().semgrep_targets()
+            )
             scan_rows = [
                 f"{f['id']} | HIGH | - | {f.get('file')}:{f.get('line')} | "
                 f"{f.get('rule')} ({scan['scanner']})"
@@ -929,12 +989,12 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         state = _apply_gate_decision(run_dir, change_id, "review", decision, state)
         if blocking:
             review_rounds = state.get("review_rounds", 0)
-            if review_rounds >= MAX_FIX_ROUNDS:
+            if review_rounds >= limits.review_rounds:
                 _escalate(
                     run_dir,
                     change_id,
                     f"findings bloqueantes aceptados tras {review_rounds} rondas de fix "
-                    f"(tope {MAX_FIX_ROUNDS}): " + ", ".join(blocking),
+                    f"(tope {limits.review_rounds}): " + ", ".join(blocking),
                 )
                 raise Blocked(f"{change_id}: findings bloqueantes persistentes -> ESCALATED")
             _archive(run_dir, "human-review-decision.json", rounds)
@@ -955,9 +1015,9 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 fix_details=details[:8000],
                 last_fix_reason=reason,
             )
-            return advance(change_id, executor)
+            return _advance(change_id, executor)
         _update_state(run_dir, status="EVIDENCE_PENDING")
-        return advance(change_id, executor)
+        return _advance(change_id, executor)
 
     # ---- 6 EVIDENCIA + gate release
     if status == "EVIDENCE_PENDING":
@@ -1005,24 +1065,37 @@ _TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def (test_\w+)", re.M)
 
 
 def check_test_integrity(state: dict) -> dict | None:
-    """Compara tests/product contra la base del run: un `test_*` desaparecido o una marca
-    skip/xfail NUEVA => FAIL con el motivo (AGENTS.md: no debilitar tests). Quitar un
-    xfail esta permitido (p.ej. CR-003 arregla el defecto). Sin git/base: None."""
+    """Compara los tests del proyecto (worktree del run) contra la base del run: un
+    `test_*` desaparecido o una marca skip/xfail NUEVA => FAIL con el motivo (AGENTS.md: no
+    debilitar tests). Quitar un xfail esta permitido (p.ej. CR-003 arregla el defecto).
+    Solo Python; en otros lenguajes se registra "no disponible". Sin git/base: None."""
+    p = project()
+    tests_rel = p.config.code.tests
+    if not p.is_python():
+        return {
+            "command": f"test-integrity ({tests_rel})",
+            "kind": "integrity",
+            "returncode": 0,
+            "stdout": f"test-integrity: no disponible para {p.config.code.language}",
+            "stderr": "",
+        }
     base = state.get("base_commit")
     if not base or not _has_git():
         return None
-    listed = _git(["ls-tree", "-r", "--name-only", base, "--", "tests/product"])
+    cid = state.get("change_id")
+    root = p.work_root(cid) if cid else p.root
+    listed = _git(["ls-tree", "-r", "--name-only", base, "--", tests_rel])
     base_files = set(listed.stdout.split()) if listed.returncode == 0 else set()
-    tests_dir = REPO_ROOT / "tests" / "product"
+    tests_dir = root / tests_rel
     current = (
-        {p.relative_to(REPO_ROOT).as_posix() for p in tests_dir.rglob("*.py")}
+        {f.relative_to(root).as_posix() for f in tests_dir.rglob("*.py")}
         if tests_dir.is_dir()
         else set()
     )
     problems = []
-    for path in sorted(p for p in base_files | current if p.endswith(".py")):
+    for path in sorted(f for f in base_files | current if f.endswith(".py")):
         old = _git(["show", f"{base}:{path}"]).stdout if path in base_files else ""
-        cur_path = REPO_ROOT / path
+        cur_path = root / path
         new = cur_path.read_text(encoding="utf-8", errors="replace") if cur_path.is_file() else ""
         removed = set(_TEST_DEF_RE.findall(old)) - set(_TEST_DEF_RE.findall(new))
         if removed:
@@ -1031,28 +1104,50 @@ def check_test_integrity(state: dict) -> dict | None:
         if added > 0:
             problems.append(f"{path}: {added} marca(s) skip/xfail nuevas")
     return {
-        "command": "test-integrity (tests/product vs base del run)",
+        "command": f"test-integrity ({tests_rel} vs base del run)",
+        "kind": "integrity",
         "returncode": 1 if problems else 0,
         "stdout": "" if problems else "test-integrity: OK",
         "stderr": "\n".join(problems),
     }
 
 
+def _kind(result: dict) -> str:
+    """Tipo de comando; resultados antiguos sin `kind` se infieren del comando."""
+    if result.get("kind"):
+        return str(result["kind"])
+    command = str(result.get("command", ""))
+    for kind in ("pytest", "ruff", "jest", "integrity"):
+        if kind in command:
+            return kind
+    return "exit_code"
+
+
 def parse_verification(v: dict) -> tuple[int, int, str]:
-    out = " ".join(r.get("stdout", "") + r.get("stderr", "") for r in v.get("results", []))
-    tests = int(m.group(1)) if (m := re.search(r"(\d+) passed", out)) else 0
-    m2 = re.search(r"(\d+) failed", out)
-    pytest_out = " ".join(
-        r.get("stdout", "") for r in v.get("results", []) if "pytest" in r.get("command", "")
-    )
-    # errores de coleccion/fixture tambien fallan (solo salida de pytest: ruff dice "1 error")
-    m3 = re.search(r"(\d+) errors?\b", pytest_out)
-    failed = (int(m2.group(1)) if m2 else 0) + (int(m3.group(1)) if m3 else 0)
-    tests += failed
-    ruff_ok = any(
-        "ruff" in r.get("command", "") and r.get("returncode", 1) == 0 for r in v.get("results", [])
-    )
-    lint = "PASS" if ruff_ok or "All checks passed" in out else "FAIL"
+    """(tests, failed, lint) desde los resultados, segun el parser de cada tipo:
+    pytest ("N passed, M failed, K errors"), jest ("Tests: M failed, N passed"),
+    ruff/lint (exit code); exit_code solo cuenta en ok/FAIL. Sin linter: NOT_RUN."""
+    tests = failed = 0
+    lint_results = []
+    for r in v.get("results", []):
+        kind, out = _kind(r), f"{r.get('stdout', '')} {r.get('stderr', '')}"
+        if kind == "pytest":
+            passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", out)) else 0
+            fail = int(m.group(1)) if (m := re.search(r"(\d+) failed", out)) else 0
+            # errores de coleccion/fixture tambien fallan (solo pytest: ruff dice "1 error")
+            m = re.search(r"(\d+) errors?\b", r.get("stdout", ""))
+            errs = int(m.group(1)) if m else 0
+            tests += passed + fail + errs
+            failed += fail + errs
+        elif kind == "jest":
+            line = m.group(0) if (m := re.search(r"Tests:[^\n]*", out)) else ""
+            fail = int(m.group(1)) if (m := re.search(r"(\d+) failed", line)) else 0
+            total = int(m.group(1)) if (m := re.search(r"(\d+) total", line)) else 0
+            tests += total
+            failed += fail
+        elif kind in {"ruff", "lint"}:
+            lint_results.append(r.get("returncode") == 0 or "All checks passed" in out)
+    lint = "NOT_RUN" if not lint_results else ("PASS" if all(lint_results) else "FAIL")
     return tests, failed, lint
 
 
@@ -1240,30 +1335,50 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
     )
 
 
-AC_RE = re.compile(r"AC-[A-Za-z0-9]+\.\d+")
+AC_RE = re.compile(r"AC-[A-Za-z0-9]+\.\d+")  # default; cada proyecto define [ids]
 UNMAPPED = "UNMAPPED"
+
+
+def _diff_files(run_dir: Path) -> list[str]:
+    paths = tuple(f"{c}/" for c in _code_paths())
+    return [
+        f
+        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
+        if f.startswith(paths)
+    ]
 
 
 def compute_traceability(run_dir: Path) -> list[dict]:
     """Req/AC -> Task -> Code -> Test -> Finding -> Human decision, solo con vinculos
     EVIDENCIABLES (el plan cita el AC; el diff contiene el archivo; un test cita el AC;
     un finding cita el AC). Si no hay vinculo => UNMAPPED, nunca relleno."""
-    acs = sorted(set(AC_RE.findall(_read(run_dir / "00-change-request.md"))))
+    p = project()
+    ac_re = re.compile(p.config.ids.acceptance)
+    acs = sorted(set(ac_re.findall(_read(run_dir / "00-change-request.md"))))
     plan_lines = _read(run_dir / "03-implementation-plan.md").splitlines()
-    diff_files = {
-        f
-        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
-        if f.startswith(("campusflow/", "tests/product/"))
-    }
+    diff_files = set(_diff_files(run_dir))
     tests_by_ac: dict[str, list[str]] = {}
-    tests_dir = REPO_ROOT / "tests" / "product"
-    for tf in sorted(tests_dir.glob("test_*.py")) if tests_dir.is_dir() else []:
-        for chunk in re.split(r"(?m)^(?=def test_|    def test_)", tf.read_text(encoding="utf-8")):
-            name = re.match(r"\s*def (test_\w+)", chunk)
+    tests_dir = p.work_root(run_dir.name) / p.config.code.tests
+    from .tools import is_test_file_name
+
+    test_files = (
+        sorted(f for f in tests_dir.rglob("*") if f.is_file() and is_test_file_name(f.name))
+        if tests_dir.is_dir()
+        else []
+    )
+    for tf in test_files:
+        text = tf.read_text(encoding="utf-8", errors="replace")
+        # python: `def test_x`; js/ts: `test("...")` / `it("...")`
+        pattern = r"(?m)^(?=\s*(?:async\s+)?def test_|\s*(?:test|it)\()"
+        for chunk in re.split(pattern, text):
+            name = re.match(
+                r"\s*(?:async\s+)?def (test_\w+)|\s*(?:test|it)\(\s*['\"`]([^'\"`]+)", chunk
+            )
             if not name:
                 continue
-            for ac in set(AC_RE.findall(chunk)):
-                tests_by_ac.setdefault(ac, []).append(f"{tf.name}::{name.group(1)}")
+            label = name.group(1) or name.group(2)
+            for ac in set(ac_re.findall(chunk)):
+                tests_by_ac.setdefault(ac, []).append(f"{tf.name}::{label}")
     reports = (
         _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
     )
@@ -1281,7 +1396,9 @@ def compute_traceability(run_dir: Path) -> list[dict]:
     for ac in acs:
         cited = [line for line in plan_lines if ac in line]
         tasks = sorted({t for line in cited for t in re.findall(r"\b(?:TASK-\d+|T\d+)\b", line)})
-        planned_files = {f for line in cited for f in re.findall(r"[\w/]+\.py", line)}
+        planned_files = {
+            f for line in cited for f in re.findall(r"[\w./-]+\.[A-Za-z0-9]+", line)
+        }
         code = sorted(planned_files & diff_files)  # planeado Y realmente cambiado
         findings = sorted(fid for fid, seg in segments.items() if ac in seg)
         rows.append(
@@ -1305,11 +1422,7 @@ def traceability_gaps(rows: list[dict]) -> int:
 
 def build_traceability(run: dict, run_dir: Path) -> str:
     rows = compute_traceability(run_dir)
-    diff_files = [
-        f
-        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
-        if f.startswith(("campusflow/", "tests/product/"))
-    ]
+    diff_files = _diff_files(run_dir)
     table = [
         f"| {r['ac']} | {', '.join(r['tasks'])} | {', '.join(r['code'])} | "
         f"{', '.join(r['tests'])} | {', '.join(r['findings'])} | {', '.join(r['decisions'])} |"
@@ -1344,14 +1457,24 @@ def build_traceability(run: dict, run_dir: Path) -> str:
 if __name__ == "__main__":
     import sys
 
-    mode = "adk" if "--adk" in sys.argv else "fake"
+    from .context import FACTORY_REPO, set_project
+    from .project import load_project
+
+    args = sys.argv[1:]
+    if "--project" in args:  # otro proyecto: python -m factory_app.orchestrator CR-1 --project P
+        i = args.index("--project")
+        set_project(load_project(args[i + 1]))
+        args = args[:i] + args[i + 2 :]
+    mode = "adk" if "--adk" in args else "fake"
+    args = [a for a in args if a != "--adk"]
     if mode == "adk":  # las credenciales viven SOLO en .env (gitignoreado)
         from dotenv import load_dotenv
 
-        load_dotenv(REPO_ROOT / ".env")
+        load_dotenv(FACTORY_REPO / ".env")
+        load_dotenv(project().root / ".env")
     ex: AgentExecutor = ADKExecutor() if mode == "adk" else FakeExecutor()
     try:
-        st = advance(sys.argv[1], ex)
+        st = advance(args[0], ex)
         print(f"status: {st['status']}")
     except (AwaitingHuman, Blocked) as exc:
         print(f"\nSTOP: {exc}")

@@ -1,33 +1,23 @@
-"""Roles humanos por gate (curso §9/§10). La firma `--by "Nombre (Rol)"` debe traer el rol
-autorizado para ese gate: la fábrica no acepta que cualquiera firme cualquier gate."""
+"""Compatibilidad CLI: los roles viven en factory_app.roles; aqui los errores salen como
+SystemExit (mensaje y codigo distinto de cero)."""
 
 from __future__ import annotations
 
-import re
+import sys
+from pathlib import Path
 
-# Gate 1 (§10): "Product Owner y/o Tech Lead" aprueban alcance y plan.
-GATE_ROLES: dict[str, tuple[str, ...]] = {
-    "requirements": ("product owner",),
-    "plan": ("tech lead", "product owner"),
-    "review": ("human reviewer", "reviewer"),
-    "findings": ("human reviewer", "reviewer"),
-    "release": ("release manager",),
-}
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from factory_app.project import DEFAULT_GATE_ROLES  # noqa: E402
+from factory_app.roles import FactoryError, role_of  # noqa: E402
+from factory_app.roles import validate_role as _validate  # noqa: E402
 
-def role_of(recorded_by: str) -> str:
-    m = re.search(r"\(([^)]+)\)\s*$", recorded_by.strip())
-    return m.group(1).strip() if m else ""
+GATE_ROLES = {gate: tuple(roles) for gate, roles in DEFAULT_GATE_ROLES.items()}
+__all__ = ["GATE_ROLES", "role_of", "validate_role"]
 
 
 def validate_role(gate: str, recorded_by: str) -> str:
-    """Devuelve el rol firmante o termina con SystemExit si no corresponde al gate."""
-    role = role_of(recorded_by)
-    allowed = GATE_ROLES[gate]
-    if not any(a in role.lower() for a in allowed):
-        shown = " / ".join(a.title() for a in allowed)
-        raise SystemExit(
-            f"Rol no autorizado para el gate '{gate}': {role or '(sin rol)'}. "
-            f'Use --by "Nombre ({shown})".'
-        )
-    return role
+    try:
+        return _validate(gate, recorded_by)
+    except FactoryError as exc:
+        raise SystemExit(str(exc)) from exc

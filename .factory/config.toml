@@ -1,0 +1,48 @@
+# Factory config de este repo (CampusFlow, entrega del curso).
+# Las rutas apuntan a la estructura del instructivo (§17): change_requests/ y runs/ en la raiz.
+name = "CampusFlow"
+
+[paths]
+change_requests = "change_requests"
+runs = "runs"
+worktrees = ".factory/worktrees"
+evidence = "evidence"
+
+[code]
+source = ["campusflow"]
+tests = "tests/product"
+readable = ["tests"]
+never_write = ["docs", "factory_app", "scripts", "factory_ui", "ui", ".github", "pyproject.toml", "uv.lock", "AGENTS.md"]
+language = "python"
+
+[docs]
+requirements = "docs/REQUIREMENTS.md"
+spec = "docs/SPEC.md"
+architecture = "docs/ARCHITECTURE.md"
+repo_map = "docs/REPO_MAP.md"
+always_include = ["NFR-01"]
+
+[verify]
+timeout = 120
+
+[[verify.commands]]
+name = "tests"
+cmd = ["{python}", "-m", "pytest", "-q"]
+kind = "pytest"
+
+[[verify.commands]]
+name = "lint"
+cmd = ["{python}", "-m", "ruff", "check", "campusflow", "tests", "factory_app", "scripts"]
+kind = "ruff"
+
+[git]
+base_branch = "main"
+branch_prefix = "factory/"
+
+[agents]
+model = "gemini-3.8-flash"
+temperature = 0.2
+
+[limits]
+verify_rounds = 3
+review_rounds = 3

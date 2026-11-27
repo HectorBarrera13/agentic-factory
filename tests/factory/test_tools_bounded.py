@@ -5,11 +5,12 @@ from __future__ import annotations
 import pytest
 
 from factory_app import tools
+from tests.factory.conftest import activate_project
 
 
 @pytest.fixture()
 def sandbox(tmp_path, monkeypatch):
-    monkeypatch.setattr(tools, "REPO_ROOT", tmp_path)
+    activate_project(tmp_path, monkeypatch)
     (tmp_path / "campusflow").mkdir()
     (tmp_path / "tests").mkdir()
     return tmp_path
@@ -51,4 +52,4 @@ def test_denial_does_not_write_anything(sandbox):
 def test_existing_product_files_readable_but_not_the_factory(sandbox):
     assert tools.read_repo_file("campusflow/service.py").__class__ is dict  # ok o error controlado
     denied = tools.read_repo_file("factory_app/orchestrator.py")
-    assert denied.get("error") or not denied.get("ok")  # factory_app fuera de READABLE_ROOTS
+    assert denied.get("error") or not denied.get("ok")  # factory_app fuera de las areas legibles

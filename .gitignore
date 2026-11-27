@@ -7,5 +7,8 @@ __pycache__/
 artifacts/
 runs/*
 !runs/README.md
+# worktrees de cada run de la fabrica (Factory Studio / orquestador)
+.factory/worktrees/
+.factory/runs/
 *.db
 .DS_Store

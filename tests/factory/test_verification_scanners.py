@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -20,6 +19,7 @@ from tests.factory.test_orchestrator import (
     drive,
     sandbox,  # noqa: F401  (fixture)
     state,
+    work,
 )
 
 
@@ -135,20 +135,20 @@ def test_integrity_allows_removing_an_xfail(git_sandbox):
 
 
 class CoderDeletesTest(FakeExecutor):
-    def __init__(self, path: Path):
+    def __init__(self, rel: str):
         super().__init__()
-        self.path = path
+        self.rel = rel
 
     def run_agent(self, phase, context):
-        if phase in {"implement", "fix"}:
-            self.path.write_text("def test_one():\n    assert True\n")
+        if phase in {"implement", "fix"}:  # en el worktree del run, como el Coder real
+            work(self.rel).write_text("def test_one():\n    assert True\n")
         return super().run_agent(phase, context)
 
 
 def test_weakened_tests_fail_verification_and_never_reach_review(git_sandbox):
     run, tmp, _st = git_sandbox
     with pytest.raises(Blocked):
-        drive(run, CoderDeletesTest(tmp / "tests" / "product" / "test_a.py"))
+        drive(run, CoderDeletesTest("tests/product/test_a.py"))
     verification = (run / "07-verification.txt").read_text()
     assert "tests eliminados" in verification and "test_two" in verification
     assert state(run)["status"] == "ESCALATED"
@@ -164,12 +164,14 @@ def _ok(stdout):
 
 @pytest.mark.parametrize("scan", ["semgrep_scan", "pip_audit_scan", "secret_scan"])
 def test_unreadable_scanner_output_is_parse_error(monkeypatch, tmp_path, scan):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")  # pip-audit aplica
     monkeypatch.setattr(scanners, "_run", _ok("{not json"))
     out = getattr(scanners, scan)(tmp_path)
     assert out["status"] == "PARSE_ERROR" and out["findings"] == []
 
 
 def test_parse_error_is_reported_as_degraded(monkeypatch, tmp_path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     monkeypatch.setattr(scanners, "_run", _ok("{not json"))
     result = scanners.run_security_scans(tmp_path)
     assert set(result["degraded_scanners"]) == {"semgrep", "pip-audit", "secrets"}
@@ -185,7 +187,9 @@ def _fake_scans(high: int):
 
 
 def test_high_scanner_findings_get_classifiable_ids(monkeypatch, tmp_path):
-    monkeypatch.setattr(scanners, "semgrep_scan", lambda root: _fake_scans(2)["scans"][0])
+    monkeypatch.setattr(
+        scanners, "semgrep_scan", lambda root, targets=None: _fake_scans(2)["scans"][0]
+    )
     monkeypatch.setattr(scanners, "pip_audit_scan", lambda root: {"scanner": "pip-audit",
                                                                   "status": "OK", "findings": []})
     monkeypatch.setattr(scanners, "secret_scan", lambda root: {"scanner": "secrets",
@@ -199,7 +203,7 @@ def test_accepted_scanner_finding_is_blocking_and_triggers_fix(sandbox, monkeypa
     real = scanners.run_security_scans
     calls = {"n": 0}
 
-    def one_high_then_clean(root):
+    def one_high_then_clean(root, targets=None):
         calls["n"] += 1
         if calls["n"] == 1:
             finding = {"rule": "sqli", "severity": "HIGH", "file": "campusflow/api.py",
@@ -227,6 +231,7 @@ def test_accepted_scanner_finding_is_blocking_and_triggers_fix(sandbox, monkeypa
 
 @pytest.mark.parametrize("scan", ["semgrep_scan", "pip_audit_scan", "secret_scan"])
 def test_empty_scanner_output_is_parse_error_not_ok(monkeypatch, tmp_path, scan):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n")
     monkeypatch.setattr(scanners, "_run", _ok(""))
     assert getattr(scanners, scan)(tmp_path)["status"] == "PARSE_ERROR"
 
