@@ -16,7 +16,7 @@ Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) · Agents CLI · 
 ```bash
 uv sync
 cp .env.example .env        # pegar GEMINI_API_KEY de Google AI Studio (GOOGLE_API_KEY tambien vale)
-uv run pytest -q            # 82 passed + 1 xfailed (defecto intencional CR-003)
+uv run pytest -q            # 157 passed + 1 xfailed (defecto intencional CR-003)
 uv run ruff check campusflow tests factory_app scripts
 python scripts/verify_repo.py
 ```
@@ -31,10 +31,13 @@ uv run python scripts/start_run.py CR-001
 uv run python -m factory_app.orchestrator CR-001          # plantillas fake (sin API)
 uv run python -m factory_app.orchestrator CR-001 --adk    # agentes Gemini reales (requiere .env)
 
-# 3. decisiones humanas (cada una firma nombre+rol y queda como artefacto)
+# 3. decisiones humanas: SOLO cuando el run se detuvo en ese gate (no hay pre-aprobaciones).
+#    Cada una firma nombre+rol y queda como artefacto; tras cada una, repetir el paso 2.
 uv run python scripts/approve_gate.py CR-001 requirements APPROVED "interpretacion OK" --by "Hector (Product Owner)"
 uv run python scripts/approve_gate.py CR-001 plan APPROVED "alcance acotado" --by "Hector (Tech Lead)"
+#    gate review: clasificar TODOS los findings (las llamadas se acumulan) y cerrar el gate
 uv run python scripts/decide_findings.py CR-001 --by "Ana (Human Reviewer)" RF-01=ACCEPTED RF-02=DEFERRED
+uv run python scripts/decide_findings.py CR-001 --by "Ana (Human Reviewer)" SEC-SCAN-01=REJECTED
 uv run python scripts/approve_gate.py CR-001 review APPROVED "hallazgos clasificados" --by "Ana (Human Reviewer)"
 uv run python scripts/approve_gate.py CR-001 release APPROVED "evidencia completa" --by "Hector (Release Manager)"
 
@@ -43,18 +46,39 @@ uv run python scripts/show_run.py CR-001
 cat runs/CR-001/factory-run.json runs/CR-001/traceability.md
 ```
 
-Flujo de fases: `intake → gate requirements → plan → gate plan → coder+test analyst →
-verification(pytest/ruff determinista) → reviewer ∥ security (sesiones separadas, solo lectura) →
-gate findings → (fix → re-verification → re-review, ≤3 rondas) → evidencia consolidada →
-gate release → READY FOR HUMAN MERGE`.
+Flujo de fases (estado en `factory-state.json`): `INTAKE_PENDING → REQUIREMENTS_GATE →
+PLAN_PENDING (plan + gate plan) → IMPLEMENT_PENDING (coder+test analyst en factory/<CR>) →
+VERIFY_PENDING (pytest/ruff + integridad de tests) → REVIEW_PENDING (reviewer ∥ security,
+sesiones separadas, solo lectura + gate review) → (fix → re-verification → re-review) →
+EVIDENCE_PENDING (evidencia + gate release) → READY FOR HUMAN MERGE | NOT READY | ESCALATED`.
 
 Garantías estructurales (no de prompt):
 
 - Gates: `advance()` persiste estado y **termina el proceso** sin veredicto registrado.
-- Verification FAIL → nunca corre Reviewer/Security.
-- El Coder solo puede escribir `campusflow/` y `tests/` (`write_product_file`); docs/fábrica/evidencia/config están denegados en runtime.
-- Findings sin decisión humana ACCEPTED/MODIFIED no cambian código; tras un fix, la nueva revisión exige decisiones de la ronda actual.
-- `factory-run.json`, `traceability.md` y `14-evidence-summary.md` los genera el motor con contadores parseados de evidencia real.
+- Una decisión solo vale si se registra **después** de que el run se detuvo en ese gate
+  (`awaiting_gate` + `gate_opened_at`); `approve_gate.py` rechaza cualquier otro gate. Reanudar
+  sin decisión no salta el gate ni regenera el intake/plan/reviews ya presentados.
+- Gates `requirements`, `plan` y `review` con REJECTED/DEFERRED → `ESCALATED` (no se reanuda);
+  `release` REJECTED → `NOT READY`.
+- Verification FAIL → nunca corre Reviewer/Security. La verificación también falla si en
+  `tests/product` desaparece un `test_*` o aparece un skip/xfail nuevo respecto a la base del run
+  (quitar un xfail sí se permite).
+- Topes separados: 3 rondas de fix por verificación y 3 por findings; al superarlos → `ESCALATED`.
+- Git: `factory/<CR>` se crea desde el HEAD al aprobar el plan y guarda `base_commit`; todos los
+  diffs son `<base_commit>...factory/<CR>`. Antes del Coder se hace checkout y, si hay cambios sin
+  commitear en `campusflow/` o `tests/product`, el run se bloquea (no se mezclan con el commit de
+  máquina).
+- El Coder solo puede escribir `campusflow/` y `tests/product/` (`write_product_file`); docs/fábrica/evidencia/config están denegados en runtime.
+- El Evidence Agent no puede escribir `human-*`, estado, consolidados ni evidencia numerada `NN-*`.
+- Findings sin decisión humana ACCEPTED/MODIFIED no cambian código; tras un fix, la nueva
+  revisión exige decisiones de la ronda actual. `approve_gate review APPROVED` exige todos los
+  findings del reporte clasificados. Los HIGH de los escáneres reciben id `SEC-SCAN-NN` y se
+  clasifican igual; un escáner ausente o ilegible queda `TOOL_MISSING`/`PARSE_ERROR` (degradado,
+  nunca "OK").
+- Intake y Planner deben terminar con `RECOMMENDATION: PROCEED|HUMAN_CLARIFICATION_REQUIRED`;
+  respuesta vacía o sin esa línea → `ESCALATED`.
+- `factory-run.json`, `traceability.md` y `14-evidence-summary.md` los genera el motor con
+  contadores parseados de evidencia real (también al escalar, para poder exportarlo).
 - Estado máximo = READY FOR HUMAN MERGE; no existe tool de merge.
 
 Alineación con el instructivo (§8-§18):
@@ -67,8 +91,10 @@ Alineación con el instructivo (§8-§18):
   fuentes y tests relevantes desde `docs/REPO_MAP.md` y deja `runs/<CR>/context-manifest.json`
   (incluido y descartado).
 - Cada gate exige el rol correcto en `--by "Nombre (Rol)"` (`scripts/_roles.py`).
-- Un `ESCALATED` por ambigüedad se reanuda cuando el PO registra una decisión posterior; los
-  rechazos de gate no se reanudan.
+- Un `ESCALATED` por ambigüedad se reanuda cuando el PO registra una decisión posterior; esa
+  aclaración solo reanuda (se archiva como `human-<gate>-decision-clarification.json`) y el
+  intake/plan regenerado vuelve a pasar por su gate con una decisión nueva. Los rechazos de
+  gate no se reanudan.
 - Re-review: la ronda anterior se archiva (`08-review-report-roundN.md`), se escribe
   `13-re-review.md`, y los reportes de una ronda no se regeneran al reanudar tras el gate.
 - Solo un MUST FIX / HIGH aceptado dispara fix; un SHOULD FIX aceptado queda registrado.
