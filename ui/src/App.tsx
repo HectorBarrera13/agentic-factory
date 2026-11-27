@@ -16,6 +16,7 @@ import { CodeView } from "@/features/code/CodeView";
 import { FactoryView } from "@/features/factory/FactoryView";
 import { OpenProjectDialog, WelcomeScreen } from "@/features/project/OpenProject";
 import { SettingsView } from "@/features/settings/SettingsView";
+import { roleLabel } from "@/lib/api";
 import { useApp, type View } from "@/lib/app-state";
 import { cn } from "@/lib/utils";
 
@@ -109,7 +110,7 @@ export function SignerIndicator() {
         >
           {signer.profile.roles.map((r) => (
             <option key={r} value={r}>
-              {r}
+              {roleLabel(r)}
             </option>
           ))}
         </Select>

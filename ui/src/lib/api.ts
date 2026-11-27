@@ -7,6 +7,69 @@ export interface Profile {
   id: string;
   name: string;
   roles: string[];
+  /** Tenia roles que ya no estan en el catalogo (se quitaron al cargar). */
+  incomplete?: boolean;
+}
+
+export type ProviderId = "gemini" | "anthropic" | "openai" | "ollama" | "openai_compatible";
+
+export interface AgentOverride {
+  provider?: ProviderId | null;
+  model?: string | null;
+  temperature?: number | null;
+}
+
+export interface ProviderStatus {
+  has_key: boolean;
+  key_source: "env" | "file" | "none";
+  last4: string | null;
+  url: string | null;
+  url_source: "env" | "file" | "none";
+}
+
+export interface ProviderInfo {
+  id: ProviderId;
+  label: string;
+  description: string;
+  needs_key: boolean;
+  needs_url: boolean;
+  key_optional: boolean;
+  temperature_range: [number, number];
+  default_url: string | null;
+  status: ProviderStatus;
+}
+
+export type ConnectionKind = "OK" | "INVALID_KEY" | "UNREACHABLE" | "ERROR" | "NO_KEY" | "NO_URL";
+
+export interface ConnectionTest {
+  ok: boolean;
+  kind: ConnectionKind;
+  message: string;
+  models: number;
+}
+
+export interface ModelEntry {
+  id: string;
+  label: string;
+  created?: string | number | null;
+}
+
+export type ProbeStatus = "OK" | "NO_TOOLS" | "NO_ACCESS" | "QUOTA" | "INVALID_KEY" | "ERROR";
+
+export interface ProbeResult {
+  provider: string;
+  model: string;
+  status: ProbeStatus;
+  message: string;
+  temperature_supported: boolean | null;
+  at: number;
+  seconds: number;
+}
+
+export interface Probes {
+  items: Record<string, ProbeResult>;
+  running: string[];
+  version: number;
 }
 
 export interface VerifyCommand {
@@ -34,9 +97,10 @@ export interface ProjectConfig {
   verify: { commands: VerifyCommand[]; timeout: number };
   git: { base_branch: string; branch_prefix: string };
   agents: {
+    provider: ProviderId;
     model: string;
     temperature: number;
-    roles: Record<string, { model?: string | null; temperature?: number | null }>;
+    roles: Record<string, AgentOverride>;
   };
   limits: { verify_rounds: number; review_rounds: number };
   gates: { roles: Record<string, string[]> };
@@ -74,6 +138,8 @@ export interface Meta {
   gate_keys: string[];
   verify_kinds: string[];
   languages: string[];
+  role_catalog: string[];
+  providers: { id: ProviderId; label: string; temperature_range: [number, number] }[];
   defaults: ProjectConfig;
 }
 
@@ -283,7 +349,27 @@ export const api = {
   updateProfile: (id: string, name: string, roles: string[]) =>
     request<Profile>("PUT", `/api/profiles/${enc(id)}`, { name, roles }),
   deleteProfile: (id: string) => request<{ deleted: boolean }>("DELETE", `/api/profiles/${enc(id)}`),
+
+  providers: () => request<{ items: ProviderInfo[] }>("GET", "/api/providers"),
+  saveProvider: (id: ProviderId, body: { api_key?: string; url?: string }) =>
+    request<{ status: ProviderStatus; test: ConnectionTest }>("PUT", `/api/providers/${enc(id)}`, body),
+  deleteProviderKey: (id: ProviderId) =>
+    request<{ status: ProviderStatus }>("DELETE", `/api/providers/${enc(id)}/key`),
+  testProvider: (id: ProviderId) => request<ConnectionTest>("POST", `/api/providers/${enc(id)}/test`),
+  providerModels: (id: ProviderId, refresh = false) =>
+    request<{ items: ModelEntry[]; error: { kind: ConnectionKind; message: string } | null }>(
+      "GET",
+      `/api/providers/${enc(id)}/models?${q({ refresh: String(refresh) })}`,
+    ),
+  probes: () => request<Probes>("GET", "/api/models/probes"),
+  probe: (provider: ProviderId, model: string) =>
+    request<ProbeResult>("POST", "/api/models/probe", { provider, model }),
 };
+
+export const probeKey = (provider: string, model: string) => `${provider}:${model}`;
+
+/** "tech lead" -> "Tech Lead" (los roles del catalogo se guardan en minusculas). */
+export const roleLabel = (role: string) => role.replace(/\b\w/g, (c) => c.toUpperCase());
 
 export function errorMessage(err: unknown): string {
   if (err instanceof ApiError) {

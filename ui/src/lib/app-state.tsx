@@ -30,6 +30,8 @@ interface AppState {
   notify: (text: string, tone?: Toast["tone"]) => void;
   /** Cambia cada vez que el backend reporta un cambio (SSE). */
   tick: number;
+  /** Cambia cuando llega un resultado (o inicio) de probe de modelo. */
+  probeTick: number;
   live: boolean;
   /** Run abierto en el tablero (compartido con el selector de raiz del editor). */
   selectedRun: string | null;
@@ -72,6 +74,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
   const [toasts, setToasts] = React.useState<Toast[]>([]);
   const [tick, setTick] = React.useState(0);
+  const [probeTick, setProbeTick] = React.useState(0);
   const [live, setLive] = React.useState(false);
   const [selectedRun, setSelectedRun] = React.useState<string | null>(null);
   const [pendingOpen, setPendingOpen] = React.useState<{ root: string; path: string } | null>(null);
@@ -105,7 +108,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     if (typeof EventSource === "undefined") return;
     const source = new EventSource("/api/events");
-    source.addEventListener("change", () => setTick((t) => t + 1));
+    let lastRuns = "";
+    let lastProbes: unknown = undefined;
+    source.addEventListener("change", (ev) => {
+      // los probes de modelos tienen su propio contador: no recargan tableros de runs
+      let snap: Record<string, unknown> = {};
+      try {
+        snap = JSON.parse((ev as MessageEvent).data ?? "{}");
+      } catch {
+        /* snapshot ilegible: se trata como cambio de runs */
+      }
+      const { probes, ...runs } = snap;
+      const runsKey = JSON.stringify(runs);
+      if (runsKey !== lastRuns || !Object.keys(snap).length) setTick((t) => t + 1);
+      if (probes !== lastProbes) setProbeTick((t) => t + 1);
+      lastRuns = runsKey;
+      lastProbes = probes;
+    });
     source.onopen = () => setLive(true);
     source.onerror = () => setLive(false);
     return () => source.close();
@@ -135,6 +154,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     toasts,
     notify,
     tick,
+    probeTick,
     live,
     selectedRun,
     setSelectedRun,
