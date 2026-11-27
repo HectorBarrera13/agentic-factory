@@ -26,8 +26,11 @@ def _run(cmd: list[str], cwd: Path, timeout: int = 300) -> dict:
             "stderr": "",
         }
     try:
+        # utf-8 explicito: en Windows el locale (cp1252) rompe el hilo lector con la salida
+        # de semgrep y stdout quedaba vacio => "OK con 0 hallazgos" falso.
         p = subprocess.run(
-            cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout, check=False,
         )
         return {
             "tool": cmd[0],
@@ -52,7 +55,7 @@ def semgrep_scan(root: Path) -> dict:
         return {"scanner": "semgrep", **{k: r[k] for k in ("status", "stderr")}, "findings": []}
     findings = []
     try:
-        data = json.loads(r["stdout"] or "{}")
+        data = json.loads(r["stdout"])  # vacio => PARSE_ERROR, nunca "OK"
         for item in data.get("results", []):
             sev = str(item.get("extra", {}).get("severity", "INFO")).upper()
             findings.append(
@@ -84,7 +87,7 @@ def pip_audit_scan(root: Path) -> dict:
         return {"scanner": "pip-audit", "status": r["status"], "findings": []}
     findings = []
     try:
-        data = json.loads(r["stdout"] or "{}")
+        data = json.loads(r["stdout"])  # vacio => PARSE_ERROR, nunca "OK"
         for dep in data.get("dependencies", []):
             for vuln in dep.get("vulns", []):
                 findings.append(
@@ -136,7 +139,7 @@ def secret_scan(root: Path) -> dict:
             "findings": hits,
         }
     try:
-        data = json.loads(r["stdout"] or "{}")
+        data = json.loads(r["stdout"])  # vacio => PARSE_ERROR, nunca "OK"
     except json.JSONDecodeError:
         return _parse_error("secrets", r)
     findings = [

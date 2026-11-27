@@ -223,3 +223,24 @@ def test_accepted_scanner_finding_is_blocking_and_triggers_fix(sandbox, monkeypa
         (run / "factory-state.json").read_text()
     )["last_fix_reason"]
     assert real is not scanners.run_security_scans
+
+
+@pytest.mark.parametrize("scan", ["semgrep_scan", "pip_audit_scan", "secret_scan"])
+def test_empty_scanner_output_is_parse_error_not_ok(monkeypatch, tmp_path, scan):
+    monkeypatch.setattr(scanners, "_run", _ok(""))
+    assert getattr(scanners, scan)(tmp_path)["status"] == "PARSE_ERROR"
+
+
+@pytest.mark.real_scanner_run
+def test_scanner_output_is_decoded_as_utf8(monkeypatch, tmp_path):
+    """En Windows el locale (cp1252) rompia la lectura de la salida de semgrep."""
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen.update(kw)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    monkeypatch.setattr(scanners.shutil, "which", lambda name: name)
+    monkeypatch.setattr(scanners.subprocess, "run", fake_run)
+    scanners._run(["semgrep", "scan"], tmp_path)
+    assert seen["encoding"] == "utf-8" and seen["errors"] == "replace"
