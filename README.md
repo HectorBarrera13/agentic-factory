@@ -16,10 +16,41 @@ Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) · Agents CLI · 
 ```bash
 uv sync
 cp .env.example .env        # pegar GEMINI_API_KEY de Google AI Studio (GOOGLE_API_KEY tambien vale)
-uv run pytest -q            # 175 passed + 1 xfailed (defecto intencional CR-003)
-uv run ruff check campusflow tests factory_app scripts
+uv run pytest -q            # 216 passed + 1 xfailed (defecto intencional CR-003)
+uv run ruff check campusflow tests factory_app factory_ui scripts
 python scripts/verify_repo.py
 ```
+
+## Factory Studio (UI local)
+
+IDE web local: a un lado tu código (explorador + editor Monaco), al otro tu fábrica
+(Change Requests, runs con stepper de fases, gates firmados, findings, diff y ajustes del flujo).
+Funciona sobre **cualquier proyecto git**: su configuración vive en `<proyecto>/.factory/config.toml`
+(este repo ya trae la suya, que apunta a `change_requests/` y `runs/`).
+
+```bash
+cd ui && npm install && npm run build && cd ..   # una vez (Node solo para compilar el frontend)
+uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?token=...
+```
+
+- **Abrir proyecto**: si no tiene `.factory/`, el asistente detecta lenguaje, carpetas y comandos
+  (pyproject / package.json) y tú revisas antes de guardar.
+- **Worktree por run**: al aprobar el plan, el run trabaja en `.factory/worktrees/<CR>` con su rama
+  `factory/<CR>`; tu árbol no se toca y puedes seguir editando. El worktree solo se borra con
+  "Quitar worktree" (la rama se conserva). Nunca hay merge automático.
+- **Perfiles locales** (`~/.agentic-factory/profiles.json`): nombre + roles. Cada decisión se firma
+  como `Nombre (Rol)` y el rol se valida contra los roles del gate configurados en el proyecto.
+- **Ajustes**: modelo y temperatura por agente, límites de rondas, comandos de verificación
+  (`pytest` / `jest` / `ruff` / `lint` / `exit_code`), rutas, roles por gate. El orden de fases y
+  gates es fijo. La guardia de integridad de tests solo existe para Python ("no disponible" en
+  otros lenguajes).
+- **Seguridad**: solo escucha en 127.0.0.1, valida `Host`, token por sesión (cookie HttpOnly),
+  sin CORS; `.git` no es accesible y los `.env*`/claves se listan sin contenido.
+- Desarrollo del frontend: `uv run python -m factory_ui --token dev --no-browser` y `npm run dev`
+  en `ui/` (Vite en :5173 hace proxy de `/api` con el token). Tests: `npm test`, `npm run typecheck`
+  (TypeScript 7).
+
+Los scripts CLI siguen funcionando y aceptan `--project RUTA` (por defecto, este repo).
 
 ## Cómo opera la fábrica (implementado)
 
@@ -65,7 +96,8 @@ Garantías estructurales (no de prompt):
   (quitar un xfail sí se permite).
 - Topes separados: 3 rondas de fix por verificación y 3 por findings; al superarlos → `ESCALATED`.
 - Git: `factory/<CR>` se crea desde el HEAD al aprobar el plan y guarda `base_commit`; todos los
-  diffs son `<base_commit>...factory/<CR>`. Antes del Coder se hace checkout y, si hay cambios sin
+  diffs son `<base_commit>...factory/<CR>`. El run trabaja en su worktree
+  `.factory/worktrees/<CR>` (tu árbol no cambia de rama); si el worktree tiene cambios sin
   commitear en `campusflow/` o `tests/product`, el run se bloquea (no se mezclan con el commit de
   máquina).
 - El Coder solo puede escribir `campusflow/` y `tests/product/` (`write_product_file`); docs/fábrica/evidencia/config están denegados en runtime.

@@ -31,9 +31,15 @@ runs/CR-001/
   08-review-report-roundN.md, 09-security-report-roundN.md   # rondas previas archivadas
 ```
 
+La carpeta de runs, la de CRs y la de worktrees se configuran en `.factory/config.toml`
+(`[paths]`). En este repo apuntan a `runs/` y `change_requests/`; en otros proyectos el valor por
+defecto es `.factory/runs/` y `.factory/change_requests/`. El código del run vive en su worktree
+`.factory/worktrees/<CR>` (rama `factory/<CR>`), nunca en el árbol del usuario.
+
 Reglas de los artefactos:
 
-- `human-*` solo los escriben `approve_gate.py` / `decide_findings.py`, y solo valen si se
+- `human-*` solo los escriben `approve_gate.py` / `decide_findings.py` (o Factory Studio, que usa
+  los mismos `factory_app.services`), y solo valen si se
   registraron con el run detenido en ese gate (despues de `gate_opened_at`).
 - `factory-run.json`, `traceability.md` y `14-evidence-summary.md` tambien se generan cuando el
   run queda `ESCALATED`, para que `export_evidence.py` pueda exportarlo.
