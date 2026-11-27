@@ -9,14 +9,14 @@ Dos sistemas separados:
 
 ## Reference stack
 
-Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) · Agents CLI · Git/GitHub · pytest + ruff · Semgrep/pip-audit/detect-secrets · GitHub Actions. Sin Google Cloud billing.
+Python 3.11+ · Google ADK · Gemini Developer API (AI Studio) por defecto; Anthropic, OpenAI, Ollama y servidores compatibles con OpenAI opcionales · Agents CLI · Git/GitHub · pytest + ruff · Semgrep/pip-audit/detect-secrets · GitHub Actions. Sin Google Cloud billing.
 
 ## Setup
 
 ```bash
 uv sync
 cp .env.example .env        # pegar GEMINI_API_KEY de Google AI Studio (GOOGLE_API_KEY tambien vale)
-uv run pytest -q            # 216 passed + 1 xfailed (defecto intencional CR-003)
+uv run pytest -q            # 283 passed + 1 xfailed (defecto intencional CR-003)
 uv run ruff check campusflow tests factory_app factory_ui scripts
 python scripts/verify_repo.py
 ```
@@ -38,9 +38,11 @@ uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?
 - **Worktree por run**: al aprobar el plan, el run trabaja en `.factory/worktrees/<CR>` con su rama
   `factory/<CR>`; tu árbol no se toca y puedes seguir editando. El worktree solo se borra con
   "Quitar worktree" (la rama se conserva). Nunca hay merge automático.
-- **Perfiles locales** (`~/.agentic-factory/profiles.json`): nombre + roles. Cada decisión se firma
-  como `Nombre (Rol)` y el rol se valida contra los roles del gate configurados en el proyecto.
-- **Ajustes**: modelo y temperatura por agente, límites de rondas, comandos de verificación
+- **Perfiles locales** (`~/.agentic-factory/profiles.json`): nombre + roles del catálogo
+  (Product Owner, Tech Lead, Human Reviewer, Reviewer, Release Manager; no se aceptan otros). Cada
+  decisión se firma como `Nombre (Rol)` y el rol se valida contra los roles del gate del proyecto.
+  Un perfil viejo con roles fuera del catálogo carga marcado como incompleto hasta editarlo.
+- **Ajustes**: proveedor, modelo y temperatura por agente (ver abajo), límites de rondas, comandos de verificación
   (`pytest` / `jest` / `ruff` / `lint` / `exit_code`), rutas, roles por gate. El orden de fases y
   gates es fijo. La guardia de integridad de tests solo existe para Python ("no disponible" en
   otros lenguajes).
@@ -51,6 +53,40 @@ uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?
   (TypeScript 7).
 
 Los scripts CLI siguen funcionando y aceptan `--project RUTA` (por defecto, este repo).
+
+### Proveedores de modelos
+
+| Proveedor | Acceso | Adaptador ADK |
+|---|---|---|
+| Google Gemini (por defecto) | API key (AI Studio) | `Gemini` |
+| Anthropic | API key | `AnthropicLlm` |
+| OpenAI | API key | `LiteLlm` (`openai/…`) |
+| Ollama (local) | URL, por defecto `http://localhost:11434` | `LiteLlm` (`ollama_chat/…`) |
+| Compatible con OpenAI (LM Studio, vLLM, llama.cpp…) | URL `/v1` + clave opcional | `LiteLlm` (`openai/…`) |
+
+- **Claves**: en *Ajustes → Proveedores* eliges el proveedor, pegas la clave (o la URL) y
+  "Guardar y probar" hace una llamada de listado: *Conectado · N modelos*, *clave inválida* o
+  *sin conexión*. Se guardan solo en `~/.agentic-factory/credentials.json` (fuera del proyecto);
+  la UI muestra únicamente los 4 últimos caracteres. Una variable de entorno real
+  (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OLLAMA_HOST`,
+  `OPENAI_COMPATIBLE_BASE_URL`, o el `.env`) tiene prioridad y no se edita desde la UI.
+- **Proveedor por proyecto y por agente**: `[agents] provider/model` es el valor por defecto y
+  `[agents.roles.<agente>]` puede cambiar proveedor, modelo o temperatura (si cambia de proveedor,
+  debe indicar modelo). `FACTORY_MODEL` solo aplica cuando el proveedor es Gemini.
+- **Lista de modelos dinámica**: sale del endpoint de listado de cada proveedor (cache de 10 min,
+  botón para recargar); también se puede escribir un nombre a mano.
+- **Probe de modelos**: "Probar" (y, al guardar Ajustes, automáticamente para los modelos en uso)
+  hace una llamada mínima real con una tool `ping`: *disponible*, *no usa tools* (no sirve para los
+  agentes), *sin acceso en tu plan*, *sin cuota*, *clave inválida* o *error*. Los resultados se
+  guardan en `~/.agentic-factory/model-probes.json`; los fallos se vuelven a probar al guardar.
+- **Temperatura**: cada proveedor tiene su rango nativo (Gemini/OpenAI/locales 0–2, Anthropic 0–1).
+  El valor se recorta a ese rango y, si el probe detectó que el modelo no acepta temperatura
+  (algunos modelos de razonamiento), no se envía. La UI avisa "se aplicará X" o "no acepta
+  temperatura"; lo pedido y lo efectivo por agente quedan en `factory-state.json` y
+  `factory-run.json` (`models`).
+- Reintentos: solo el backoff del orquestador reintenta (los SDKs van con 0 reintentos); los
+  errores 429/529/overloaded/servicio no disponible de cualquier proveedor son transitorios y los de
+  autenticación o modelo inexistente escalan al humano.
 
 ## Cómo opera la fábrica (implementado)
 
