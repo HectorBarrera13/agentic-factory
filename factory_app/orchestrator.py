@@ -8,8 +8,10 @@ Fases (cada `advance()` ejecuta UNA fase y persiste factory-state.json):
 
 Reglas duras (AGENTS.md del curso):
     - Sin veredicto humano registrado, advance() se detiene: silence is never approval.
+    - Una decision solo vale si se registro DESPUES de que el run se detuvo en ese gate
+      (`awaiting_gate` + `gate_opened_at`): no hay pre-aprobaciones.
     - verification FAIL jamas llega a review (R4 del curso).
-    - MAX_FIX_ROUNDS acotado; al superarlo el run queda ESCALATED a humano.
+    - MAX_FIX_ROUNDS por tipo (verificacion / findings); al superarlo el run queda ESCALATED.
     - Ningun camino produce merge: el estado maximo es READY FOR HUMAN MERGE.
     - Los hallazgos se consumen por ronda: tras un fix, la nueva revision exige
       decisiones nuevas (no vale la decision anterior).
@@ -71,6 +73,19 @@ def _retry_hint_seconds(exc: BaseException) -> int | None:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _now_precise() -> str:
+    """Marca con microsegundos: ordena 'gate abierto' vs 'decision registrada'."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_ts(value: object) -> datetime | None:
+    try:
+        ts = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
 
 
 def _git(args: list[str]) -> subprocess.CompletedProcess:
@@ -336,9 +351,58 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.is_file() else ""
 
 
-def _gate_decision(run_dir: Path, gate: str) -> dict | None:
+def _load_state(run_dir: Path) -> dict:
+    return json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
+
+
+def _gate_decision(run_dir: Path, gate: str, state: dict) -> dict | None:
+    """Decision humana VALIDA para `gate`: solo si la fabrica esta detenida en ese gate y
+    la decision se registro DESPUES de abrirse (nunca pre-aprobaciones ni decisiones
+    viejas de otra ronda). Lo demas se ignora: silence is never approval."""
     path = run_dir / f"human-{gate}-decision.json"
-    return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
+    if not path.is_file() or state.get("awaiting_gate") != gate:
+        return None
+    decision = json.loads(path.read_text(encoding="utf-8"))
+    opened, recorded = (
+        _parse_ts(state.get("gate_opened_at")),
+        _parse_ts(decision.get("recorded_at")),
+    )
+    if opened is None or recorded is None or recorded < opened:
+        return None
+    return decision
+
+
+def _open_gate(run_dir: Path, change_id: str, gate: str, why: str, state: dict, **kw) -> None:
+    """Detiene el run en `gate`. La marca de apertura se conserva si ya estaba abierto
+    (reanudar sin decision no invalida una decision registrada entre dos advance)."""
+    if state.get("awaiting_gate") != gate:
+        kw.update(awaiting_gate=gate, gate_opened_at=_now_precise())
+    if kw:
+        _update_state(run_dir, **kw)
+    raise AwaitingHuman(change_id, gate, why)
+
+
+def _escalate(run_dir: Path, change_id: str, reason: str, **kw) -> dict:
+    """ESCALATED + evidencia consolidada (factory-run.json, resumen, trazabilidad) para que
+    un escalamiento tambien sea exportable y auditable."""
+    kw.setdefault("awaiting_gate", "")
+    state = _update_state(
+        run_dir, status="ESCALATED", stop_reason=reason, escalated_at=_now(), **kw
+    )
+    _write_consolidated_evidence(change_id, state, run_dir)
+    return state
+
+
+def _write_consolidated_evidence(change_id: str, state: dict, run_dir: Path) -> dict:
+    run_json = build_factory_run(change_id, state, run_dir)
+    (run_dir / "factory-run.json").write_text(json.dumps(run_json, indent=2), encoding="utf-8")
+    (run_dir / "14-evidence-summary.md").write_text(
+        build_evidence_summary(run_json, run_dir), encoding="utf-8"
+    )
+    (run_dir / "traceability.md").write_text(
+        build_traceability(run_json, run_dir), encoding="utf-8"
+    )
+    return run_json
 
 
 # Artefactos de decision humana con el nombre exacto del instructivo (§17). Los
@@ -371,17 +435,16 @@ def _write_gate_artifact(run_dir: Path, gate: str, decision: dict, extra: str = 
     )
 
 
-def _apply_gate_decision(run_dir: Path, change_id: str, gate: str, decision: dict) -> None:
-    """REJECTED/DEFERRED en gates 1 escalan; no hay continuacion automatica."""
+def _apply_gate_decision(
+    run_dir: Path, change_id: str, gate: str, decision: dict, state: dict
+) -> dict:
+    """Consume la decision: cierra el gate y la registra en human_gates.
+    REJECTED/DEFERRED escalan (requirements, plan, review); no hay continuacion automatica."""
     _write_gate_artifact(run_dir, gate, decision)
+    gates = {**state["human_gates"], gate: decision["decision"]}
     if decision["decision"] in {"APPROVED", "MODIFIED"}:
-        return
-    _update_state(
-        run_dir,
-        status="ESCALATED",
-        stop_reason=f"gate {gate}: {decision['decision']}",
-        escalated_at=_now(),
-    )
+        return _update_state(run_dir, awaiting_gate="", human_gates=gates)
+    _escalate(run_dir, change_id, f"gate {gate}: {decision['decision']}", human_gates=gates)
     raise AwaitingHuman(change_id, gate, f"decision {decision['decision']}: intervenga un humano")
 
 
@@ -395,23 +458,27 @@ def _archive(run_dir: Path, name: str, round_no: int) -> None:
 def _try_resume_escalation(run_dir: Path, state: dict) -> dict | None:
     """Un ESCALATED por ambiguedad (intake/planner) se reanuda SOLO cuando el humano
     registra una decision APPROVED/MODIFIED POSTERIOR al escalamiento (curso §11.3:
-    STOP hasta recibir decision humana). Rechazos de gate (`gate ...`) no se reanudan."""
+    STOP hasta recibir decision humana). Rechazos de gate (`gate ...`) no se reanudan.
+
+    La aclaracion SOLO reanuda: se archiva y el intake/plan regenerados vuelven a pasar
+    por su gate con una decision nueva (nadie aprueba un artefacto que no vio)."""
     reason = str(state.get("stop_reason", ""))
     resume = {"intake:": ("requirements", "INTAKE_PENDING"), "planner:": ("plan", "PLAN_PENDING")}
     for prefix, (gate, target) in resume.items():
         if not reason.startswith(prefix):
             continue
-        decision = _gate_decision(run_dir, gate)
-        escalated_at = state.get("escalated_at", "")
-        if (
-            decision
-            and decision.get("decision") in {"APPROVED", "MODIFIED"}
-            and decision.get("recorded_at", "") > escalated_at
-        ):
+        decision = _gate_decision(run_dir, gate, state)
+        if decision and decision.get("decision") in {"APPROVED", "MODIFIED"}:
+            n = len(list(run_dir.glob(f"human-{gate}-decision-clarification*.json")))
+            (run_dir / f"human-{gate}-decision.json").rename(
+                run_dir / f"human-{gate}-decision-clarification{n or ''}.json"
+            )
             return _update_state(
                 run_dir,
                 status=target,
                 stop_reason="",
+                awaiting_gate="",
+                planned=False,
                 po_clarification=str(decision.get("reason", ""))[:2000],
             )
     return None
@@ -462,6 +529,13 @@ def _commit_product_changes(change_id: str, fix_reason: str) -> str:
     return _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
 
 
+def _create_run_branch(change_id: str, state: dict) -> dict:
+    branch = f"factory/{change_id}"
+    if _git(["rev-parse", "--verify", branch]).returncode != 0:
+        _git(["checkout", "-b", branch])
+    return {"branch": branch}
+
+
 # ================================================================= avance
 def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
     executor = executor or FakeExecutor()
@@ -488,67 +562,77 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             {"change_id": change_id, "cr_text": cr_text, "po_clarification": clarification},
         )
         (run_dir / "01-intake-report.md").write_text(out["report"], encoding="utf-8")
-        if out.get("recommendation") != "PROCEED":
-            _update_state(
+        reco = out.get("recommendation")
+        if reco != "PROCEED":
+            why = (
+                "requiere clarificacion del Product Owner"
+                if reco == "HUMAN_CLARIFICATION_REQUIRED"
+                else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+            )
+            _escalate(
                 run_dir,
-                status="ESCALATED",
-                stop_reason="intake: requiere clarificacion del Product Owner",
-                escalated_at=_now(),
-            )
-            raise AwaitingHuman(
                 change_id,
-                "requirements",
-                "intake detecto ambiguedad; resuelva con approve_gate requirements",
+                f"intake: {why}",
+                awaiting_gate="requirements",
+                gate_opened_at=_now_precise(),
             )
-        decision = _gate_decision(run_dir, "requirements")
-        if decision is None:
-            _update_state(run_dir, status="PLAN_PENDING")
             raise AwaitingHuman(
-                change_id, "requirements", "el PO debe validar interpretación/alcance"
+                change_id, "requirements", f"intake: {why}; resuelva con approve_gate requirements"
             )
-        _apply_gate_decision(run_dir, change_id, "requirements", decision)
-        state = _update_state(
-            run_dir,
-            status="PLAN_PENDING",
-            human_gates={**state["human_gates"], "requirements": decision["decision"]},
-        )
+        state = _update_state(run_dir, status="REQUIREMENTS_GATE")
+        return advance(change_id, executor)
+
+    # ---- 1b gate requirements (intake ya hecho: no se repite al reanudar)
+    if status == "REQUIREMENTS_GATE":
+        decision = _gate_decision(run_dir, "requirements", state)
+        if decision is None:
+            _open_gate(
+                run_dir, change_id, "requirements", "el PO debe validar interpretación/alcance",
+                state,
+            )
+        state = _apply_gate_decision(run_dir, change_id, "requirements", decision, state)
+        _update_state(run_dir, status="PLAN_PENDING", planned=False)
         return advance(change_id, executor)
 
     # ---- 2 PLANNER + gate plan (el Coder bloqueado hasta APPROVED)
     if status == "PLAN_PENDING":
-        out = executor.run_agent(
-            "plan",
-            {
-                "change_id": change_id,
-                "cr_text": cr_text,
-                "intake_report": _read(run_dir / "01-intake-report.md"),
-                "po_clarification": clarification,
-            },
-        )
-        (run_dir / "03-implementation-plan.md").write_text(out["report"], encoding="utf-8")
-        if out.get("recommendation") != "PROCEED":
-            _update_state(
-                run_dir,
-                status="ESCALATED",
-                stop_reason="planner: ambiguedad residual",
-                escalated_at=_now(),
+        # El plan se genera UNA vez: al reanudar tras la decision NO se regenera
+        # (el Tech Lead aprobo ESTE plan, no uno nuevo).
+        if not state.get("planned"):
+            out = executor.run_agent(
+                "plan",
+                {
+                    "change_id": change_id,
+                    "cr_text": cr_text,
+                    "intake_report": _read(run_dir / "01-intake-report.md"),
+                    "po_clarification": clarification,
+                },
             )
-            raise AwaitingHuman(change_id, "plan", "planner pidio aclaracion")
-        decision = _gate_decision(run_dir, "plan")
+            (run_dir / "03-implementation-plan.md").write_text(out["report"], encoding="utf-8")
+            reco = out.get("recommendation")
+            if reco != "PROCEED":
+                why = (
+                    "ambiguedad residual"
+                    if reco == "HUMAN_CLARIFICATION_REQUIRED"
+                    else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+                )
+                _escalate(
+                    run_dir,
+                    change_id,
+                    f"planner: {why}",
+                    awaiting_gate="plan",
+                    gate_opened_at=_now_precise(),
+                )
+                raise AwaitingHuman(change_id, "plan", f"planner: {why}")
+            state = _update_state(run_dir, planned=True)
+        decision = _gate_decision(run_dir, "plan", state)
         if decision is None:
-            raise AwaitingHuman(
-                change_id, "plan", "el Coder permanece BLOQUEADO hasta plan APPROVED"
+            _open_gate(
+                run_dir, change_id, "plan", "el Coder permanece BLOQUEADO hasta plan APPROVED",
+                state,
             )
-        _apply_gate_decision(run_dir, change_id, "plan", decision)
-        branch = f"factory/{change_id}"
-        if _git(["rev-parse", "--verify", branch]).returncode != 0:
-            _git(["checkout", "-b", branch])
-        _update_state(
-            run_dir,
-            status="IMPLEMENT_PENDING",
-            branch=branch,
-            human_gates={**state["human_gates"], "plan": decision["decision"]},
-        )
+        state = _apply_gate_decision(run_dir, change_id, "plan", decision, state)
+        _update_state(run_dir, status="IMPLEMENT_PENDING", **_create_run_branch(change_id, state))
         return advance(change_id, executor)
 
     # ---- 3 CODER + TEST ANALYST
@@ -593,18 +677,20 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         verdict = "PASS" if v.get("ok") else "FAIL"
         ver = {"status": verdict, "tests": tests, "failed": failed, "lint": lint}
         if verdict == "FAIL":
-            if round_no >= MAX_FIX_ROUNDS:
-                _update_state(
+            verify_rounds = state.get("verify_rounds", 0)
+            if verify_rounds >= MAX_FIX_ROUNDS:
+                _escalate(
                     run_dir,
-                    status="FIX_ROUNDS_EXCEEDED",
+                    change_id,
+                    f"verification FAIL tras {verify_rounds} rondas de fix (tope {MAX_FIX_ROUNDS})",
                     verification=ver,
-                    stop_reason=f"verification FAIL tras {round_no} rondas",
                 )
-                raise Blocked(f"{change_id}: verification FAIL persistente -> intervencion humana")
+                raise Blocked(f"{change_id}: verification FAIL persistente -> ESCALATED a humano")
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
                 iterations=round_no + 1,
+                verify_rounds=verify_rounds + 1,
                 verification=ver,
                 fix_reason="verification FAIL",
             )
@@ -696,48 +782,60 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                     "medium": counts["medium"],
                 },
             )
-        decision = _gate_decision(run_dir, "review")
+        decision = _gate_decision(run_dir, "review", state)
         if decision is None:
-            raise AwaitingHuman(
-                change_id, "review", "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)"
+            _open_gate(
+                run_dir,
+                change_id,
+                "review",
+                "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)",
+                state,
             )
-        blocking = accepted_blocking(run_dir)
-        _record_review_decisions(run_dir, rounds, decision, blocking)
+        blocking = (
+            accepted_blocking(run_dir, state)
+            if decision["decision"] in {"APPROVED", "MODIFIED"}
+            else []
+        )
+        _record_review_decisions(run_dir, rounds, decision, blocking, state)
+        state = _apply_gate_decision(run_dir, change_id, "review", decision, state)
         if blocking:
+            review_rounds = state.get("review_rounds", 0)
+            if review_rounds >= MAX_FIX_ROUNDS:
+                _escalate(
+                    run_dir,
+                    change_id,
+                    f"findings bloqueantes aceptados tras {review_rounds} rondas de fix "
+                    f"(tope {MAX_FIX_ROUNDS}): " + ", ".join(blocking),
+                )
+                raise Blocked(f"{change_id}: findings bloqueantes persistentes -> ESCALATED")
             _archive(run_dir, "human-review-decision.json", rounds)
             _archive(run_dir, "human-findings-decisions.json", rounds)
+            reason = "findings bloqueantes aceptados: " + ", ".join(blocking)
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
                 iterations=rounds + 1,
-                human_gates={**state["human_gates"], "review": decision["decision"]},
-                fix_reason="findings bloqueantes aceptados: " + ", ".join(blocking),
-                last_fix_reason="findings bloqueantes aceptados: " + ", ".join(blocking),
+                review_rounds=review_rounds + 1,
+                fix_reason=reason,
+                last_fix_reason=reason,
             )
             return advance(change_id, executor)
-        _update_state(
-            run_dir,
-            status="EVIDENCE_PENDING",
-            human_gates={**state["human_gates"], "review": decision["decision"]},
-        )
+        _update_state(run_dir, status="EVIDENCE_PENDING")
         return advance(change_id, executor)
 
     # ---- 6 EVIDENCIA + gate release
     if status == "EVIDENCE_PENDING":
-        state = json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
-        run_json = build_factory_run(change_id, state, run_dir)
-        (run_dir / "factory-run.json").write_text(json.dumps(run_json, indent=2), encoding="utf-8")
-        (run_dir / "14-evidence-summary.md").write_text(
-            build_evidence_summary(run_json, run_dir), encoding="utf-8"
-        )
-        (run_dir / "traceability.md").write_text(
-            build_traceability(run_json, run_dir), encoding="utf-8"
-        )
-        decision = _gate_decision(run_dir, "release")
+        state = _load_state(run_dir)
+        _write_consolidated_evidence(change_id, state, run_dir)
+        decision = _gate_decision(run_dir, "release", state)
         if decision is None:
-            _update_state(run_dir, status="EVIDENCE_PENDING", evidence="CONSOLIDATED")
-            raise AwaitingHuman(
-                change_id, "release", "Release Manager decide con evidencia consolidada"
+            _open_gate(
+                run_dir,
+                change_id,
+                "release",
+                "Release Manager decide con evidencia consolidada",
+                state,
+                **({} if state.get("evidence") == "CONSOLIDATED" else {"evidence": "CONSOLIDATED"}),
             )
         verdict = decision["decision"]
         final = {"APPROVED": "READY FOR HUMAN MERGE", "REJECTED": "NOT READY"}.get(
@@ -747,8 +845,10 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             run_dir,
             status=final,
             evidence="CONSOLIDATED",
+            awaiting_gate="",
             human_gates={**state["human_gates"], "release": verdict},
             release_decision=decision,
+            **({"stop_reason": f"gate release: {verdict}"} if final == "ESCALATED" else {}),
         )
         (run_dir / "15-release-decision.json").write_text(
             json.dumps({**decision, "final_status": final}, indent=2), encoding="utf-8"
@@ -821,14 +921,25 @@ def finding_severities(run_dir: Path) -> dict[str, str]:
     return out
 
 
-def accepted_blocking(run_dir: Path) -> list[str]:
+def findings_decisions(run_dir: Path, state: dict) -> dict:
+    """Decisiones por finding VALIDAS: registradas con el gate review abierto (no antes)."""
+    path = run_dir / "human-findings-decisions.json"
+    if not path.is_file() or state.get("awaiting_gate") != "review":
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    opened, recorded = _parse_ts(state.get("gate_opened_at")), _parse_ts(data.get("recorded_at"))
+    if opened is None or recorded is None or recorded < opened:
+        return {}
+    return data
+
+
+def accepted_blocking(run_dir: Path, state: dict) -> list[str]:
     """Findings que el humano ACEPTO/MODIFICO Y que son bloqueantes (MUST FIX / HIGH).
     Un SHOULD FIX aceptado NO dispara un ciclo de fix; sin severidad parseable se trata
     como bloqueante (conservador)."""
-    path = run_dir / "human-findings-decisions.json"
-    if not path.is_file():
+    data = findings_decisions(run_dir, state)
+    if not data:
         return []  # sin decision explicita, ningun finding se auto-aplica (Gate 2 real)
-    data = json.loads(path.read_text(encoding="utf-8"))
     severities = finding_severities(run_dir)
     return [
         d["finding_id"]
@@ -839,12 +950,11 @@ def accepted_blocking(run_dir: Path) -> list[str]:
 
 
 def _record_review_decisions(
-    run_dir: Path, round_no: int, decision: dict, blocking: list[str]
+    run_dir: Path, round_no: int, decision: dict, blocking: list[str], state: dict
 ) -> None:
     """10-human-review-decisions.md (§17): decisiones por finding de cada ronda, append-only."""
     path = run_dir / "10-human-review-decisions.md"
-    findings = run_dir / "human-findings-decisions.json"
-    data = json.loads(findings.read_text(encoding="utf-8")) if findings.is_file() else {}
+    data = findings_decisions(run_dir, state)
     severities = finding_severities(run_dir)
     lines = [
         f"## Round {round_no} — gate review: {decision.get('decision')}",

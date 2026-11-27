@@ -47,8 +47,15 @@ def main() -> None:
     if not state_path.exists():
         raise SystemExit(f"Run not found: {change_id}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    state["human_gates"][gate] = decision
-    state_path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    awaiting = state.get("awaiting_gate") or ""
+    if awaiting != gate:
+        raise SystemExit(
+            f"La fabrica no esta esperando el gate '{gate}' en {change_id} "
+            f"(status={state.get('status')}, esperando: {awaiting or 'ningun gate'}). "
+            "Las decisiones solo se registran cuando el run se detiene en su gate: "
+            "avance con `python -m factory_app.orchestrator` primero."
+        )
+    # human_gates lo actualiza el motor al CONSUMIR la decision, no este script.
     evidence = {
         "change_id": change_id,
         "gate": gate,

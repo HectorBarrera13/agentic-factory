@@ -67,3 +67,52 @@ def test_approve_gate_cli_rejects_wrong_role_and_records_nothing(tmp_path):
         for f in run.iterdir():
             f.unlink()
         run.rmdir()
+
+
+def _cli_run(name: str, state: dict):
+    run = ROOT / "runs" / name
+    run.mkdir(parents=True)
+    (run / "factory-state.json").write_text(json.dumps(state))
+    return run
+
+
+def _cleanup(run):
+    for f in run.iterdir():
+        f.unlink()
+    run.rmdir()
+
+
+def _approve(name, gate, by):
+    return subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "approve_gate.py"), name, gate, "APPROVED",
+         "ok", "--by", by],
+        capture_output=True, text=True, check=False,
+    )
+
+
+def test_approve_gate_cli_rejects_gate_not_awaited():
+    """No hay pre-aprobaciones: solo se registra el gate en el que el run esta detenido."""
+    name = "CR-AWAIT-TEST"
+    run = _cli_run(name, {"status": "REQUIREMENTS_GATE", "awaiting_gate": "requirements",
+                          "human_gates": {"plan": "PENDING"}})
+    try:
+        r = _approve(name, "plan", "Luis (Tech Lead)")
+        assert r.returncode != 0 and "no esta esperando" in (r.stderr + r.stdout)
+        assert not (run / "human-plan-decision.json").exists()
+    finally:
+        _cleanup(run)
+
+
+def test_approve_gate_cli_records_awaited_gate_without_touching_state():
+    name = "CR-AWAIT-OK"
+    st = {"status": "PLAN_PENDING", "awaiting_gate": "plan", "human_gates": {"plan": "PENDING"}}
+    run = _cli_run(name, st)
+    try:
+        r = _approve(name, "plan", "Luis (Tech Lead)")
+        assert r.returncode == 0, r.stderr
+        decision = json.loads((run / "human-plan-decision.json").read_text())
+        assert decision["decision"] == "APPROVED" and decision["recorded_at"]
+        # human_gates lo escribe el motor al consumir la decision
+        assert json.loads((run / "factory-state.json").read_text()) == st
+    finally:
+        _cleanup(run)

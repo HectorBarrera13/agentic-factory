@@ -19,6 +19,8 @@ from factory_app.orchestrator import AwaitingHuman, FakeExecutor
 from tests.factory.test_orchestrator import (
     CR_AMBIGUOUS,
     approve,
+    decide,
+    drive,
     sandbox,  # noqa: F401  (fixture)
     state,
 )
@@ -49,9 +51,42 @@ def test_escalated_ambiguity_resumes_after_po_decision(sandbox):  # noqa: F811
     human(run, "requirements")  # el PO decide la politica DESPUES del escalamiento
     with pytest.raises(AwaitingHuman) as exc:
         ORCH.advance("CR-T", FakeExecutor())
-    assert exc.value.gate == "plan"  # reanudo: intake ok -> plan -> espera Tech Lead
+    # la aclaracion solo reanuda: el intake regenerado exige una aprobacion NUEVA del PO
+    assert exc.value.gate == "requirements"
     assert state(run)["po_clarification"] == "aclaracion del PO"
+    assert (run / "human-requirements-decision-clarification.json").is_file()
+    assert not (run / "03-implementation-plan.md").exists()
+    approve(run, "requirements")
+    with pytest.raises(AwaitingHuman) as exc:
+        ORCH.advance("CR-T", FakeExecutor())
+    assert exc.value.gate == "plan"
     assert (run / "03-implementation-plan.md").is_file()
+
+
+class PlannerAsksOnce(FakeExecutor):
+    def __init__(self):
+        super().__init__()
+        self.asked = False
+
+    def run_agent(self, phase, context):
+        if phase == "plan" and not self.asked:
+            self.asked = True
+            return {"report": "# Plan\n", "recommendation": "HUMAN_CLARIFICATION_REQUIRED"}
+        return super().run_agent(phase, context)
+
+
+def test_planner_clarification_requires_fresh_plan_approval(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = PlannerAsksOnce()
+    assert drive(run, ex, stop_at="plan").gate == "plan"  # el planner pide aclaracion
+    assert state(run)["status"] == "ESCALATED"
+    approve(run, "plan")  # aclaracion del Tech Lead
+    with pytest.raises(AwaitingHuman) as exc:
+        ORCH.advance("CR-T", ex)
+    assert exc.value.gate == "plan"  # el plan NUEVO espera su propia aprobacion
+    assert not (run / "05-coder-report.md").exists()
+    approve(run, "plan")
+    assert drive(run, ex, stop_at="review").gate == "review"
 
 
 def test_escalated_does_not_resume_without_fresh_decision(sandbox):  # noqa: F811
@@ -59,16 +94,15 @@ def test_escalated_does_not_resume_without_fresh_decision(sandbox):  # noqa: F81
     with pytest.raises(AwaitingHuman):
         ORCH.advance("CR-T", FakeExecutor())
     # decision sin recorded_at (no demostrable como posterior) => sigue detenido
-    approve(run, "requirements")
+    human(run, "requirements", recorded_at="")
     assert ORCH.advance("CR-T", FakeExecutor())["status"] == "ESCALATED"
     assert not (run / "03-implementation-plan.md").exists()
 
 
 def test_rejected_gate_never_resumes(sandbox):  # noqa: F811
     run = sandbox()
-    approve(run, "requirements", decision="REJECTED")
-    with pytest.raises(AwaitingHuman):
-        ORCH.advance("CR-T", FakeExecutor())
+    drive(run, FakeExecutor(), decisions={"requirements": "REJECTED"})
+    assert state(run)["status"] == "ESCALATED"
     human(run, "requirements", decision="APPROVED")  # aprobar despues NO reabre un rechazo
     assert ORCH.advance("CR-T", FakeExecutor())["status"] == "ESCALATED"
 
@@ -84,20 +118,13 @@ class CountingExecutor(FakeExecutor):
         return super().run_agent(phase, context)
 
 
-def _approve_all_but_release(run):
-    approve(run, "requirements")
-    approve(run, "plan")
-    approve(run, "review")
-
-
 def test_review_is_not_rerun_when_resuming_after_human_decision(sandbox):  # noqa: F811
     run = sandbox()
     ex = CountingExecutor()
-    approve(run, "requirements")
-    approve(run, "plan")
     # el gate de review se alcanza SIN decision: se registra despues
+    drive(run, ex, stop_at="review")
     with pytest.raises(AwaitingHuman):
-        ORCH.advance("CR-T", ex)
+        ORCH.advance("CR-T", ex)  # reanudar sin decision tampoco regenera
     assert ex.review_runs == 1
     approve(run, "review")
     with pytest.raises(AwaitingHuman) as exc:
@@ -108,12 +135,10 @@ def test_review_is_not_rerun_when_resuming_after_human_decision(sandbox):  # noq
 
 def test_fix_round_archives_previous_reports_and_writes_re_review(sandbox):  # noqa: F811
     run = sandbox()
-    _approve_all_but_release(run)
-    (run / "human-findings-decisions.json").write_text(
-        json.dumps({"decisions": [{"finding_id": "RF-01", "decision": "ACCEPTED"}]}),
-        encoding="utf-8",
-    )
     ex = FakeExecutor(review_report="# Review\n\nRF-01 | MUST FIX | race\nMUST FIX: 1\n")
+    drive(run, ex, stop_at="review")
+    decide(run, RF_01="ACCEPTED")
+    approve(run, "review")
     with pytest.raises(AwaitingHuman) as exc:
         ORCH.advance("CR-T", ex)
     assert exc.value.gate == "review"
@@ -127,15 +152,9 @@ def test_fix_round_archives_previous_reports_and_writes_re_review(sandbox):  # n
 # ---------------------------------------------------------------- #18 severidad
 def test_accepted_should_fix_does_not_trigger_fix_cycle(sandbox):  # noqa: F811
     run = sandbox()
-    _approve_all_but_release(run)
-    (run / "human-findings-decisions.json").write_text(
-        json.dumps({"decisions": [{"finding_id": "RF-02", "decision": "ACCEPTED"}]}),
-        encoding="utf-8",
-    )
     ex = FakeExecutor(review_report="# Review\n\nRF-02 | SHOULD FIX | naming\nSHOULD FIX: 1\n")
-    with pytest.raises(AwaitingHuman) as exc:
-        ORCH.advance("CR-T", ex)
-    assert exc.value.gate == "release"
+    exc = drive(run, ex, findings={"RF_02": "ACCEPTED"}, stop_at="release")
+    assert exc.gate == "release"
     assert not (run / "11-fix-report.md").exists()
 
 
@@ -148,16 +167,8 @@ def test_severity_parsing_same_line_before_segment():
 # ---------------------------------------------------------------- #8 artefactos §17
 def test_instructivo_named_artifacts_are_written(sandbox):  # noqa: F811
     run = sandbox()
-    _approve_all_but_release(run)
-    (run / "human-findings-decisions.json").write_text(
-        json.dumps({"decisions": [{"finding_id": "RF-02", "decision": "DEFERRED"}]}),
-        encoding="utf-8",
-    )
     ex = FakeExecutor(review_report="# Review\n\nRF-02 | SHOULD FIX | naming\n")
-    with pytest.raises(AwaitingHuman):
-        ORCH.advance("CR-T", ex)
-    approve(run, "release")
-    assert ORCH.advance("CR-T", ex)["status"] == "READY FOR HUMAN MERGE"
+    assert drive(run, ex, findings={"RF_02": "DEFERRED"})["status"] == "READY FOR HUMAN MERGE"
     for name in (
         "02-human-requirement-decision.md",
         "04-human-plan-approval.md",
@@ -174,10 +185,7 @@ def test_instructivo_named_artifacts_are_written(sandbox):  # noqa: F811
 # ---------------------------------------------------------------- #4 traceability real
 def test_traceability_marks_unmapped_instead_of_inventing(sandbox):  # noqa: F811
     run = sandbox()
-    _approve_all_but_release(run)
-    ex = FakeExecutor()
-    with pytest.raises(AwaitingHuman):
-        ORCH.advance("CR-T", ex)
+    drive(run, FakeExecutor(), stop_at="release")
     text = (run / "traceability.md").read_text()
     assert "UNMAPPED" in text and "| T1 |" not in text  # el plan falso no cita ningun AC
     run_json = json.loads((run / "factory-run.json").read_text())
