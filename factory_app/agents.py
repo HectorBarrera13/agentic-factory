@@ -38,7 +38,9 @@ planner_agent = LlmAgent(
     name="PlannerAgent",
     model=GEMINI_MODEL,
     description="Creates an implementation plan without changing code.",
-    instruction=PLANNER_INSTRUCTION + "\n\nIntake report:\n{intake_report}",
+    # `?`: cada fase corre en una sesion ADK nueva (estado vacio); el intake ya llega en el
+    # prompt. Sin `?` ADK lanza KeyError "Context variable not found".
+    instruction=PLANNER_INSTRUCTION + "\n\nIntake report:\n{intake_report?}",
     tools=READ_TOOLS,
     output_key="implementation_plan",
 )

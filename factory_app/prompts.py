@@ -23,6 +23,13 @@ Do not design the implementation. Do not modify files.
 """
 )
 
+RECOMMENDATION_RULE = """
+OUTPUT CONTRACT (parsed deterministically): the LAST line of your answer must be exactly
+`RECOMMENDATION: PROCEED` or `RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED`.
+Without that line the factory stops the run for a human.
+"""
+INTAKE_INSTRUCTION += RECOMMENDATION_RULE
+
 PLANNER_INSTRUCTION = (
     COMMON_RULES
     + """
@@ -30,8 +37,10 @@ ROLE: Planner Agent (read-only).
 Use the intake report and repository context to propose an implementation plan.
 Include scope, requirements/AC, likely files, tests, architecture constraints,
 security considerations, verification commands, assumptions/open questions.
-If ambiguity remains, STOP and request human clarification. Do not write code.
+If ambiguity remains, request human clarification (RECOMMENDATION:
+HUMAN_CLARIFICATION_REQUIRED) instead of guessing. Do not write code.
 """
+    + RECOMMENDATION_RULE
 )
 
 CODER_INSTRUCTION = (

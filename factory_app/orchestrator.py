@@ -32,6 +32,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MAX_FIX_ROUNDS = 3
+PROMPT_FIELD_CAP = 12_000
 
 TERMINAL = {"READY FOR HUMAN MERGE", "NOT READY", "ESCALATED"}
 GATE_ORDER = ("requirements", "plan", "review", "release")
@@ -56,13 +57,29 @@ class TransientModelError(Exception):
 
 
 _TRANSIENT_MARKERS = (
-    "429", "503", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "high demand", "rate limit",
+    "429", "503", "resource_exhausted", "unavailable", "high demand", "rate limit",
 )
 
 
 def _is_transient(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(m in text for m in _TRANSIENT_MARKERS)
+
+
+_RECO_RE = re.compile(
+    r"^[\s>*_`#-]*RECOMMENDATION[\s*_`]*:[\s*_`]*(PROCEED|HUMAN_CLARIFICATION_REQUIRED)\b",
+    re.I | re.M,
+)
+
+
+def parse_recommendation(report: str) -> str:
+    """Lee SOLO la linea `RECOMMENDATION: ...` (la ultima si hay varias).
+    Devuelve PROCEED | HUMAN_CLARIFICATION_REQUIRED | EMPTY | MISSING: menciones sueltas
+    de STOP o HUMAN_CLARIFICATION_REQUIRED en el cuerpo ya no deciden nada."""
+    if not report.strip():
+        return "EMPTY"
+    hits = _RECO_RE.findall(report)
+    return hits[-1].upper() if hits else "MISSING"
 
 
 def _retry_hint_seconds(exc: BaseException) -> int | None:
@@ -129,12 +146,13 @@ class FakeExecutor(AgentExecutor):
                 return {
                     "recommendation": "HUMAN_CLARIFICATION_REQUIRED",
                     "report": f"# Intake {cid}\n\nSTOP: el CR no define politica; "
-                    "requiere decision del Product Owner.\n",
+                    "requiere decision del Product Owner.\n\n"
+                    "RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED\n",
                 }
             return {
                 "recommendation": "PROCEED",
-                "report": f"# Intake {cid}\n\nPROCEED: ACs identificados, "
-                "sin ambiguedad bloqueante.\n",
+                "report": f"# Intake {cid}\n\nACs identificados, "
+                "sin ambiguedad bloqueante.\n\nRECOMMENDATION: PROCEED\n",
             }
         if phase == "review":
             self._review_calls += 1
@@ -148,7 +166,7 @@ class FakeExecutor(AgentExecutor):
             "plan": (
                 f"# Plan {cid}\n\n| task | files | tests |\n|---|---|---|\n"
                 "| T1 | campusflow/service.py | tests/product/test_service.py |\n\n"
-                "Verificacion: pytest + ruff.\n"
+                "Verificacion: pytest + ruff.\n\nRECOMMENDATION: PROCEED\n"
             ),
             "implement": f"# Coder report {cid}\n\nfiles_changed: campusflow/service.py\n",
             "test_analysis": f"# Test analysis {cid}\n\nboundary/negativos/regresion cubiertos.\n",
@@ -243,14 +261,10 @@ class ADKExecutor(AgentExecutor):
             return asyncio.run(_run())
 
         report = self._call_with_backoff(_call, phase, context["change_id"])
-        recommendation = (
-            "HUMAN_CLARIFICATION_REQUIRED"
-            if re.search(r"HUMAN_CLARIFICATION_REQUIRED|\bSTOP\b", report)
-            else "PROCEED"
-        )
         return {
             "report": report or f"# {phase} {context['change_id']} (respuesta vacía)",
-            "recommendation": recommendation,
+            # vacia o sin linea RECOMMENDATION => el run escala (nunca PROCEED por defecto)
+            "recommendation": parse_recommendation(report or ""),
         }
 
     def _call_with_backoff(self, fn, phase: str, change_id: str):
@@ -266,7 +280,7 @@ class ADKExecutor(AgentExecutor):
         attempt = 0
         while True:
             try:
-                return fn()
+                result = fn()
             except Exception as exc:
                 if not _is_transient(exc):
                     raise
@@ -291,6 +305,10 @@ class ADKExecutor(AgentExecutor):
                 print(f"  [llm] {phase}: transitorio ({type(exc).__name__}), "
                       f"intento {attempt}/{max_retries} en {delay:.1f}s")
                 time.sleep(delay)
+                continue
+            # exito: los reintentos que costo tambien cuentan en la metrica (§19.1)
+            self._record_retries(change_id, phase, attempt, exhausted=False)
+            return result
 
     @staticmethod
     def _record_retries(change_id: str, phase: str, n: int, exhausted: bool) -> None:
@@ -330,7 +348,14 @@ class ADKExecutor(AgentExecutor):
             "accepted_blocking_findings",
         ):
             if context.get(key):
-                bits.append(f"{key.upper()}:\n{str(context[key])[:12000]}")
+                text = str(context[key])
+                if len(text) > PROMPT_FIELD_CAP:  # truncado VISIBLE: el agente sabe que falta
+                    text = (
+                        text[:PROMPT_FIELD_CAP]
+                        + f"\n...[TRUNCATED {len(text) - PROMPT_FIELD_CAP} chars; "
+                        "use the read tools / inspect_git_diff for the rest]"
+                    )
+                bits.append(f"{key.upper()}:\n{text}")
         return "\n\n".join(bits)
 
 
@@ -529,6 +554,14 @@ def _commit_product_changes(change_id: str, fix_reason: str) -> str:
     return _git(["rev-parse", "--short", "HEAD"]).stdout.strip()
 
 
+def _last_verification_file(run_dir: Path) -> str:
+    return (
+        "12-re-verification.txt"
+        if (run_dir / "12-re-verification.txt").is_file()
+        else "07-verification.txt"
+    )
+
+
 def _create_run_branch(change_id: str, state: dict) -> dict:
     branch = f"factory/{change_id}"
     if _git(["rev-parse", "--verify", branch]).returncode != 0:
@@ -640,8 +673,17 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
         fix_reason = state.get("fix_reason", "")
         ctx = {
             "change_id": change_id,
+            "cr_text": cr_text,
             "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
-            "accepted_blocking_findings": fix_reason,
+            # el Coder Fix recibe QUE corregir, no solo los ids
+            "accepted_blocking_findings": (
+                fix_reason + "\n\n" + state.get("fix_details", "") if fix_reason else ""
+            ),
+            "verification_summary": (
+                _read(run_dir / _last_verification_file(run_dir))
+                if fix_reason == "verification FAIL"
+                else ""
+            ),
         }
         phase = "fix" if fix_reason else "implement"
         out = executor.run_agent(phase, ctx)
@@ -656,12 +698,21 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             )
         (run_dir / target).write_text(report, encoding="utf-8")
         if not fix_reason:
-            out2 = executor.run_agent("test_analysis", ctx)
+            out2 = executor.run_agent(
+                "test_analysis",
+                {
+                    "change_id": change_id,
+                    "cr_text": cr_text,
+                    "implementation_plan": ctx["implementation_plan"],
+                    "git_diff": _git(["diff", "main...HEAD"]).stdout,
+                },
+            )
             (run_dir / "06-test-analysis.md").write_text(out2["report"], encoding="utf-8")
         _update_state(
             run_dir,
             status="VERIFY_PENDING",
             fix_reason="",
+            fix_details="",
             last_commit=commit or state.get("last_commit", ""),
         )
         return advance(change_id, executor)
@@ -726,14 +777,7 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
                 "cr_text": cr_text,
                 "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
                 "git_diff": diff,
-                "verification_summary": _read(
-                    run_dir
-                    / (
-                        "12-re-verification.txt"
-                        if (run_dir / "12-re-verification.txt").is_file()
-                        else "07-verification.txt"
-                    )
-                ),
+                "verification_summary": _read(run_dir / _last_verification_file(run_dir)),
                 "prior_findings": prior_findings,
             }
             review = executor.run_agent("review", review_ctx)  # sesion propia
@@ -811,12 +855,19 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
             _archive(run_dir, "human-review-decision.json", rounds)
             _archive(run_dir, "human-findings-decisions.json", rounds)
             reason = "findings bloqueantes aceptados: " + ", ".join(blocking)
+            segments = finding_segments(
+                _read(run_dir / "08-review-report.md")
+                + "\n"
+                + _read(run_dir / "09-security-report.md")
+            )
+            details = "\n".join(segments.get(fid, fid).strip() for fid in blocking)
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
                 iterations=rounds + 1,
                 review_rounds=review_rounds + 1,
                 fix_reason=reason,
+                fix_details=details[:8000],
                 last_fix_reason=reason,
             )
             return advance(change_id, executor)
