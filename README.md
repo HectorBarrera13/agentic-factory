@@ -66,7 +66,8 @@ uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?
   decisión se firma como `Nombre (Rol)` y el rol se valida contra los roles del gate del proyecto.
   Un perfil viejo con roles fuera del catálogo carga marcado como incompleto hasta editarlo.
 - **Ajustes**: proveedor, modelo y temperatura por agente (ver abajo), límites de rondas, comandos de verificación
-  (`pytest` / `jest` / `ruff` / `lint` / `exit_code`), rutas, roles por gate. El orden de fases y
+  (`pytest` / `jest` / `ruff` / `lint` / `exit_code`; un `exit_code` que corre `node --test` también
+  cuenta sus tests), rutas, roles por gate. El orden de fases y
   gates es fijo. La guardia de integridad de tests solo existe para Python ("no disponible" en
   otros lenguajes).
 - **Seguridad**: solo escucha en 127.0.0.1, valida `Host`, token por sesión (cookie HttpOnly),

@@ -1431,10 +1431,23 @@ def _kind(result: dict) -> str:
     return "exit_code"
 
 
+# Resumen final de `node --test`: "ℹ tests 21" (reporter spec) o "# tests 21" (TAP).
+_NODE_TEST_RE = re.compile(r"^[ \t]*(?:ℹ|#)[ \t]+(tests|fail)[ \t]+(\d+)[ \t]*$", re.M)
+
+
+def node_test_counts(stdout: str) -> tuple[int, int] | None:
+    """(tests, fallidos) del resumen de `node --test`; None si la salida no lo trae."""
+    found = {k: int(n) for k, n in _NODE_TEST_RE.findall(stdout)}
+    if "tests" not in found:
+        return None
+    return found["tests"], found.get("fail", 0)
+
+
 def parse_verification(v: dict) -> tuple[int, int, str]:
     """(tests, failed, lint) desde los resultados, segun el parser de cada tipo:
     pytest ("N passed, M failed, K errors"), jest ("Tests: M failed, N passed"),
-    ruff/lint (exit code); exit_code solo cuenta en ok/FAIL. Sin linter: NOT_RUN."""
+    ruff/lint (exit code); exit_code solo cuenta en ok/FAIL, salvo que su salida sea el
+    resumen de `node --test` ("ℹ tests N" / "ℹ fail N"). Sin linter: NOT_RUN."""
     tests = failed = 0
     lint_results = []
     for r in v.get("results", []):
@@ -1453,6 +1466,9 @@ def parse_verification(v: dict) -> tuple[int, int, str]:
             total = int(m.group(1)) if (m := re.search(r"(\d+) total", line)) else 0
             tests += total
             failed += fail
+        elif kind == "exit_code" and (node := node_test_counts(r.get("stdout", ""))):
+            tests += node[0]
+            failed += node[1]
         elif kind in {"ruff", "lint"}:
             lint_results.append(r.get("returncode") == 0 or "All checks passed" in out)
     lint = "NOT_RUN" if not lint_results else ("PASS" if all(lint_results) else "FAIL")
