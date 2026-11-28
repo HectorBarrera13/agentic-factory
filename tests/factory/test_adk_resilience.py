@@ -189,6 +189,19 @@ def test_exhausted_retries_degrade_the_stored_probe(sandbox, monkeypatch):  # no
     assert "EXHAUSTED" not in state(run)["last_llm_note"]
 
 
+def test_request_retries_count_in_the_metric(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = ADKExecutor(backoff_base=0, max_retries=1)
+
+    def phase_with_two_request_retries():
+        ex._request_retries += 2  # lo que suma request_retry durante la fase
+        return "ok"
+
+    assert ex._call_with_backoff(phase_with_two_request_retries, "implement", "CR-T") == "ok"
+    st = state(run)
+    assert st["llm_retries"] == 2 and "2 backoff retries" in st["last_llm_note"]
+
+
 def test_long_prompt_fields_are_visibly_truncated():
     p = ADKExecutor._prompt("review", {"change_id": "CR-T", "git_diff": "x" * 20_000})
     assert "[TRUNCATED 8000 chars" in p

@@ -44,6 +44,42 @@ def phase_reads():
         _phase_reads.reset(token)
 
 
+# ruta -> bytes originales (None: el archivo no existia) de lo que la fase escribio
+_phase_writes: ContextVar[dict[Path, bytes | None] | None] = ContextVar(
+    "phase_writes", default=None
+)
+
+
+@contextlib.contextmanager
+def phase_writes():
+    """Una fase que falla (cuota agotada, pausa, error) deshace lo que escribio: el worktree
+    vuelve a su punto de control y la fase se repite desde cero al reanudar, en vez de dejar
+    archivos a medias que bloquean el reanudar ("cambios sin commitear")."""
+    originals: dict[Path, bytes | None] = {}
+    token = _phase_writes.set(originals)
+    try:
+        yield
+    except BaseException:
+        _revert_writes(originals)
+        raise
+    finally:
+        _phase_writes.reset(token)
+
+
+def _revert_writes(originals: dict[Path, bytes | None]) -> None:
+    root = work_root()
+    for path, before in originals.items():
+        if before is not None:
+            path.write_bytes(before)
+            continue
+        path.unlink(missing_ok=True)
+        # carpetas que la fase creo y quedaron vacias
+        parent = path.parent
+        while root in parent.parents and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+
+
 def _under(posix: str, prefixes: list[str]) -> bool:
     return any(posix == p or posix.startswith(p + "/") for p in prefixes if p)
 
@@ -310,6 +346,9 @@ def write_product_file(relative_path: str, content: str) -> dict:
     reads = _phase_reads.get()
     if reads is not None and candidate.is_file() and posix not in reads:
         return {"ok": False, "error": f"{posix}: {READ_FIRST}"}
+    writes = _phase_writes.get()
+    if writes is not None and candidate not in writes:
+        writes[candidate] = candidate.read_bytes() if candidate.is_file() else None
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_text(content, encoding="utf-8")
     if reads is not None:

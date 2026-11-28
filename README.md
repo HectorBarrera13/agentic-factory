@@ -108,7 +108,9 @@ Los scripts CLI siguen funcionando y aceptan `--project RUTA` (por defecto, este
   (algunos modelos de razonamiento), no se envía. La UI avisa "se aplicará X" o "no acepta
   temperatura"; lo pedido y lo efectivo por agente quedan en `factory-state.json` y
   `factory-run.json` (`models`).
-- Reintentos: solo el backoff del orquestador reintenta (los SDKs van con 0 reintentos); los
+- Reintentos: los SDKs van con 0 reintentos; la fábrica repite primero la petición que falló
+  (respetando el `retryDelay` del proveedor) y, si no basta, la fase entera; una fase que falla
+  deshace lo que escribió en el worktree del run. Los
   errores 429/529/overloaded/servicio no disponible de cualquier proveedor son transitorios y los de
   autenticación o modelo inexistente escalan al humano.
 

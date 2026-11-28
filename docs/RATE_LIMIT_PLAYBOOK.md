@@ -16,12 +16,13 @@ de "Resilience: manejo documentado de rate limit / retry / resume" (Definition o
 
 | Situación | Respuesta de la fábrica |
 |---|---|
-| 429/503 transitorios (`429`, `503`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, "high demand", "rate limit"; sin distinguir mayúsculas) | Exponential backoff (base 3s, x2) + jitter, hasta 5 reintentos |
+| 429/503 transitorios en una petición (`429`, `503`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, "high demand", "rate limit"; sin distinguir mayúsculas) | **Se repite solo esa petición** (`factory_app/request_retry.py`): espera el `retryDelay` del proveedor con un mínimo exponencial (4s, 8s, 16s… tope 60s), hasta 6 veces. La fase conserva lo que ya hizo: un límite por minuto (p. ej. 15 peticiones/min del free tier) ya no obliga a repetir una fase de 40 llamadas a tool |
+| La petición sigue fallando | Backoff por fase del orquestador (base 3s, x2) + jitter, hasta 5 reintentos: la fase se repite desde cero |
 | `RetryInfo.retryDelay > 10 min` (cuota diaria) | **No reintenta** (gastaría quota en vano); eleva `TransientModelError` con la ventana de resume y la sugerencia de cambiar modelo |
-| Agotados reintentos | Estado del run **intacto en su checkpoint** (`INTAKE_PENDING` verificado: cero escrituras parciales); exit 4 |
+| Agotados reintentos | Estado del run **intacto en su checkpoint**; lo que la fase escribió en el worktree del run se deshace (`tools.phase_writes`), así reanudar no choca con "cambios sin commitear"; exit 4 |
 | Reanudación | El MISMO comando `--adk` continúa desde el último checkpoint; fases ya completas no se repiten |
-| Reintentos internos de google-genai | **Desactivados** (`Gemini(retry_options=HttpRetryOptions(attempts=1))` en `factory_app/agents.py`): solo reintenta el backoff de la fábrica, así no se multiplican los reintentos ni se esconde la métrica |
-| Métrica | `llm_retries` y `last_llm_note` persistidos en `factory-state.json` (medible en evals §19.1); cuenta tanto los reintentos que terminaron en éxito como los agotados |
+| Reintentos internos de los SDKs | **Desactivados** (`HttpRetryOptions(attempts=1)` en Gemini, `max_retries=0`/`num_retries=0` en el resto, `factory_app/models.py`): solo reintenta la fábrica (por petición y por fase), así no se multiplican los reintentos ni se esconde la métrica |
+| Métrica | `llm_retries` y `last_llm_note` persistidos en `factory-state.json` (medible en evals §19.1); cuenta los reintentos por petición y por fase, tanto los que terminaron en éxito como los agotados |
 | Respuesta vacía o sin línea `RECOMMENDATION:` (Intake/Planner) | **No** se toma como PROCEED: el run queda `ESCALATED` (`stop_reason` "sin RECOMMENDATION valida") y se reanuda con una decisión del gate correspondiente |
 | Error no transitorio (p. ej. `KeyError` de plantilla ADK) | Sin reintento: se propaga y el run sigue en su checkpoint |
 | Cambio de proveedor/modelo | `FACTORY_MODEL` en `.env` sin tocar código (routing 3.8-flash ↔ 3.5-flash-lite observado en producción) |

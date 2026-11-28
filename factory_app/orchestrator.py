@@ -293,6 +293,7 @@ class ADKExecutor(AgentExecutor):
     def __init__(self, backoff_base: float = 3.0, max_retries: int = 5):
         self.backoff_base = backoff_base
         self.max_retries = max_retries
+        self._request_retries = 0
 
     def run_agent(self, phase: str, context: dict) -> dict:
         import asyncio
@@ -301,7 +302,8 @@ class ADKExecutor(AgentExecutor):
         from google.genai import types
 
         from . import agents as A
-        from .tools import phase_reads, select_context
+        from . import request_retry
+        from .tools import phase_reads, phase_writes, select_context
 
         # Instancia NUEVA por fase: sin padre, sin estado compartido con otras fases.
         agent = A.AGENT_FACTORIES[self.AGENT_FOR_PHASE[phase]]()
@@ -355,8 +357,14 @@ class ADKExecutor(AgentExecutor):
 
         def _call() -> str:
             control.check_pause(f"pausado antes de {phase}")
-            with phase_reads():  # sesion de modelo nueva: no conoce ningun archivo aun
-                return asyncio.run(_guarded())
+            counter = request_retry.start_counting()
+            try:
+                # sesion de modelo nueva: no conoce ningun archivo aun; si la fase falla,
+                # lo que escribio se deshace (el worktree vuelve a su punto de control)
+                with phase_reads(), phase_writes():
+                    return asyncio.run(_guarded())
+            finally:
+                self._request_retries += counter[0]
 
         report = self._call_with_backoff(
             _call, phase, context["change_id"], model=(settings["provider"], settings["model"])
@@ -380,6 +388,7 @@ class ADKExecutor(AgentExecutor):
 
         max_retries = self.max_retries
         attempt = 0
+        self._request_retries = 0  # reintentos por peticion (request_retry) de esta fase
         while True:
             try:
                 result = fn()
@@ -390,7 +399,9 @@ class ADKExecutor(AgentExecutor):
                 if hint is not None and hint > 600:
                     # cuota diaria: reintentar YA gastaria quota sin posibilidad;
                     # checkpoint intacto + mensaje con ventana de resume (§20)
-                    self._record_retries(change_id, phase, attempt, exhausted=True)
+                    self._record_retries(
+                        change_id, phase, attempt + self._request_retries, exhausted=True
+                    )
                     _probe_failed(model, phase, exc)
                     raise TransientModelError(
                         f"{phase}: cuota free-tier; reintentar en ~{hint // 60} min O "
@@ -398,7 +409,9 @@ class ADKExecutor(AgentExecutor):
                         "gemini-3.5-flash-lite); run resumible"
                     ) from exc
                 if attempt >= max_retries:
-                    self._record_retries(change_id, phase, attempt, exhausted=True)
+                    self._record_retries(
+                        change_id, phase, attempt + self._request_retries, exhausted=True
+                    )
                     _probe_failed(model, phase, exc)
                     raise TransientModelError(
                         f"{phase}: {max_retries} reintentos agotados; el run sigue en su "
@@ -411,7 +424,7 @@ class ADKExecutor(AgentExecutor):
                 control.sleep(delay)  # la pausa corta la espera
                 continue
             # exito: los reintentos que costo tambien cuentan en la metrica (§19.1)
-            self._record_retries(change_id, phase, attempt, exhausted=False)
+            self._record_retries(change_id, phase, attempt + self._request_retries, exhausted=False)
             return result
 
     @staticmethod
