@@ -187,6 +187,42 @@ def test_profiles_sign_only_with_their_own_roles(client):
     assert r.status_code == 400 and "no tiene el rol" in r.json()["error"]
 
 
+def test_retry_signs_as_po_and_reports_the_attempt_cap(client, project_dir):
+    pid = _profile(client)
+    tl = _profile(client, name="Leo", roles=["Tech Lead"])
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    body = {"body": "# CR-001\n\n- AC-V.1 value es 3\n", "reason": "alcance nuevo",
+            "profile_id": pid, "role": "Product Owner"}
+    r = client.post("/api/runs/CR-001/retry", json=body)
+    assert r.status_code == 400 and "ESCALATED o NOT READY" in r.json()["error"]
+    # rechazar el requirements gate => ESCALATED definitivo
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    client.post("/api/runs/CR-001/gates/requirements", json={
+        "decision": "REJECTED", "reason": "no", "profile_id": pid, "role": "Product Owner"})
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    assert client.get("/api/crs/CR-001").json()["retryable"] is True
+    r = client.post("/api/runs/CR-001/retry", json={**body, "profile_id": tl, "role": "Tech Lead"})
+    assert r.status_code == 400  # solo firma el PO
+    r = client.post("/api/runs/CR-001/retry", json=body)
+    assert r.status_code == 200, r.text
+    st = r.json()
+    assert st["attempt"] == 2 and st["retry"]["by"] == "Ana (Product Owner)"
+    assert client.get("/api/crs/CR-001").json()["retryable"] is False
+    assert "value es 3" in (project_dir / ".factory" / "change_requests" / "CR-001-value.md"
+                            ).read_text(encoding="utf-8")
+    # tope de intentos: la API devuelve un code para que la UI pida confirmacion
+    for _ in range(3):
+        client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+        client.post("/api/runs/CR-001/gates/requirements", json={
+            "decision": "REJECTED", "reason": "no", "profile_id": pid, "role": "Product Owner"})
+        client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+        r = client.post("/api/runs/CR-001/retry", json=body)
+        if r.status_code != 200:
+            break
+    assert r.status_code == 400 and r.json()["code"] == "attempts_exhausted"
+    assert client.post("/api/runs/CR-001/retry", json={**body, "force": True}).status_code == 200
+
+
 # ---------------------------------------------------------------- flujo completo
 @pytest.mark.skipif(GIT is None, reason="git no disponible")
 def test_full_flow_through_the_api_reaches_ready_for_human_merge(client, project_dir):

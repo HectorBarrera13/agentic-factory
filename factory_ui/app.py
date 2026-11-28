@@ -123,6 +123,14 @@ class GateBody(BaseModel):
     role: str
 
 
+class RetryBody(BaseModel):
+    body: str
+    reason: str
+    profile_id: str
+    role: str
+    force: bool = False
+
+
 class FindingsBody(BaseModel):
     verdicts: dict[str, str]
     profile_id: str
@@ -241,6 +249,13 @@ def _signature(session: Session, profile_id: str, role: str) -> str:
     return profile.signature(role)
 
 
+def _retryable(project, change_id: str) -> bool:
+    try:
+        return services.read_state(project, change_id).get("status") in services.RETRYABLE
+    except FactoryError:
+        return False
+
+
 def create_app(
     project_root: str | Path | None = None,
     token: str | None = None,
@@ -259,7 +274,8 @@ def create_app(
 
     @app.exception_handler(FactoryError)
     async def _factory_error(_request: Request, exc: FactoryError):
-        return JSONResponse({"error": str(exc)}, status_code=400)
+        payload = {"error": str(exc), **({"code": exc.code} if exc.code else {})}
+        return JSONResponse(payload, status_code=400)
 
     @app.exception_handler(ValidationError)
     async def _validation_error(_request: Request, exc: ValidationError):
@@ -420,6 +436,7 @@ def create_app(
             "file": path.relative_to(p.root).as_posix(),
             "body": path.read_text(encoding="utf-8"),
             "frozen": (p.run_dir(change_id) / "factory-state.json").is_file(),
+            "retryable": _retryable(p, change_id),
         }
 
     @app.post("/api/crs")
@@ -462,6 +479,14 @@ def create_app(
     @app.post("/api/runs/{change_id}/pause")
     def pause_run(change_id: str):
         return session.runs.pause(session.require(), change_id)
+
+    @app.post("/api/runs/{change_id}/retry")
+    def retry_run(change_id: str, body: RetryBody):
+        p = session.require()
+        if session.runs.busy(p, change_id):
+            raise FactoryError("el run esta avanzando; espera a que se detenga")
+        signed = _signature(session, body.profile_id, body.role)
+        return services.retry_run(p, change_id, body.body, body.reason, signed, body.force)
 
     @app.post("/api/runs/{change_id}/gates/{gate}")
     def decide_gate(change_id: str, gate: str, body: GateBody):
