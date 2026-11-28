@@ -391,3 +391,123 @@ def test_saving_config_probes_the_models_in_use(client, monkeypatch):
     r = client.put("/api/config", json=cfg)
     assert r.status_code == 200, r.text
     assert launched == [[("ollama", "llama3"), ("openai", "gpt-4.1")]]
+
+
+# ---------------------------------------------------------------- pausa / modelos en uso / arranque
+def test_pause_needs_a_run_in_progress(client):
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    r = client.post("/api/runs/CR-001/pause")
+    assert r.status_code == 400 and "no esta avanzando" in r.json()["error"]
+
+
+def test_pause_from_the_api_cuts_the_run_and_resume_continues(client, monkeypatch):
+    import time
+
+    from factory_app import control
+
+    class Slow(ORCH.FakeExecutor):
+        def run_agent(self, phase, context):
+            for _ in range(200):  # simula una llamada larga al modelo
+                if control.pause_requested():
+                    raise control.Paused(f"pausado durante {phase}")
+                time.sleep(0.02)
+            return super().run_agent(phase, context)
+
+    monkeypatch.setattr(runs_mod.RunManager, "_executor", lambda self, mode: Slow())
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    assert client.post("/api/runs/CR-001/advance", json={"mode": "adk"}).json()["kind"] == "running"
+    assert client.post("/api/runs/CR-001/pause").json()["pausing"] is True
+    for _ in range(100):
+        out = client.get("/api/runs/CR-001").json()["outcome"]
+        if out["kind"] != "running":
+            break
+        time.sleep(0.05)
+    assert out["kind"] == "paused" and out["mode"] == "adk"
+    st = client.get("/api/runs/CR-001").json()["state"]
+    assert st["status"] == "INTAKE_PENDING" and st["paused"]["status"] == "INTAKE_PENDING"
+    monkeypatch.setattr(runs_mod.RunManager, "_executor", lambda self, mode: ORCH.FakeExecutor())
+    out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
+    assert out["kind"] == "awaiting" and out["gate"] == "requirements"
+    assert "paused" not in client.get("/api/runs/CR-001").json()["state"]
+
+
+def test_models_in_use_report_probe_and_env_override(client, monkeypatch):
+    from factory_app import probe
+
+    cfg = client.get("/api/config").json()["config"]
+    cfg["agents"] = {"provider": "gemini", "model": "gemini-a", "temperature": 0.2,
+                     "roles": {"reviewer": {"provider": "openai", "model": "gpt-x"}}}
+    assert client.put("/api/config", json=cfg).status_code == 200
+    probe._store("openai", "gpt-x", {"provider": "openai", "model": "gpt-x", "status": "OK",
+                                     "message": "", "at": 1, "seconds": 1})
+    monkeypatch.delenv("FACTORY_MODEL", raising=False)
+    items = {i["model"]: i for i in client.get("/api/models/in-use").json()["items"]}
+    assert items["gpt-x"]["roles"] == ["reviewer"] and items["gpt-x"]["probe"]["status"] == "OK"
+    assert items["gemini-a"]["probe"] is None and items["gemini-a"]["env_override"] is False
+    monkeypatch.setenv("FACTORY_MODEL", "gemini-env")
+    items = {i["model"]: i for i in client.get("/api/models/in-use").json()["items"]}
+    assert "gemini-a" not in items
+    assert items["gemini-env"]["env_override"] is True
+    assert items["gemini-env"]["configured_model"] == "gemini-a"
+    assert items["gpt-x"]["env_override"] is False  # no aplica a otros proveedores
+
+
+def test_new_projects_propose_the_last_model_that_passed_the_probe(client, tmp_path):
+    from factory_app import probe
+
+    other = tmp_path / "nuevo"
+    other.mkdir()
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert "suggested_model" not in out  # sin probes: el default del codigo
+    for at, (prov, model, status) in enumerate([("ollama", "llama3", "OK"),
+                                                ("openai", "gpt-x", "OK"),
+                                                ("gemini", "g-roto", "ERROR")]):
+        probe._store(prov, model, {"provider": prov, "model": model, "status": status,
+                                   "message": "", "at": at, "seconds": 1})
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert (out["config"]["agents"]["provider"], out["config"]["agents"]["model"]) == \
+        ("openai", "gpt-x")
+    assert out["suggested_model"] == {"provider": "openai", "model": "gpt-x"}
+
+
+def test_browse_returns_the_folder_chosen_in_the_native_dialog(client, monkeypatch, tmp_path):
+    from factory_ui import app as app_mod
+
+    seen = []
+    monkeypatch.setattr(app_mod, "browse_folder", lambda start: seen.append(start) or "C:/x")
+    assert client.post("/api/projects/browse").json() == {"path": "C:/x"}
+    assert seen and seen[0] == str(Path(seen[0]))  # parte de la carpeta del proyecto actual
+    monkeypatch.setattr(app_mod, "browse_folder", lambda start: None)
+    assert client.post("/api/projects/browse").json() == {"path": None}
+
+
+def test_browse_folder_handles_cancel_and_missing_tkinter(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from factory_app.roles import FactoryError
+    from factory_ui import app as app_mod
+
+    def fake_run(out, code=0):
+        return lambda *a, **k: SimpleNamespace(returncode=code, stdout=out, stderr="")
+
+    monkeypatch.setattr(app_mod.subprocess, "run", fake_run(f"{tmp_path}\n"))
+    assert app_mod.browse_folder(str(tmp_path)) == str(tmp_path)
+    monkeypatch.setattr(app_mod.subprocess, "run", fake_run(""))
+    assert app_mod.browse_folder() is None
+    monkeypatch.setattr(app_mod.subprocess, "run", fake_run("", code=1))
+    with pytest.raises(FactoryError, match="escribe la ruta"):
+        app_mod.browse_folder()
+
+
+def test_startup_opens_the_last_project_that_still_exists(tmp_path):
+    from factory_ui.app import last_project
+
+    store = Store(tmp_path / "home")
+    assert last_project(store) is None
+    keep, gone = tmp_path / "keep", tmp_path / "gone"
+    keep.mkdir()
+    gone.mkdir()
+    store.add_recent(keep)
+    store.add_recent(gone)
+    gone.rmdir()
+    assert last_project(store) == keep

@@ -13,8 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+from factory_app import control, services
 from factory_app import orchestrator as ORCH
-from factory_app import services
 from factory_app.context import FACTORY_REPO, use_project
 from factory_app.project import Project, normalize_change_id
 from factory_app.roles import FactoryError
@@ -38,6 +38,7 @@ class RunManager:
     def __init__(self):
         self._locks: dict[str, threading.Lock] = {}
         self._outcomes: dict[str, dict] = {}
+        self._controls: dict[str, control.RunControl] = {}
         self._guard = threading.Lock()
         self.version = 0  # cambia con cada outcome (lo mira el SSE)
 
@@ -76,13 +77,17 @@ class RunManager:
             lock = self._locks.setdefault(key, threading.Lock())
             if not lock.acquire(blocking=False):
                 raise FactoryError(f"{cid} ya esta avanzando; espera a que se detenga")
+        ctl = control.RunControl()
+        self._controls[key] = ctl
         self._set(key, {"kind": "running", "mode": mode, "at": time.time()})
 
         def work():
             try:
-                with use_project(project):
+                with use_project(project), control.use_control(ctl):
                     st = ORCH.advance(cid, executor)
                 self._set(key, {"kind": "done", "status": st["status"]})
+            except control.Paused as exc:
+                self._set(key, {"kind": "paused", "message": str(exc), "mode": mode})
             except ORCH.AwaitingHuman as exc:
                 self._set(key, {"kind": "awaiting", "gate": exc.gate, "message": exc.why})
             except ORCH.Blocked as exc:
@@ -94,6 +99,7 @@ class RunManager:
             except Exception as exc:  # noqa: BLE001 — se reporta a la UI, el run queda en checkpoint
                 self._set(key, {"kind": "error", "message": f"{type(exc).__name__}: {exc}"})
             finally:
+                self._controls.pop(key, None)
                 lock.release()
 
         ctx = contextvars.copy_context()
@@ -101,6 +107,17 @@ class RunManager:
         thread.start()
         if wait:
             thread.join()
+        return self.outcome(project, cid) or {}
+
+    def pause(self, project: Project, change_id: str) -> dict:
+        """Pausa inmediata: cancela la llamada en curso; el run vuelve a su checkpoint."""
+        cid = normalize_change_id(change_id)
+        key = self._key(project, cid)
+        ctl = self._controls.get(key)
+        if ctl is None or not self.busy(project, cid):
+            raise FactoryError(f"{cid} no esta avanzando: no hay nada que pausar")
+        ctl.pause()
+        self._set(key, {**(self._outcomes.get(key) or {}), "kind": "running", "pausing": True})
         return self.outcome(project, cid) or {}
 
     def _set(self, key: str, outcome: dict) -> None:

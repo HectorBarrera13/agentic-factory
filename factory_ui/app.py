@@ -15,7 +15,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import secrets
+import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 from typing import Literal
@@ -159,6 +162,57 @@ def _provider_list() -> list[dict]:
     return out
 
 
+# Dialogo nativo de carpeta en un proceso aparte: tkinter necesita su propio hilo
+# principal y no debe bloquear el servidor. Imprime la ruta elegida (vacio = cancelado).
+BROWSE_SCRIPT = """
+import sys, tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+path = filedialog.askdirectory(parent=root, initialdir=sys.argv[1] or None,
+                               title="Elige la carpeta del proyecto", mustexist=True)
+root.destroy()
+sys.stdout.write(path or "")
+"""
+BROWSE_TIMEOUT = 600
+
+
+def browse_folder(initial: str = "") -> str | None:
+    """Abre el explorador del sistema y devuelve la carpeta elegida (None si se cancela)."""
+    try:
+        r = subprocess.run([sys.executable, "-c", BROWSE_SCRIPT, initial], capture_output=True,
+                           text=True, timeout=BROWSE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise FactoryError("el explorador quedo abierto demasiado tiempo; vuelve a intentarlo") \
+            from exc
+    if r.returncode != 0:
+        raise FactoryError("no se pudo abrir el explorador del sistema (tkinter no disponible); "
+                           "escribe la ruta a mano")
+    path = r.stdout.strip()
+    return str(Path(path)) if path else None
+
+
+def _models_in_use(project: Project) -> list[dict]:
+    """Modelos que usaran los agentes (con FACTORY_MODEL aplicado) y su ultimo probe."""
+    agents = project.config.agents
+    env_model = os.getenv("FACTORY_MODEL")
+    out: dict[tuple[str, str], dict] = {}
+    for role in ROLES:
+        provider, model = agents.provider_model_for(role)
+        own = (agents.roles.get(role) or None)
+        override = bool(provider == "gemini" and env_model and not (own and own.model)
+                        and env_model != agents.model)
+        item = out.setdefault((provider, model), {
+            "provider": provider, "model": model, "roles": [],
+            "probe": probe_mod.result(provider, model), "env_override": False,
+            "configured_model": agents.model if override else None,
+        })
+        item["roles"].append(role)
+        item["env_override"] = item["env_override"] or override
+    return list(out.values())
+
+
 def _probes() -> dict:
     return {"items": probe_mod.results(), "running": sorted(probe_mod.running),
             "version": probe_mod.version}
@@ -260,9 +314,20 @@ def create_app(
     @app.post("/api/projects/detect")
     def detect(body: OpenBody):
         try:
-            return detect_mod.detect(Path(body.path).expanduser())
+            found = detect_mod.detect(Path(body.path).expanduser())
         except FileNotFoundError as exc:
             raise FactoryError(f"La carpeta no existe: {body.path}") from exc
+        suggested = probe_mod.latest_ok()
+        # proyecto nuevo: proponer el ultimo modelo que paso la prueba (no el del codigo)
+        if suggested and not found.get("has_config"):
+            found["config"]["agents"]["provider"], found["config"]["agents"]["model"] = suggested
+            found["suggested_model"] = {"provider": suggested[0], "model": suggested[1]}
+        return found
+
+    @app.post("/api/projects/browse")
+    async def browse():
+        start = str(session.project.root.parent) if session.project else str(Path.home())
+        return {"path": await asyncio.to_thread(browse_folder, start)}
 
     @app.get("/api/config")
     def get_config():
@@ -307,6 +372,10 @@ def create_app(
             return {"items": providers.list_models(provider_id, refresh=refresh), "error": None}
         except providers.ConnectionProblem as exc:
             return {"items": [], "error": {"kind": exc.kind, "message": str(exc)}}
+
+    @app.get("/api/models/in-use")
+    def models_in_use():
+        return {"items": _models_in_use(session.require())}
 
     @app.get("/api/models/probes")
     def model_probes():
@@ -389,6 +458,10 @@ def create_app(
     @app.post("/api/runs/{change_id}/advance")
     def advance(change_id: str, body: AdvanceBody, wait: bool = False):
         return session.runs.advance(session.require(), change_id, body.mode, wait=wait)
+
+    @app.post("/api/runs/{change_id}/pause")
+    def pause_run(change_id: str):
+        return session.runs.pause(session.require(), change_id)
 
     @app.post("/api/runs/{change_id}/gates/{gate}")
     def decide_gate(change_id: str, gate: str, body: GateBody):
@@ -502,6 +575,11 @@ def create_app(
     return app
 
 
+def last_project(store: Store) -> Path | None:
+    """Ultimo proyecto abierto que siga existiendo (se abre al iniciar sin ruta)."""
+    return next((Path(p) for p in store.recent() if Path(p).is_dir()), None)
+
+
 def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
@@ -515,9 +593,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     token = args.token or secrets.token_urlsafe(24)
     hosts = {f"127.0.0.1:{args.port}", f"localhost:{args.port}"}
-    app = create_app(args.project or Path.cwd(), token=token, allowed_hosts=hosts)
+    root = args.project or last_project(Store()) or Path.cwd()
+    app = create_app(root, token=token, allowed_hosts=hosts)
     url = f"http://127.0.0.1:{args.port}/?token={token}"
     print(f"Factory Studio: {url}")
+    print(f"Proyecto: {app.state.session.project.root if app.state.session.project else root}")
     if not args.no_browser:
         webbrowser.open(url)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
