@@ -265,6 +265,12 @@ def test_services_raise_factory_error_not_system_exit(ts_project):
         services.approve_gate(p, "CR-001", "plan", "APPROVED", "ok", "Luis (Tech Lead)")
     with pytest.raises(FactoryError, match="Rol no autorizado"):
         services.approve_gate(p, "CR-001", "release", "APPROVED", "ok", "Luis (Tech Lead)")
+    # sin avanzar, el CR aun se edita; en cuanto corre el intake queda congelado
+    services.update_change_request(p, "CR-001", "# CR-001\n\n- AC-CART.1 total\n")
+    run = p.run_dir("CR-001")
+    assert "AC-CART.1" in (run / "00-change-request.md").read_text(encoding="utf-8")
+    with pytest.raises(AwaitingHuman):
+        ORCH.advance("CR-001", FakeExecutor())
     with pytest.raises(FactoryError, match="congelado"):
         services.update_change_request(p, "CR-001", "# otro")
 
