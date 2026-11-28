@@ -207,6 +207,11 @@ Alineación con el instructivo (§8-§18):
   defecto) se exige confirmación explícita (`--force`), que también queda registrada.
 - Re-review: la ronda anterior se archiva (`08-review-report-roundN.md`), se escribe
   `13-re-review.md`, y los reportes de una ronda no se regeneran al reanudar tras el gate.
+  Un finding aceptado en una ronda anterior que el fix ya corrigió se clasifica `RESOLVED`
+  (solo se admite para esos findings): no abre otra ronda de fix ni cuenta como rechazo.
+- El motivo con que se firma un gate `requirements` o `plan` (APPROVED/MODIFIED) llega a las
+  fases siguientes como `HUMAN_GATE_NOTES` (planner, Coder, Test Analyst, Reviewer) y manda
+  sobre el intake o el plan cuando los contradice.
 - Solo un MUST FIX / HIGH aceptado, o un finding que el Human Reviewer marca "corregir en este
   ciclo", dispara fix; un SHOULD FIX aceptado sin esa marca queda registrado. Cada
   clasificación lleva su motivo (llega al Coder Fix) y el Human Reviewer puede añadir findings

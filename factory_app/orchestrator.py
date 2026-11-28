@@ -458,6 +458,7 @@ class ADKExecutor(AgentExecutor):
         for key in (
             "cr_text",
             "po_clarification",
+            "human_gate_notes",
             "selected_context",
             "intake_report",
             "implementation_plan",
@@ -750,10 +751,28 @@ def _apply_gate_decision(
     gates = {**state["human_gates"], gate: decision["decision"]}
     signers = {**state.get("gate_signers", {}), gate: _signer(decision)}
     if decision["decision"] in {"APPROVED", "MODIFIED"}:
-        return _update_state(run_dir, awaiting_gate="", human_gates=gates, gate_signers=signers)
+        notes = dict(state.get("gate_notes", {}))
+        reason = str(decision.get("reason") or "").strip()
+        if reason:  # lo que el humano decidio al firmar: lo leen las fases siguientes
+            notes[gate] = {"decision": decision["decision"],
+                           "by": str(decision.get("recorded_by", "")), "reason": reason}
+        return _update_state(run_dir, awaiting_gate="", human_gates=gates, gate_signers=signers,
+                             gate_notes=notes)
     _escalate(run_dir, change_id, f"gate {gate}: {decision['decision']}", human_gates=gates,
               gate_signers=signers)
     raise AwaitingHuman(change_id, gate, f"decision {decision['decision']}: intervenga un humano")
+
+
+def human_gate_notes(run_dir: Path, gates: tuple[str, ...] = ("requirements", "plan")) -> str:
+    """Motivos de los gates ya firmados (APPROVED/MODIFIED), para las fases que siguen.
+    Un MODIFIED sin esto no cambiaba nada: el planner y el Coder nunca veian el motivo."""
+    notes = _load_state(run_dir).get("gate_notes", {})
+    lines = [
+        f"- gate {gate}: {n['decision']} por {n.get('by') or '?'}: {n['reason']}"
+        for gate in gates
+        if (n := notes.get(gate))
+    ]
+    return "\n".join(lines)
 
 
 def _archive(run_dir: Path, name: str, round_no: int) -> None:
@@ -1091,6 +1110,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                     "cr_text": cr_text,
                     "intake_report": _read(run_dir / "01-intake-report.md"),
                     "po_clarification": clarification,
+                    "human_gate_notes": human_gate_notes(run_dir, ("requirements",)),
                 },
             )
             (run_dir / "03-implementation-plan.md").write_text(out["report"], encoding="utf-8")
@@ -1131,6 +1151,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             "change_id": change_id,
             "cr_text": cr_text,
             "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
+            "human_gate_notes": human_gate_notes(run_dir),
             # el Coder Fix recibe QUE corregir, no solo los ids
             "accepted_blocking_findings": (
                 fix_reason + "\n\n" + state.get("fix_details", "") if fix_reason else ""
@@ -1162,6 +1183,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                     "change_id": change_id,
                     "cr_text": cr_text,
                     "implementation_plan": ctx["implementation_plan"],
+                    "human_gate_notes": ctx["human_gate_notes"],
                     "git_diff": _git(["diff", rng]).stdout,
                 },
             )
@@ -1244,6 +1266,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 "change_id": change_id,
                 "cr_text": cr_text,
                 "implementation_plan": _read(run_dir / "03-implementation-plan.md"),
+                "human_gate_notes": human_gate_notes(run_dir),
                 "git_diff": diff,
                 "verification_summary": _read(run_dir / _last_verification_file(run_dir)),
                 "prior_findings": prior_findings,
@@ -1323,7 +1346,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 run_dir,
                 change_id,
                 "review",
-                "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)",
+                "clasifique cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED/RESOLVED)",
                 state,
             )
         blocking = (

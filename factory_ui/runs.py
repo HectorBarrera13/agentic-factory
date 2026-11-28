@@ -144,6 +144,7 @@ def _finding_source(fid: str) -> str:
 
 def _findings(project: Project, run: Path, state: dict) -> dict:
     ids = sorted(services.report_finding_ids(run))
+    fixed = services.previously_fixed(run)
     with use_project(project):
         severities = ORCH.finding_severities(run)
         segments = ORCH.report_segments(run)
@@ -166,6 +167,7 @@ def _findings(project: Project, run: Path, state: dict) -> dict:
                 "reason": (decided.get(fid) or {}).get("reason") or "",
                 "human_blocking": (decided.get(fid) or {}).get("blocking") is True,
                 "source": _finding_source(fid),
+                "fixed_before": fid in fixed,
                 "excerpt": segments.get(fid, "").strip()[:600],
             }
             for fid in ids

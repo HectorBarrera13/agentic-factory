@@ -229,6 +229,57 @@ def test_fix_receives_the_accepted_findings_text(sandbox):  # noqa: F811
     assert "RF-01" in fix and "race condition in register" in fix
 
 
+def _sign(run, gate, decision, reason):
+    import json
+    from datetime import datetime, timezone
+
+    (run / f"human-{gate}-decision.json").write_text(json.dumps({
+        "decision": decision, "reason": reason, "recorded_by": "Tony (Product Owner)",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+
+
+def test_gate_reasons_reach_the_phases_that_follow(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = Capture()
+    drive(run, ex, stop_at="requirements")
+    _sign(run, "requirements", "MODIFIED", "No existe AC-04; el texto es 'en conflicto'")
+    drive(run, ex, stop_at="plan")
+    plan_notes = ex.ctx["plan"]["human_gate_notes"]
+    assert "gate requirements: MODIFIED por Tony (Product Owner)" in plan_notes
+    assert "No existe AC-04" in plan_notes
+    _sign(run, "plan", "MODIFIED", "T4 pertenece a AC-01")
+    drive(run, ex, stop_at="review")
+    for phase in ("implement", "test_analysis", "review"):
+        notes = ex.ctx[phase]["human_gate_notes"]
+        assert "No existe AC-04" in notes and "T4 pertenece a AC-01" in notes, phase
+    prompt = ADKExecutor._prompt("implement", ex.ctx["implement"])
+    assert "HUMAN_GATE_NOTES:\n- gate requirements: MODIFIED" in prompt
+
+
+def test_a_fixed_finding_is_marked_resolved_and_does_not_fix_again(sandbox):  # noqa: F811
+    from factory_app import services
+    from factory_app.context import project
+
+    run = sandbox()
+    reviewer = "Tester (Human Reviewer)"
+    ex = Capture(review_report="# Review\n\nRF-01 | MUST FIX | race condition in register\n")
+    drive(run, ex, stop_at="review")
+    with pytest.raises(services.FactoryError, match="ronda anterior"):
+        services.decide_findings(project(), "CR-T", {"RF-01": "RESOLVED"}, reviewer)
+    services.decide_findings(project(), "CR-T", {"RF-01": "ACCEPTED"}, reviewer)
+    approve(run, "review")
+    drive(run, ex, stop_at="review")  # fix + re-review: el Reviewer vuelve a nombrar RF-01
+    assert services.previously_fixed(run) == {"RF-01"}
+    services.decide_findings(project(), "CR-T", {"RF-01": {
+        "decision": "RESOLVED", "reason": "corregido y verificado"}}, reviewer)
+    approve(run, "review")
+    drive(run, ex)
+    st = state(run)
+    assert st["status"] == "READY FOR HUMAN MERGE"
+    assert st["review_rounds"] == 1  # RESOLVED no abre otra ronda de fix
+
+
 def _decide_with(run, **decisions):
     """Clasificacion con campos nuevos (motivo, "corregir en este ciclo") registrada AHORA."""
     import json

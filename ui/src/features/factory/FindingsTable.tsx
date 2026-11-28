@@ -10,6 +10,7 @@ const VERDICT_LABEL: Record<string, string> = {
   MODIFIED: "Modificado",
   REJECTED: "Rechazado",
   DEFERRED: "Diferido",
+  RESOLVED: "Resuelto (ya corregido)",
 };
 const FIX_VERDICTS = new Set(["ACCEPTED", "MODIFIED"]);
 const SOURCE_LABEL: Record<string, string> = {
@@ -177,7 +178,9 @@ export function FindingsTable({
                             onChange={(e) => edit(f, { decision: e.target.value })}
                           >
                             <option value="">— sin clasificar —</option>
-                            {verdicts.map((v) => (
+                            {verdicts
+                              .filter((v) => v !== "RESOLVED" || f.fixed_before)
+                              .map((v) => (
                               <option key={v} value={v}>
                                 {VERDICT_LABEL[v] ?? v}
                               </option>

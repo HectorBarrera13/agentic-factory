@@ -247,6 +247,8 @@ export interface Finding {
   /** Marcado "corregir en este ciclo" por el Human Reviewer. */
   human_blocking?: boolean;
   source?: "reviewer" | "human" | "security" | "scanner" | "";
+  /** Aceptado en una ronda anterior (ya paso por un fix): admite RESOLVED. */
+  fixed_before?: boolean;
 }
 
 /** Veredicto de un finding: solo la decision, o con motivo / "corregir en este ciclo". */

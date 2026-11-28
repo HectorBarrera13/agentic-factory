@@ -1,4 +1,5 @@
-"""Gate 2: clasificacion HUMANA de cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED).
+"""Gate 2: clasificacion HUMANA de cada finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED;
+RESOLVED en el re-review para un finding ya corregido por un fix de una ronda anterior).
 
 Usage:
   python scripts/decide_findings.py CR-001 --by "Ana (Human Reviewer)" \

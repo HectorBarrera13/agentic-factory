@@ -18,7 +18,9 @@ from .roles import FactoryError, validate_role
 
 VALID_GATES = ("requirements", "plan", "review", "release")
 VALID_DECISIONS = ("APPROVED", "MODIFIED", "REJECTED", "DEFERRED")
-VERDICTS = ("ACCEPTED", "REJECTED", "MODIFIED", "DEFERRED")
+# RESOLVED: un finding aceptado en una ronda anterior que el fix ya corrigio (re-review).
+# No dispara otro fix ni cuenta como rechazo.
+VERDICTS = ("ACCEPTED", "REJECTED", "MODIFIED", "DEFERRED", "RESOLVED")
 FINDING_RE = re.compile(r"^(RF|HR|SEC|SEC-SCAN)-\d{2,}$")
 REPORT_ID_RE = re.compile(r"\b(?:RF|HR|SEC(?:-SCAN)?)-\d{2,}\b")
 # mismos nombres que orchestrator.FINDING_REPORTS (services no importa el motor)
@@ -523,6 +525,22 @@ def report_finding_ids(run: Path) -> set[str]:
     return set(REPORT_ID_RE.findall(text))
 
 
+def previously_fixed(run: Path) -> set[str]:
+    """Findings ACEPTADOS/MODIFICADOS en una ronda anterior (archivada): los que ya pasaron
+    por un Coder Fix y en el re-review se pueden marcar RESOLVED."""
+    ids: set[str] = set()
+    for path in run.glob("human-findings-decisions-round*.json"):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        ids |= {
+            d["finding_id"] for d in data.get("decisions", [])
+            if d.get("decision") in FIX_VERDICTS
+        }
+    return ids
+
+
 def _decided_ids(run: Path) -> set[str]:
     path = run / "human-findings-decisions.json"
     if not path.is_file():
@@ -559,7 +577,7 @@ def approve_gate(
         if missing:
             raise FactoryError(
                 f"Findings sin clasificar en {cid}: {', '.join(missing)}. "
-                "Clasificalos (ACCEPTED|REJECTED|MODIFIED|DEFERRED) como Human Reviewer "
+                "Clasificalos (ACCEPTED|REJECTED|MODIFIED|DEFERRED|RESOLVED) como Human Reviewer "
                 "antes de cerrar el gate review."
             )
     # human_gates lo actualiza el motor al CONSUMIR la decision, no esta funcion.
@@ -662,6 +680,16 @@ def decide_findings(
     unknown = [d["finding_id"] for d in decisions if known and d["finding_id"] not in known]
     if unknown:
         raise FactoryError(f"findings no presentes en los reportes del run: {unknown}")
+    fixed = previously_fixed(run)
+    not_fixed = [
+        d["finding_id"] for d in decisions
+        if d["decision"] == "RESOLVED" and d["finding_id"] not in fixed
+    ]
+    if not_fixed:
+        raise FactoryError(
+            f"RESOLVED solo vale para findings aceptados en una ronda anterior (ya corregidos "
+            f"por un fix): {not_fixed}"
+        )
     rows, added_decisions = _added_findings(run, added, recorded_by)
     if rows:
         human = run / HUMAN_FINDINGS
