@@ -12,7 +12,9 @@
 | `factory_app/prompts.py` | Agent prompts |
 | `factory_app/contracts.py` | Structured agent contracts (role/allow/deny/output/stop/escalation) |
 | `factory_app/orchestrator.py` | Gates, state machine, evidence, traceability |
+| `factory_app/activity.py` | Live activity stream per run (`runs/<CR>/activity.jsonl`: who works on what) |
 | `scripts/_roles.py` | Human role required per gate |
+| `scripts/retry_run.py` | New attempt of an ESCALATED / NOT READY run (edited CR, PO signature) |
 | `change_requests/` | Work input |
 | `scripts/` | Deterministic run/gate helpers |
 | `tests/` | Product, factory and eval tests |

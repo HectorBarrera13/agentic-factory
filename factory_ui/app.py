@@ -15,7 +15,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import secrets
+import subprocess
+import sys
 import webbrowser
 from pathlib import Path
 from typing import Literal
@@ -25,11 +28,13 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ValidationError
 
-from factory_app import services
+from factory_app import credentials, providers, services
+from factory_app import probe as probe_mod
 from factory_app.orchestrator import remove_worktree
 from factory_app.project import (
     GATES,
     LANGUAGES,
+    ROLE_CATALOG,
     ROLES,
     VERIFY_KINDS,
     Project,
@@ -103,6 +108,15 @@ class CrUpdate(BaseModel):
     body: str
 
 
+class SignBody(BaseModel):
+    profile_id: str
+    role: str
+
+
+class DeleteCrBody(SignBody):
+    confirm: str
+
+
 class StartBody(BaseModel):
     change_id: str
 
@@ -118,6 +132,14 @@ class GateBody(BaseModel):
     role: str
 
 
+class RetryBody(BaseModel):
+    body: str
+    reason: str
+    profile_id: str
+    role: str
+    force: bool = False
+
+
 class FindingsBody(BaseModel):
     verdicts: dict[str, str]
     profile_id: str
@@ -127,6 +149,90 @@ class FindingsBody(BaseModel):
 class ProfileBody(BaseModel):
     name: str
     roles: list[str]
+
+
+class ProviderBody(BaseModel):
+    api_key: str | None = None
+    url: str | None = None
+
+
+class ProbeBody(BaseModel):
+    provider: str
+    model: str
+
+
+def _provider_list() -> list[dict]:
+    """Catalogo + estado de cada proveedor. Nunca incluye la clave."""
+    out = []
+    for pid, info in providers.PROVIDERS.items():
+        out.append({
+            "id": pid,
+            "label": info.label,
+            "description": info.description,
+            "needs_key": info.needs_key,
+            "needs_url": info.needs_url,
+            "key_optional": not info.needs_key and bool(credentials.ENV_VARS[pid][0]),
+            "temperature_range": list(info.temperature_range),
+            "default_url": credentials.DEFAULT_URLS.get(pid),
+            "status": credentials.status(pid),
+        })
+    return out
+
+
+# Dialogo nativo de carpeta en un proceso aparte: tkinter necesita su propio hilo
+# principal y no debe bloquear el servidor. Imprime la ruta elegida (vacio = cancelado).
+BROWSE_SCRIPT = """
+import sys, tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+path = filedialog.askdirectory(parent=root, initialdir=sys.argv[1] or None,
+                               title="Elige la carpeta del proyecto", mustexist=True)
+root.destroy()
+sys.stdout.write(path or "")
+"""
+BROWSE_TIMEOUT = 600
+
+
+def browse_folder(initial: str = "") -> str | None:
+    """Abre el explorador del sistema y devuelve la carpeta elegida (None si se cancela)."""
+    try:
+        r = subprocess.run([sys.executable, "-c", BROWSE_SCRIPT, initial], capture_output=True,
+                           text=True, timeout=BROWSE_TIMEOUT, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise FactoryError("el explorador quedo abierto demasiado tiempo; vuelve a intentarlo") \
+            from exc
+    if r.returncode != 0:
+        raise FactoryError("no se pudo abrir el explorador del sistema (tkinter no disponible); "
+                           "escribe la ruta a mano")
+    path = r.stdout.strip()
+    return str(Path(path)) if path else None
+
+
+def _models_in_use(project: Project) -> list[dict]:
+    """Modelos que usaran los agentes (con FACTORY_MODEL aplicado) y su ultimo probe."""
+    agents = project.config.agents
+    env_model = os.getenv("FACTORY_MODEL")
+    out: dict[tuple[str, str], dict] = {}
+    for role in ROLES:
+        provider, model = agents.provider_model_for(role)
+        own = (agents.roles.get(role) or None)
+        override = bool(provider == "gemini" and env_model and not (own and own.model)
+                        and env_model != agents.model)
+        item = out.setdefault((provider, model), {
+            "provider": provider, "model": model, "roles": [],
+            "probe": probe_mod.result(provider, model), "env_override": False,
+            "configured_model": agents.model if override else None,
+        })
+        item["roles"].append(role)
+        item["env_override"] = item["env_override"] or override
+    return list(out.values())
+
+
+def _probes() -> dict:
+    return {"items": probe_mod.results(), "running": sorted(probe_mod.running),
+            "version": probe_mod.version}
 
 
 def _project_info(session: Session) -> dict | None:
@@ -146,9 +252,17 @@ def _signature(session: Session, profile_id: str, role: str) -> str:
     profile = session.store.profile(profile_id)
     if profile is None:
         raise FactoryError("Perfil no encontrado: crea o elige un perfil para firmar")
+    role = role.strip().lower()
     if role not in profile.roles:
         raise FactoryError(f"El perfil {profile.name} no tiene el rol {role!r}")
     return profile.signature(role)
+
+
+def _retryable(project, change_id: str) -> bool:
+    try:
+        return services.read_state(project, change_id).get("status") in services.RETRYABLE
+    except FactoryError:
+        return False
 
 
 def create_app(
@@ -169,7 +283,8 @@ def create_app(
 
     @app.exception_handler(FactoryError)
     async def _factory_error(_request: Request, exc: FactoryError):
-        return JSONResponse({"error": str(exc)}, status_code=400)
+        payload = {"error": str(exc), **({"code": exc.code} if exc.code else {})}
+        return JSONResponse(payload, status_code=400)
 
     @app.exception_handler(ValidationError)
     async def _validation_error(_request: Request, exc: ValidationError):
@@ -207,6 +322,12 @@ def create_app(
             "gate_keys": list(GATES),
             "verify_kinds": list(VERIFY_KINDS),
             "languages": list(LANGUAGES),
+            "role_catalog": list(ROLE_CATALOG),
+            "providers": [
+                {"id": pid, "label": info.label,
+                 "temperature_range": list(info.temperature_range)}
+                for pid, info in providers.PROVIDERS.items()
+            ],
             "defaults": ProjectConfig().model_dump(),
         }
 
@@ -218,9 +339,20 @@ def create_app(
     @app.post("/api/projects/detect")
     def detect(body: OpenBody):
         try:
-            return detect_mod.detect(Path(body.path).expanduser())
+            found = detect_mod.detect(Path(body.path).expanduser())
         except FileNotFoundError as exc:
             raise FactoryError(f"La carpeta no existe: {body.path}") from exc
+        suggested = probe_mod.latest_ok()
+        # proyecto nuevo: proponer el ultimo modelo que paso la prueba (no el del codigo)
+        if suggested and not found.get("has_config"):
+            found["config"]["agents"]["provider"], found["config"]["agents"]["model"] = suggested
+            found["suggested_model"] = {"provider": suggested[0], "model": suggested[1]}
+        return found
+
+    @app.post("/api/projects/browse")
+    async def browse():
+        start = str(session.project.root.parent) if session.project else str(Path.home())
+        return {"path": await asyncio.to_thread(browse_folder, start)}
 
     @app.get("/api/config")
     def get_config():
@@ -231,7 +363,56 @@ def create_app(
         p = session.require()
         config = ProjectConfig.model_validate(data)
         save_config(p, config)
+        # probe automatico de los modelos en uso (sin bloquear el guardado)
+        probe_mod.probe_in_background(config.agents.in_use())
         return _project_info(session)
+
+    # ------------------------------------------------------------ proveedores / modelos
+    @app.get("/api/providers")
+    def list_providers():
+        return {"items": _provider_list()}
+
+    @app.put("/api/providers/{provider_id}")
+    def save_provider(provider_id: str, body: ProviderBody):
+        providers.info(provider_id)
+        credentials.save(provider_id, api_key=body.api_key, url=body.url)
+        providers.clear_cache(provider_id)
+        return {"status": credentials.status(provider_id),
+                "test": providers.test_connection(provider_id)}
+
+    @app.delete("/api/providers/{provider_id}/key")
+    def delete_provider_key(provider_id: str):
+        providers.info(provider_id)
+        status = credentials.delete_key(provider_id)
+        providers.clear_cache(provider_id)
+        return {"status": status}
+
+    @app.post("/api/providers/{provider_id}/test")
+    def test_provider(provider_id: str):
+        return providers.test_connection(provider_id)
+
+    @app.get("/api/providers/{provider_id}/models")
+    def provider_models(provider_id: str, refresh: bool = False):
+        try:
+            return {"items": providers.list_models(provider_id, refresh=refresh), "error": None}
+        except providers.ConnectionProblem as exc:
+            return {"items": [], "error": {"kind": exc.kind, "message": str(exc)}}
+
+    @app.get("/api/models/in-use")
+    def models_in_use():
+        return {"items": _models_in_use(session.require())}
+
+    @app.get("/api/models/probes")
+    def model_probes():
+        return _probes()
+
+    @app.post("/api/models/probe")
+    async def run_probe(body: ProbeBody):
+        providers.info(body.provider)
+        if not body.model.strip():
+            raise FactoryError("falta el modelo")
+        # en un hilo: el probe usa asyncio.run y puede tardar
+        return await asyncio.to_thread(probe_mod.probe, body.provider, body.model.strip())
 
     # ------------------------------------------------------------ archivos / git
     @app.get("/api/files/tree")
@@ -252,18 +433,25 @@ def create_app(
 
     # ------------------------------------------------------------ change requests
     @app.get("/api/crs")
-    def list_crs():
-        return {"items": services.list_change_requests(session.require())}
+    def list_crs(archived: bool = False):
+        p = session.require()
+        if archived:
+            return {"items": services.list_archived(p)}
+        return {"items": services.list_change_requests(p)}
 
     @app.get("/api/crs/{change_id}")
     def get_cr(change_id: str):
         p = session.require()
         path = services.find_change_request(p, change_id)
+        life = services.cr_lifecycle(p, change_id, busy=session.runs.busy(p, change_id))
         return {
             "change_id": change_id.upper(),
             "file": path.relative_to(p.root).as_posix(),
             "body": path.read_text(encoding="utf-8"),
-            "frozen": (p.run_dir(change_id) / "factory-state.json").is_file(),
+            # compatibilidad: congelado = ya no se edita (el intake corrio o esta corriendo)
+            "frozen": not life["editable"],
+            "retryable": _retryable(p, change_id),
+            **life,
         }
 
     @app.post("/api/crs")
@@ -275,8 +463,27 @@ def create_app(
     @app.put("/api/crs/{change_id}")
     def update_cr(change_id: str, body: CrUpdate):
         p = session.require()
-        path = services.update_change_request(p, change_id, body.body)
+        path = services.update_change_request(
+            p, change_id, body.body, busy=session.runs.busy(p, change_id))
         return {"file": path.relative_to(p.root).as_posix()}
+
+    @app.post("/api/crs/{change_id}/archive")
+    def archive_cr(change_id: str, body: SignBody):
+        p = session.require()
+        signed = _signature(session, body.profile_id, body.role)
+        return services.archive_change_request(
+            p, change_id, signed, busy=session.runs.busy(p, change_id))
+
+    @app.post("/api/crs/{change_id}/restore")
+    def restore_cr(change_id: str):
+        return services.restore_change_request(session.require(), change_id)
+
+    @app.delete("/api/crs/{change_id}")
+    def delete_cr(change_id: str, body: DeleteCrBody):
+        p = session.require()
+        _signature(session, body.profile_id, body.role)  # solo un humano identificado borra
+        return services.delete_change_request(
+            p, change_id, body.confirm, busy=session.runs.busy(p, change_id))
 
     # ------------------------------------------------------------ runs
     @app.get("/api/runs")
@@ -295,6 +502,14 @@ def create_app(
     def run_detail(change_id: str):
         return runs_mod.detail(session.require(), session.runs, change_id)
 
+    @app.get("/api/runs/{change_id}/activity")
+    def run_activity(change_id: str, after: int = 0):
+        from factory_app import activity
+
+        p = session.require()
+        services.read_state(p, change_id)  # FactoryError si no existe
+        return activity.read(p.run_dir(change_id), after=after)
+
     @app.get("/api/runs/{change_id}/artifacts/{name}")
     def run_artifact(change_id: str, name: str):
         return {"name": name, "content": runs_mod.read_artifact(session.require(), change_id, name)}
@@ -302,6 +517,18 @@ def create_app(
     @app.post("/api/runs/{change_id}/advance")
     def advance(change_id: str, body: AdvanceBody, wait: bool = False):
         return session.runs.advance(session.require(), change_id, body.mode, wait=wait)
+
+    @app.post("/api/runs/{change_id}/pause")
+    def pause_run(change_id: str):
+        return session.runs.pause(session.require(), change_id)
+
+    @app.post("/api/runs/{change_id}/retry")
+    def retry_run(change_id: str, body: RetryBody):
+        p = session.require()
+        if session.runs.busy(p, change_id):
+            raise FactoryError("el run esta avanzando; espera a que se detenga")
+        signed = _signature(session, body.profile_id, body.role)
+        return services.retry_run(p, change_id, body.body, body.reason, signed, body.force)
 
     @app.post("/api/runs/{change_id}/gates/{gate}")
     def decide_gate(change_id: str, gate: str, body: GateBody):
@@ -367,7 +594,8 @@ def create_app(
             while True:
                 if await request.is_disconnected():
                     break
-                snap = runs_mod.snapshot(session.project, session.runs)
+                snap = {**runs_mod.snapshot(session.project, session.runs),
+                        "probes": probe_mod.version}
                 if snap != last:
                     last = snap
                     sent += 1
@@ -414,6 +642,11 @@ def create_app(
     return app
 
 
+def last_project(store: Store) -> Path | None:
+    """Ultimo proyecto abierto que siga existiendo (se abre al iniciar sin ruta)."""
+    return next((Path(p) for p in store.recent() if Path(p).is_dir()), None)
+
+
 def main(argv: list[str] | None = None) -> None:
     import uvicorn
 
@@ -427,9 +660,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     token = args.token or secrets.token_urlsafe(24)
     hosts = {f"127.0.0.1:{args.port}", f"localhost:{args.port}"}
-    app = create_app(args.project or Path.cwd(), token=token, allowed_hosts=hosts)
+    root = args.project or last_project(Store()) or Path.cwd()
+    app = create_app(root, token=token, allowed_hosts=hosts)
     url = f"http://127.0.0.1:{args.port}/?token={token}"
     print(f"Factory Studio: {url}")
+    print(f"Proyecto: {app.state.session.project.root if app.state.session.project else root}")
     if not args.no_browser:
         webbrowser.open(url)
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")

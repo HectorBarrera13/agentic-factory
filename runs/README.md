@@ -24,12 +24,23 @@ runs/CR-001/
   15-release-decision.json              # gate 3 (Release Manager)
   context-manifest.json                 # contexto seleccionado: incluido / descartado
   tool-calls.jsonl                      # solo --adk: cada llamada a tool (fase, agente, args truncados, ok/error)
+  activity.jsonl                        # actividad en vivo {seq, ts, kind, ...}: fases (rol, proveedor, modelo,
+                                        # duracion), tools (solo destino corto), comandos de verificacion, gates,
+                                        # rondas de fix, pausa, escalado y fin; la lee el diagrama de Studio
   factory-state.json                    # estado/checkpoint del motor (awaiting_gate, base_commit, rondas)
   human-<gate>-decision.json            # fuente maquina de cada decision humana
   human-<gate>-decision-clarification*.json  # aclaraciones del PO que reanudaron un ESCALATED
   human-findings-decisions.json         # decisiones por finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)
   08-review-report-roundN.md, 09-security-report-roundN.md   # rondas previas archivadas
+  00-retry-decision.md                  # Reintentar: quien, por que, intento anterior, CR cambiado
+  intentos/<n>/                         # intento anterior archivado completo (rama factory/<CR>-intento<n>)
+runs/archivados/CR-001/                 # run terminado y archivado desde Studio (mismo contenido)
+  archivo.json                          # {change_id, archived_at, archived_by, status, branch, worktree_removed}
 ```
+
+Archivar no borra evidencia: mueve el run (y el CR a `<crs>/archivados/`) y quita el worktree; la
+rama `factory/<CR>` sigue. Restaurar lo devuelve a su sitio si no existe ya un CR o run con ese ID.
+Eliminar (permanente, con el ID tecleado) borra CR, run y worktree, nunca la rama.
 
 La carpeta de runs, la de CRs y la de worktrees se configuran en `.factory/config.toml`
 (`[paths]`). En este repo apuntan a `runs/` y `change_requests/`; en otros proyectos el valor por

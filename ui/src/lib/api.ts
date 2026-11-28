@@ -7,6 +7,79 @@ export interface Profile {
   id: string;
   name: string;
   roles: string[];
+  /** Tenia roles que ya no estan en el catalogo (se quitaron al cargar). */
+  incomplete?: boolean;
+}
+
+export type ProviderId = "gemini" | "anthropic" | "openai" | "ollama" | "openai_compatible";
+
+export interface AgentOverride {
+  provider?: ProviderId | null;
+  model?: string | null;
+  temperature?: number | null;
+}
+
+export interface ProviderStatus {
+  has_key: boolean;
+  key_source: "env" | "file" | "none";
+  last4: string | null;
+  url: string | null;
+  url_source: "env" | "file" | "none";
+}
+
+export interface ProviderInfo {
+  id: ProviderId;
+  label: string;
+  description: string;
+  needs_key: boolean;
+  needs_url: boolean;
+  key_optional: boolean;
+  temperature_range: [number, number];
+  default_url: string | null;
+  status: ProviderStatus;
+}
+
+export type ConnectionKind = "OK" | "INVALID_KEY" | "UNREACHABLE" | "ERROR" | "NO_KEY" | "NO_URL";
+
+export interface ConnectionTest {
+  ok: boolean;
+  kind: ConnectionKind;
+  message: string;
+  models: number;
+}
+
+export interface ModelEntry {
+  id: string;
+  label: string;
+  created?: string | number | null;
+}
+
+export type ProbeStatus = "OK" | "NO_TOOLS" | "NO_ACCESS" | "QUOTA" | "INVALID_KEY" | "ERROR";
+
+export interface ProbeResult {
+  provider: string;
+  model: string;
+  status: ProbeStatus;
+  message: string;
+  temperature_supported: boolean | null;
+  at: number;
+  seconds: number;
+}
+
+export interface ModelInUse {
+  provider: ProviderId;
+  model: string;
+  roles: string[];
+  probe: ProbeResult | null;
+  /** FACTORY_MODEL del entorno reemplaza el modelo configurado (solo Gemini). */
+  env_override: boolean;
+  configured_model: string | null;
+}
+
+export interface Probes {
+  items: Record<string, ProbeResult>;
+  running: string[];
+  version: number;
 }
 
 export interface VerifyCommand {
@@ -34,11 +107,12 @@ export interface ProjectConfig {
   verify: { commands: VerifyCommand[]; timeout: number };
   git: { base_branch: string; branch_prefix: string };
   agents: {
+    provider: ProviderId;
     model: string;
     temperature: number;
-    roles: Record<string, { model?: string | null; temperature?: number | null }>;
+    roles: Record<string, AgentOverride>;
   };
-  limits: { verify_rounds: number; review_rounds: number };
+  limits: { verify_rounds: number; review_rounds: number; clarification_rounds: number; attempts: number };
   gates: { roles: Record<string, string[]> };
   scanners: { semgrep_targets: string[] };
   ids: { acceptance: string; requirement: string };
@@ -74,6 +148,8 @@ export interface Meta {
   gate_keys: string[];
   verify_kinds: string[];
   languages: string[];
+  role_catalog: string[];
+  providers: { id: ProviderId; label: string; temperature_range: [number, number] }[];
   defaults: ProjectConfig;
 }
 
@@ -104,7 +180,34 @@ export interface ChangeRequest {
   change_id: string;
   file: string;
   title: string;
-  has_run: boolean;
+  has_run?: boolean;
+  /** solo en la lista de archivados */
+  archived?: boolean;
+  archived_at?: string;
+  archived_by?: string;
+  status?: string;
+}
+
+/** Que se puede hacer con un CR ahora (lo decide el servidor). */
+export interface CrLifecycle {
+  editable: boolean;
+  archivable: boolean;
+  deletable: boolean;
+  /** por que no se puede editar/archivar/eliminar, en palabras */
+  reason: string;
+}
+
+export interface CrInfo extends CrLifecycle {
+  change_id: string;
+  file: string;
+  body: string;
+  frozen: boolean;
+  retryable: boolean;
+}
+
+export interface Signature {
+  profile_id: string;
+  role: string;
 }
 
 export interface RunSummary {
@@ -113,11 +216,16 @@ export interface RunSummary {
   awaiting_gate: string;
   stop_reason: string;
   created_at?: string;
+  attempt?: number;
   busy?: boolean;
+  /** Pausado por un humano (se reanuda desde su ultimo checkpoint). */
+  paused?: boolean;
 }
 
 export interface Outcome {
-  kind: "running" | "done" | "awaiting" | "blocked" | "transient" | "error";
+  kind: "running" | "done" | "awaiting" | "blocked" | "transient" | "error" | "paused";
+  /** Se pidio pausa y el motor aun no corta (llamada al modelo cancelandose). */
+  pausing?: boolean;
   status?: string;
   gate?: string;
   message?: string;
@@ -151,13 +259,79 @@ export interface RunState {
   iterations?: number;
   branch?: string;
   worktree?: string;
+  /** Pausa humana: el run quedo en `status` (su ultimo checkpoint). */
+  paused?: { at: string; status: string; reason: string; worktree_reset: boolean };
+  /** Intento actual del CR (1 si nunca se reintento). */
+  attempt?: number;
+  previous_attempts?: PreviousAttempt[];
+  retry?: { by: string; role: string; reason: string; at: string; forced: boolean; cr_changed: boolean };
+  /** Respuestas del PO a pedidos de aclaracion (acumuladas, con tope por intento). */
+  po_clarifications?: { n: number; gate: string; reason: string; by: string; at: string }[];
   [key: string]: unknown;
+}
+
+export interface PreviousAttempt {
+  n: number;
+  status: string;
+  stop_reason: string;
+  branch: string | null;
+  archive: string;
+  archived_at: string;
+}
+
+/** Evento de la actividad en vivo de un run (activity.jsonl). */
+export interface ActivityEvent {
+  seq: number;
+  ts: string;
+  kind: string;
+  phase?: string;
+  role?: string;
+  agent?: string;
+  provider?: string;
+  model?: string;
+  tool?: string;
+  target?: string;
+  command?: string;
+  cmd_kind?: string;
+  returncode?: number | null;
+  gate?: string;
+  roles?: string[];
+  decision?: string;
+  by?: string;
+  fix?: "verify" | "review";
+  n?: number;
+  cap?: number;
+  ok?: boolean;
+  tests?: number;
+  failed?: number;
+  duration_ms?: number;
+  reason?: string;
+  message?: string;
+  status?: string;
+  error?: string;
+  recommendation?: string;
+  findings?: number;
+  /** scan_end: los escaneres bloquean el release / cuales no corrieron */
+  blocked?: boolean;
+  degraded?: string[];
+}
+
+/** Fase abierta en este momento (solo mientras el run avanza). */
+export interface LiveWork {
+  phase: string;
+  role?: string;
+  provider?: string;
+  model?: string;
+  since: string;
+  tool?: string;
+  target?: string;
 }
 
 export interface RunDetail {
   change_id: string;
   state: RunState;
   busy: boolean;
+  live?: LiveWork | null;
   outcome: Outcome | null;
   artifacts: Artifact[];
   gate: {
@@ -183,15 +357,20 @@ export interface Detected {
   config: ProjectConfig;
   notes: string[];
   has_config: boolean;
+  /** Proyecto nuevo: ultimo modelo que paso la prueba (ya aplicado en config). */
+  suggested_model?: { provider: ProviderId; model: string };
 }
 
 export class ApiError extends Error {
   status: number;
   details?: unknown;
-  constructor(message: string, status: number, details?: unknown) {
+  /** Caso concreto del backend (p. ej. "attempts_exhausted") para reaccionar sin parsear. */
+  code?: string;
+  constructor(message: string, status: number, details?: unknown, code?: string) {
     super(message);
     this.status = status;
     this.details = details;
+    this.code = code;
   }
 }
 
@@ -210,10 +389,10 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
     data = text;
   }
   if (!res.ok) {
-    const obj = (data ?? {}) as { error?: string; detail?: unknown; details?: unknown };
+    const obj = (data ?? {}) as { error?: string; detail?: unknown; details?: unknown; code?: string };
     let message = obj.error ?? `Error ${res.status}`;
     if (!obj.error && Array.isArray(obj.detail)) message = "Datos invalidos";
-    throw new ApiError(message, res.status, obj.details ?? obj.detail);
+    throw new ApiError(message, res.status, obj.details ?? obj.detail, obj.code);
   }
   return data as T;
 }
@@ -226,6 +405,7 @@ export const api = {
   meta: () => request<Meta>("GET", "/api/meta"),
   openProject: (path: string) => request<ProjectInfo>("POST", "/api/projects/open", { path }),
   detect: (path: string) => request<Detected>("POST", "/api/projects/detect", { path }),
+  browse: () => request<{ path: string | null }>("POST", "/api/projects/browse"),
   saveConfig: (config: ProjectConfig) => request<ProjectInfo>("PUT", "/api/config", config),
 
   tree: (root: string) => request<FileTree>("GET", `/api/files/tree?${q({ root })}`),
@@ -238,12 +418,18 @@ export const api = {
     }),
   gitStatus: () => request<{ files: { status: string; path: string }[] }>("GET", "/api/git/status"),
 
-  crs: () => request<{ items: ChangeRequest[] }>("GET", "/api/crs"),
-  cr: (id: string) =>
-    request<{ change_id: string; file: string; body: string; frozen: boolean }>(
-      "GET",
-      `/api/crs/${enc(id)}`,
+  crs: (archived = false) =>
+    request<{ items: ChangeRequest[] }>("GET", archived ? "/api/crs?archived=true" : "/api/crs"),
+  cr: (id: string) => request<CrInfo>("GET", `/api/crs/${enc(id)}`),
+  archiveCr: (id: string, sig: Signature) =>
+    request<{ change_id: string; archived_at: string; branch?: string; worktree_removed?: boolean }>(
+      "POST",
+      `/api/crs/${enc(id)}/archive`,
+      sig,
     ),
+  restoreCr: (id: string) => request<{ change_id: string }>("POST", `/api/crs/${enc(id)}/restore`),
+  deleteCr: (id: string, confirm: string, sig: Signature) =>
+    request<{ change_id: string; deleted: string[] }>("DELETE", `/api/crs/${enc(id)}`, { confirm, ...sig }),
   createCr: (change_id: string, title: string, body: string) =>
     request<{ file: string }>("POST", "/api/crs", { change_id, title, body }),
   updateCr: (id: string, body: string) =>
@@ -259,6 +445,11 @@ export const api = {
     ),
   advance: (id: string, mode: "fake" | "adk") =>
     request<Outcome>("POST", `/api/runs/${enc(id)}/advance`, { mode }),
+  pause: (id: string) => request<Outcome>("POST", `/api/runs/${enc(id)}/pause`),
+  activity: (id: string, after = 0) =>
+    request<{ items: ActivityEvent[]; last: number }>("GET", `/api/runs/${enc(id)}/activity?after=${after}`),
+  retry: (id: string, body: { body: string; reason: string; profile_id: string; role: string; force?: boolean }) =>
+    request<RunState>("POST", `/api/runs/${enc(id)}/retry`, body),
   decideGate: (id: string, gate: string, body: Json) =>
     request<Json>("POST", `/api/runs/${enc(id)}/gates/${enc(gate)}`, body),
   decideFindings: (id: string, body: Json) =>
@@ -283,7 +474,28 @@ export const api = {
   updateProfile: (id: string, name: string, roles: string[]) =>
     request<Profile>("PUT", `/api/profiles/${enc(id)}`, { name, roles }),
   deleteProfile: (id: string) => request<{ deleted: boolean }>("DELETE", `/api/profiles/${enc(id)}`),
+
+  providers: () => request<{ items: ProviderInfo[] }>("GET", "/api/providers"),
+  saveProvider: (id: ProviderId, body: { api_key?: string; url?: string }) =>
+    request<{ status: ProviderStatus; test: ConnectionTest }>("PUT", `/api/providers/${enc(id)}`, body),
+  deleteProviderKey: (id: ProviderId) =>
+    request<{ status: ProviderStatus }>("DELETE", `/api/providers/${enc(id)}/key`),
+  testProvider: (id: ProviderId) => request<ConnectionTest>("POST", `/api/providers/${enc(id)}/test`),
+  providerModels: (id: ProviderId, refresh = false) =>
+    request<{ items: ModelEntry[]; error: { kind: ConnectionKind; message: string } | null }>(
+      "GET",
+      `/api/providers/${enc(id)}/models?${q({ refresh: String(refresh) })}`,
+    ),
+  probes: () => request<Probes>("GET", "/api/models/probes"),
+  modelsInUse: () => request<{ items: ModelInUse[] }>("GET", "/api/models/in-use"),
+  probe: (provider: ProviderId, model: string) =>
+    request<ProbeResult>("POST", "/api/models/probe", { provider, model }),
 };
+
+export const probeKey = (provider: string, model: string) => `${provider}:${model}`;
+
+/** "tech lead" -> "Tech Lead" (los roles del catalogo se guardan en minusculas). */
+export const roleLabel = (role: string) => role.replace(/\b\w/g, (c) => c.toUpperCase());
 
 export function errorMessage(err: unknown): string {
   if (err instanceof ApiError) {

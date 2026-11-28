@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from pathlib import Path
 
+from . import activity
 from .context import active_run, project, work_root
 from .project import ALWAYS_NEVER_WRITE
 
@@ -146,6 +148,8 @@ def run_baseline_verification() -> dict:
         }
     for command in cfg.commands:
         label = command.label()
+        activity.emit("verify_cmd_start", phase="verify", command=label, cmd_kind=command.kind)
+        t0 = time.monotonic()
         try:
             # sin shell: argv explicito de la config, nunca texto del LLM
             completed = subprocess.run(
@@ -163,6 +167,7 @@ def run_baseline_verification() -> dict:
                     "stderr": f"timeout tras {cfg.timeout}s",
                 }
             )
+            _cmd_end(results[-1], t0)
             continue
         except FileNotFoundError:
             all_ok = False
@@ -175,6 +180,7 @@ def run_baseline_verification() -> dict:
                     "stderr": f"comando no encontrado: {command.argv()[0]}",
                 }
             )
+            _cmd_end(results[-1], t0)
             continue
         all_ok = all_ok and completed.returncode == 0
         results.append(
@@ -186,7 +192,17 @@ def run_baseline_verification() -> dict:
                 "stderr": completed.stderr[-3000:],
             }
         )
+        _cmd_end(results[-1], t0)
     return {"ok": all_ok, "results": results}
+
+
+def _cmd_end(result: dict, t0: float) -> None:
+    """Actividad en vivo: fin de un comando de verificacion (sin su salida)."""
+    activity.emit(
+        "verify_cmd_end", phase="verify", command=result["command"], cmd_kind=result["kind"],
+        returncode=result["returncode"], ok=result["returncode"] == 0,
+        duration_ms=int((time.monotonic() - t0) * 1000),
+    )
 
 
 ENGINE_ARTIFACTS = {

@@ -7,8 +7,13 @@ import {
   FileText,
   FolderGit2,
   GitCompare,
-  History,
+  FlaskConical,
+  Activity,
+  FolderArchive as ArchiveIcon,
+  Pause,
   Play,
+  RotateCcw,
+  Settings2,
   Trash2,
 } from "lucide-react";
 import * as React from "react";
@@ -20,48 +25,129 @@ import {
   Callout,
   Card,
   EmptyState,
+  LoadingBlock,
+  Menu,
   Select,
   Tabs,
   TabsContent,
   TabsList,
   TabsTrigger,
 } from "@/components/ui";
-import { api, errorMessage, type RunDetail } from "@/lib/api";
+import { api, errorMessage, roleLabel, type ModelInUse, type RunDetail } from "@/lib/api";
 import { useApp, useLoad } from "@/lib/app-state";
+import { deriveFlow, useActivity } from "@/lib/activity";
 import { statusLabel, statusTone, TERMINAL } from "@/lib/phases";
 import { cn, formatTime, languageFor } from "@/lib/utils";
+import { ProviderLogo } from "@/components/ProviderLogo";
+import { DeleteCrDialog, EditCrButton, useSignature } from "./CrEditor";
+import { StatusIcon } from "./StatusIcon";
 import { FindingsTable } from "./FindingsTable";
 import { GateCard } from "./GateCard";
-import { PhaseStepper } from "./PhaseStepper";
+import { ActivityLog } from "./ActivityLog";
+import { FlowDiagram } from "./FlowDiagram";
+import { NowStrip } from "./NowStrip";
+import { RetryDialog } from "./RetryDialog";
+
+/** Terminados que admiten Reintentar (nuevo intento del CR editado). */
+const RETRYABLE = ["ESCALATED", "NOT READY"];
 
 const OUTCOME_COPY: Record<string, { tone: "info" | "warning" | "danger" | "success"; title: string }> = {
-  running: { tone: "info", title: "Avanzando…" },
   awaiting: { tone: "warning", title: "Detenido en un gate humano" },
   blocked: { tone: "danger", title: "Bloqueado" },
   transient: { tone: "warning", title: "Error transitorio del modelo: reintenta más tarde" },
   error: { tone: "danger", title: "Error al avanzar (el run quedó en su último checkpoint)" },
   done: { tone: "success", title: "Run terminado" },
+  paused: { tone: "info", title: "Run pausado" },
 };
 
-export function RunBoard({ changeId }: { changeId: string }) {
-  const { meta, tick, signer, notify, openFile } = useApp();
+type Mode = "fake" | "adk";
+const LS_MODE = "factory.mode";
+
+/** Modo recordado; por defecto el modelo real (la simulacion es para probar el flujo). */
+function readMode(): Mode {
+  try {
+    return localStorage.getItem(LS_MODE) === "fake" ? "fake" : "adk";
+  } catch {
+    return "adk";
+  }
+}
+
+const PROBE_WORDS: Record<string, string> = {
+  NO_TOOLS: "no usa tools",
+  NO_ACCESS: "sin acceso en tu plan",
+  QUOTA: "sin cuota",
+  INVALID_KEY: "clave inválida",
+  ERROR: "error",
+};
+
+const probeWords = (m: ModelInUse) => (m.probe ? PROBE_WORDS[m.probe.status] ?? m.probe.status : "sin probar");
+
+export function RunBoard({
+  changeId,
+  onRemoved,
+  onRestore,
+}: {
+  changeId: string;
+  /** el CR se archivo o elimino: la lista se recarga */
+  onRemoved?: () => void;
+  /** "Deshacer" del archivado */
+  onRestore?: (id: string) => void;
+}) {
+  const { meta, tick, probeTick, signer, notify, openFile, session } = useApp();
   const run = useLoad(() => api.run(changeId), [changeId, tick]);
-  const [mode, setMode] = React.useState<"fake" | "adk">("fake");
+  // que se puede hacer con el CR (editar antes del intake, archivar/eliminar al terminar)
+  const life = useLoad(() => api.cr(changeId), [changeId, tick, run.data?.state.status, run.data?.busy]);
+  const agents = session?.project?.config.agents;
+  const inUse = useLoad(() => api.modelsInUse(), [probeTick, JSON.stringify(agents)]);
+  const [mode, setModeState] = React.useState<Mode>(readMode);
+  const setMode = (m: Mode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(LS_MODE, m);
+    } catch {
+      /* sin almacenamiento: solo esta sesion */
+    }
+  };
+  const [pausing, setPausing] = React.useState(false);
   const [tab, setTab] = React.useState("artifacts");
   const [artifact, setArtifact] = React.useState<string | null>(null);
   const [starting, setStarting] = React.useState(false);
+  const [retrying, setRetrying] = React.useState(false);
+  const events = useActivity(changeId, tick, run.data?.state.attempt ?? 1);
 
   if (run.error && !run.data) {
     return <div className="p-6"><Callout tone="danger" title="No se pudo cargar el run">{run.error}</Callout></div>;
   }
   const d = run.data;
-  if (!d || !meta) return <div className="p-6 text-sm text-muted-foreground">Cargando run…</div>;
+  if (!d || !meta) return <LoadingBlock label="Cargando run…" lines={5} />;
 
   const st = d.state;
-  const terminal = TERMINAL.includes(st.status);
+  // un ESCALATED por ambiguedad con su gate abierto se reanuda: no es terminal en la UI
+  const resumable = st.status === "ESCALATED" && Boolean(st.awaiting_gate);
+  const terminal = TERMINAL.includes(st.status) && !resumable;
+  const retryable = RETRYABLE.includes(st.status) && !d.busy;
+  const attempts = session?.project?.config.limits?.attempts ?? 3;
   const signature = signer.profile ? { profile_id: signer.profile.id, role: signer.role } : null;
 
+  const models = inUse.data?.items ?? [];
+  const notOk = mode === "adk" ? models.filter((m) => m.probe?.status !== "OK") : [];
+  const paused = st.paused && !d.busy ? st.paused : null;
+  const isPausing = d.busy && (pausing || Boolean(d.outcome?.pausing));
+  const realLabel = models.length
+    ? `Modelo real · ${models[0].provider}/${models[0].model}${models.length > 1 ? ` +${models.length - 1}` : ""}`
+    : agents
+      ? `Modelo real · ${agents.provider}/${agents.model}`
+      : "Modelo real";
+
   const advance = async () => {
+    if (
+      notOk.length &&
+      !window.confirm(
+        `${notOk.map((m) => `${m.provider}/${m.model}: ${probeWords(m)}`).join("\n")}\n\n` +
+          "Este modelo no ha pasado la prueba y la fase puede fallar. ¿Avanzar de todos modos?",
+      )
+    )
+      return;
     setStarting(true);
     try {
       await api.advance(changeId, mode);
@@ -73,6 +159,20 @@ export function RunBoard({ changeId }: { changeId: string }) {
     }
   };
 
+  const pause = async () => {
+    setPausing(true);
+    try {
+      await api.pause(changeId);
+      run.reload();
+    } catch (err) {
+      notify(errorMessage(err), "danger");
+    } finally {
+      setPausing(false);
+    }
+  };
+
+  const flow = deriveFlow(st, events, meta.phases, d.busy);
+
   const showArtifact = (name: string) => {
     setArtifact(name);
     setTab("artifacts");
@@ -80,46 +180,104 @@ export function RunBoard({ changeId }: { changeId: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex flex-wrap items-center gap-3 border-b border-border px-5 py-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-5 py-3">
+        <div className="min-w-0 flex-1 basis-64">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="font-mono text-base font-semibold">{changeId}</h2>
-            <Badge tone={statusTone(st.status, st.awaiting_gate)}>{statusLabel(st.status, st.awaiting_gate)}</Badge>
-            {d.busy ? <Badge tone="info">en curso</Badge> : null}
+            <Badge tone={statusTone(st.status, st.awaiting_gate)}>
+              <StatusIcon status={st.status} awaiting={st.awaiting_gate} paused={st.paused} />
+              {statusLabel(st.status, st.awaiting_gate)}
+            </Badge>
+            {d.busy ? <Badge tone="info">{isPausing ? "pausando…" : "en curso"}</Badge> : null}
+            {paused ? <Badge tone="warning"><Pause className="size-3" /> Pausada en {statusLabel(paused.status)}</Badge> : null}
+            {(st.attempt ?? 1) > 1 ? <Badge tone={(st.attempt ?? 1) > attempts ? "warning" : "neutral"}>Intento {st.attempt}/{attempts}</Badge> : null}
           </div>
-          <p className="mt-0.5 text-xs text-muted-foreground">
+          <p className="mt-0.5 truncate text-xs text-muted-foreground" title={st.branch ?? undefined}>
             {st.branch ? <>rama <span className="font-mono">{st.branch}</span> · </> : null}
             iteraciones {st.iterations ?? 0}
           </p>
         </div>
-        <div className="flex-1" />
-        {!terminal ? (
-          <div className="flex items-center gap-2">
-            <Select aria-label="Modo de ejecución" className="h-8 w-40 text-xs" value={mode} onChange={(e) => setMode(e.target.value as "fake" | "adk")}>
-              <option value="fake">Fake (determinista)</option>
-              <option value="adk">ADK (Gemini)</option>
-            </Select>
-            <Button
-              onClick={advance}
-              loading={starting || d.busy}
-              disabled={Boolean(st.awaiting_gate) && !d.gate?.recorded}
-              title={st.awaiting_gate && !d.gate?.recorded ? "Decide el gate primero" : "Avanza hasta el siguiente gate"}
-            >
-              <Play /> Avanzar
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
+          {life.data?.editable && !d.busy ? (
+            <EditCrButton
+              changeId={changeId}
+              onSaved={() => {
+                life.reload();
+                run.reload();
+              }}
+            />
+          ) : null}
+          {retryable ? (
+            <Button variant="outline" size="sm" onClick={() => setRetrying(true)} title="Editar el CR y correr un intento nuevo (el actual se archiva)">
+              <RotateCcw /> Reintentar
             </Button>
-          </div>
-        ) : (
-          <TerminalActions detail={d} onChange={run.reload} />
-        )}
+          ) : null}
+          {!terminal ? (
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <Select aria-label="Modo de ejecución" className="h-8 w-auto min-w-40 max-w-64 text-xs" value={mode} disabled={d.busy} onChange={(e) => setMode(e.target.value as Mode)}>
+                <option value="adk">{realLabel}</option>
+                <option value="fake">Simulación (Fake, sin modelo)</option>
+              </Select>
+              {d.busy ? (
+                <Button
+                  variant="outline"
+                  onClick={pause}
+                  loading={isPausing}
+                  disabled={isPausing}
+                  title="Corta ya la ejecución; al reanudar se repite la fase en curso desde su inicio"
+                >
+                  <Pause /> {isPausing ? "Pausando…" : "Pausar"}
+                </Button>
+              ) : null}
+              <Button
+                onClick={advance}
+                loading={starting || d.busy}
+                disabled={Boolean(st.awaiting_gate) && !d.gate?.recorded}
+                title={st.awaiting_gate && !d.gate?.recorded ? "Decide el gate primero" : paused ? "Repite la fase pausada desde su inicio" : "Avanza hasta el siguiente gate"}
+              >
+                <Play /> {paused ? "Reanudar" : "Avanzar"}
+              </Button>
+            </div>
+          ) : (
+            <TerminalActions
+              detail={d}
+              archivable={Boolean(life.data?.archivable)}
+              deletable={Boolean(life.data?.deletable)}
+              reason={life.data?.reason}
+              onChange={run.reload}
+              onRemoved={onRemoved}
+              onRestore={onRestore}
+            />
+          )}
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-auto">
         <div className="space-y-4 p-5">
-          <Card className="px-4 py-4">
-            <PhaseStepper phases={meta.phases} state={st} busy={d.busy} />
+          <Card className="px-3 py-3">
+            <FlowDiagram
+              flow={flow}
+              phases={meta.phases}
+              state={st}
+              busy={d.busy}
+              artifacts={d.artifacts.map((a) => a.name)}
+              onOpenArtifact={showArtifact}
+              recorded={d.gate?.recorded ?? null}
+            />
           </Card>
 
-          <RunAlerts detail={d} />
+          <NowStrip
+            flow={flow}
+            live={d.live}
+            busy={d.busy}
+            message={d.outcome?.kind === "running" ? d.outcome.message : undefined}
+            recorded={d.gate?.recorded ?? null}
+          />
+
+          {!terminal && notOk.length ? <ModelWarning items={notOk} /> : null}
+          {!terminal ? <EnvOverrideNote items={models} /> : null}
+
+          <RunAlerts detail={d} clarificationCap={session?.project?.config.limits?.clarification_rounds ?? 3} />
 
           {d.gate ? (
             <GateCard
@@ -166,7 +324,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
               <TabsList>
                 <TabsTrigger value="artifacts"><FileText /> Artefactos ({d.artifacts.length})</TabsTrigger>
                 <TabsTrigger value="diff"><GitCompare /> Diff</TabsTrigger>
-                <TabsTrigger value="timeline"><History /> Línea de tiempo</TabsTrigger>
+                <TabsTrigger value="activity"><Activity /> Actividad{events.length ? ` (${events.length})` : ""}</TabsTrigger>
                 <TabsTrigger value="summary"><FileCode2 /> Estado</TabsTrigger>
               </TabsList>
               <TabsContent value="artifacts">
@@ -175,8 +333,8 @@ export function RunBoard({ changeId }: { changeId: string }) {
               <TabsContent value="diff">
                 <DiffPane changeId={changeId} hasBranch={Boolean(st.branch)} tick={tick} onOpenWorktree={(p) => openFile(`run:${changeId}`, p)} worktree={Boolean(d.worktree)} />
               </TabsContent>
-              <TabsContent value="timeline">
-                <Timeline detail={d} />
+              <TabsContent value="activity">
+                {events.length ? <ActivityLog events={events} busy={d.busy} /> : <Timeline detail={d} />}
               </TabsContent>
               <TabsContent value="summary">
                 <StateSummary detail={d} />
@@ -185,18 +343,31 @@ export function RunBoard({ changeId }: { changeId: string }) {
           </Card>
         </div>
       </div>
+      <RetryDialog open={retrying} onOpenChange={setRetrying} state={st} onRetried={run.reload} />
     </div>
   );
 }
 
-function RunAlerts({ detail }: { detail: RunDetail }) {
+function RunAlerts({ detail, clarificationCap }: { detail: RunDetail; clarificationCap: number }) {
   const st = detail.state;
   const o = detail.outcome;
   const alerts: React.ReactNode[] = [];
-  if (st.status === "ESCALATED" || st.status === "NOT READY") {
+  const used = st.po_clarifications?.length ?? 0;
+  if (st.status === "ESCALATED" && st.awaiting_gate) {
     alerts.push(
-      <Callout key="stop" tone="danger" icon={<AlertTriangle />} title={st.status === "ESCALATED" ? "Run escalado a un humano" : "No listo para merge"}>
-        {st.stop_reason || "Sin motivo registrado."}
+      <Callout key="stop" tone="warning" icon={<AlertTriangle />} title="Escalado: el agente pide una aclaración (reanudable)">
+        <p>{st.stop_reason || "Sin motivo registrado."}</p>
+        <p className="mt-1">
+          Registra tu aclaración como decisión en el gate <span className="font-mono">{st.awaiting_gate}</span> y pulsa Avanzar, o
+          edita el CR con Reintentar. Aclaraciones usadas: {used}/{clarificationCap}.
+        </p>
+      </Callout>,
+    );
+  } else if (st.status === "ESCALATED" || st.status === "NOT READY") {
+    alerts.push(
+      <Callout key="stop" tone="danger" icon={<AlertTriangle />} title={st.status === "ESCALATED" ? "Run escalado a un humano (no se reanuda)" : "No listo para merge"}>
+        <p>{st.stop_reason || "Sin motivo registrado."}</p>
+        <p className="mt-1">Usa Reintentar para editar el CR y correr un intento nuevo; este intento se archiva y su rama se conserva.</p>
       </Callout>,
     );
   } else if (st.status === "READY FOR HUMAN MERGE") {
@@ -206,7 +377,15 @@ function RunAlerts({ detail }: { detail: RunDetail }) {
       </Callout>,
     );
   }
-  if (o && o.kind !== "awaiting" && o.kind !== "done" && !(o.kind === "running" && !detail.busy)) {
+  if (st.paused && !detail.busy) {
+    alerts.push(
+      <Callout key="paused" tone="info" icon={<Pause />} title={`Run pausado en ${statusLabel(st.paused.status)}`}>
+        Al reanudar se repite esa fase desde su inicio (último punto de control).
+        {st.paused.worktree_reset ? " Los cambios a medias del Coder en el worktree del run se descartaron." : ""}
+      </Callout>,
+    );
+  }
+  if (o && o.kind !== "awaiting" && o.kind !== "done" && o.kind !== "paused" && o.kind !== "running") {
     const copy = OUTCOME_COPY[o.kind];
     alerts.push(
       <Callout key="outcome" tone={copy.tone} title={copy.title}>
@@ -217,9 +396,87 @@ function RunAlerts({ detail }: { detail: RunDetail }) {
   return alerts.length ? <div className="space-y-2">{alerts}</div> : null;
 }
 
-function TerminalActions({ detail, onChange }: { detail: RunDetail; onChange: () => void }) {
+/** Modelos en uso que no pasaron la prueba: avisar ANTES de gastar una fase. */
+function ModelWarning({ items }: { items: ModelInUse[] }) {
+  const { notify, setView, setSettingsTab } = useApp();
+  const [probing, setProbing] = React.useState(false);
+  const probeAll = async () => {
+    setProbing(true);
+    try {
+      const results = await Promise.all(items.map((m) => api.probe(m.provider, m.model)));
+      const ok = results.filter((r) => r.status === "OK").length;
+      notify(ok === results.length ? "Modelos disponibles" : `${results.length - ok} modelo(s) siguen sin pasar la prueba`, ok === results.length ? "success" : "danger");
+    } catch (err) {
+      notify(errorMessage(err), "danger");
+    } finally {
+      setProbing(false);
+    }
+  };
+  return (
+    <Callout tone="warning" icon={<AlertTriangle />} title="Un modelo en uso no pasó la prueba">
+      <ul className="mt-1 space-y-0.5">
+        {items.map((m) => (
+          <li key={`${m.provider}:${m.model}`}>
+            <ProviderLogo provider={m.provider} decorative className="mr-1 inline size-3.5 align-[-2px]" />
+            <span className="font-mono">{m.provider}/{m.model}</span> ({m.roles.join(", ")}): <strong>{probeWords(m)}</strong>
+            {m.probe?.message ? <span className="text-muted-foreground"> — {m.probe.message}</span> : null}
+          </li>
+        ))}
+      </ul>
+      <div className="mt-2 flex gap-2">
+        <Button size="xs" variant="outline" loading={probing} onClick={probeAll}>
+          <FlaskConical /> Probar ahora
+        </Button>
+        <Button
+          size="xs"
+          variant="ghost"
+          onClick={() => {
+            setSettingsTab("agents");
+            setView("settings");
+          }}
+        >
+          <Settings2 /> Ir a Ajustes
+        </Button>
+      </div>
+    </Callout>
+  );
+}
+
+/** FACTORY_MODEL del entorno gana sobre lo elegido en Ajustes: que no sea silencioso. */
+export function EnvOverrideNote({ items }: { items: ModelInUse[] }) {
+  const hit = items.find((m) => m.env_override);
+  if (!hit) return null;
+  return (
+    <Callout tone="warning" icon={<AlertTriangle />} title="FACTORY_MODEL del entorno reemplaza el modelo">
+      Se usará <span className="font-mono">{hit.model}</span> en lugar de{" "}
+      <span className="font-mono">{hit.configured_model}</span> ({hit.roles.map(roleLabel).join(", ")}). Quita{" "}
+      <span className="font-mono">FACTORY_MODEL</span> del entorno o del <span className="font-mono">.env</span> y reinicia Studio para usar el de Ajustes.
+    </Callout>
+  );
+}
+
+function TerminalActions({
+  detail,
+  archivable,
+  deletable,
+  reason,
+  onChange,
+  onRemoved,
+  onRestore,
+}: {
+  detail: RunDetail;
+  archivable: boolean;
+  deletable: boolean;
+  reason?: string;
+  onChange: () => void;
+  onRemoved?: () => void;
+  onRestore?: (id: string) => void;
+}) {
   const { notify } = useApp();
+  const sign = useSignature();
   const [busy, setBusy] = React.useState<string | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
+  const id = detail.change_id;
   const act = async (name: string, fn: () => Promise<string>) => {
     setBusy(name);
     try {
@@ -231,29 +488,76 @@ function TerminalActions({ detail, onChange }: { detail: RunDetail; onChange: ()
       setBusy(null);
     }
   };
+  const archive = async () => {
+    const sig = sign();
+    if (!sig) return;
+    setBusy("archive");
+    try {
+      const r = await api.archiveCr(id, { profile_id: sig.profile_id, role: sig.role });
+      notify(
+        `${id} archivado${r.worktree_removed ? " (worktree quitado)" : ""}. La rama sigue.`,
+        "success",
+        onRestore ? { label: "Deshacer", onClick: () => onRestore(id) } : undefined,
+      );
+      onRemoved?.();
+    } catch (err) {
+      notify(errorMessage(err), "danger");
+    } finally {
+      setBusy(null);
+    }
+  };
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
       <Button
         variant="outline"
         size="sm"
         loading={busy === "export"}
-        onClick={() => act("export", async () => `Evidencia exportada en ${(await api.exportEvidence(detail.change_id)).dest}`)}
+        onClick={() => act("export", async () => `Evidencia exportada en ${(await api.exportEvidence(id)).dest}`)}
       >
         <Archive /> Exportar evidencia
       </Button>
-      {detail.worktree ? (
-        <Button
-          variant="ghost"
-          size="sm"
-          loading={busy === "cleanup"}
-          onClick={() => {
-            if (!window.confirm(`Quitar el worktree de ${detail.change_id}? La rama se conserva.`)) return;
-            act("cleanup", async () => ((await api.cleanup(detail.change_id)).removed ? "Worktree eliminado (la rama sigue)" : "No había worktree"));
-          }}
-        >
-          <Trash2 /> Quitar worktree
-        </Button>
-      ) : null}
+      <Button
+        variant="outline"
+        size="sm"
+        loading={busy === "archive"}
+        disabled={!archivable}
+        title={archivable ? "Oculta el CR y su run; se puede restaurar. Quita el worktree, la rama sigue." : reason}
+        onClick={archive}
+      >
+        <ArchiveIcon /> Archivar
+      </Button>
+      <Menu
+        label={`Más acciones de ${id}`}
+        items={[
+          ...(detail.worktree
+            ? [
+                {
+                  label: "Quitar worktree",
+                  icon: <Trash2 />,
+                  onSelect: () => {
+                    if (!window.confirm(`Quitar el worktree de ${id}? La rama se conserva.`)) return;
+                    act("cleanup", async () => ((await api.cleanup(id)).removed ? "Worktree eliminado (la rama sigue)" : "No había worktree"));
+                  },
+                },
+              ]
+            : []),
+          {
+            label: "Eliminar…",
+            icon: <Trash2 />,
+            danger: true,
+            disabled: !deletable,
+            hint: deletable ? "Borra el CR, su evidencia y el worktree; la rama sigue" : reason,
+            onSelect: () => setDeleting(true),
+          },
+        ]}
+      />
+      <DeleteCrDialog
+        changeId={id}
+        hasRun
+        open={deleting}
+        onOpenChange={setDeleting}
+        onDeleted={() => onRemoved?.()}
+      />
     </div>
   );
 }
@@ -270,14 +574,16 @@ function ArtifactsPane({ detail, selected, onSelect }: { detail: RunDetail; sele
   const text = content.data?.content ?? "";
   const isMd = current?.endsWith(".md");
   return (
-    <div className="grid min-h-[22rem] grid-cols-[15rem_1fr]">
-      <div className="border-r border-border p-1.5">
-        {detail.artifacts.map((a) => (
+    <div className="grid min-h-[22rem] grid-cols-[minmax(12rem,17rem)_minmax(0,1fr)]">
+      <div className="anim-list max-h-[34rem] overflow-auto border-r border-border p-1.5">
+        {detail.artifacts.map((a, i) => (
           <button
             key={a.name}
+            style={{ ["--i" as string]: i }}
             type="button"
             onClick={() => onSelect(a.name)}
-            className={cn("flex w-full items-center gap-1.5 truncate rounded px-2 py-1.5 text-left font-mono text-[11px] hover:bg-accent", a.name === current && "bg-primary/15")}
+            title={a.name}
+            className={cn("flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1.5 text-left font-mono text-[11px] transition-colors duration-100 hover:bg-accent", a.name === current && "bg-primary/15 text-foreground")}
           >
             <FileText className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="truncate">{a.name}</span>
@@ -327,7 +633,7 @@ function DiffPane({
   }
   const statusTone = (s: string) => (s === "A" ? "text-success" : s === "D" ? "text-danger" : "text-warning");
   return (
-    <div className="grid h-[30rem] grid-cols-[15rem_1fr]">
+    <div className="grid h-[30rem] grid-cols-[minmax(12rem,17rem)_minmax(0,1fr)]">
       <div className="overflow-auto border-r border-border p-1.5">
         {files.data?.files.map((f) => (
           <button
@@ -369,7 +675,7 @@ function DiffPane({
   );
 }
 
-/** Linea de tiempo desde el disco: artefactos por fecha + decisiones humanas + resultado. */
+/** Runs sin activity.jsonl (anteriores): linea de tiempo desde el disco (artefactos + gates). */
 function Timeline({ detail }: { detail: RunDetail }) {
   const events = [...detail.artifacts]
     .sort((a, b) => b.modified - a.modified)
@@ -415,6 +721,25 @@ function StateSummary({ detail }: { detail: RunDetail }) {
     ["Review", st.review ? `${st.review.status} · must fix ${st.review.must_fix} · should fix ${st.review.should_fix}` : "—"],
     ["Seguridad", st.security ? `${st.security.status} · high ${st.security.high} · medium ${st.security.medium}` : "—"],
     ["Worktree", detail.worktree ? <span className="font-mono">{detail.worktree}</span> : "—"],
+    ...(st.po_clarifications?.length
+      ? [["Aclaraciones PO", <ol key="c" className="list-decimal pl-4">{st.po_clarifications.map((c) => <li key={c.n}>{c.reason} <span className="text-muted-foreground">({c.by})</span></li>)}</ol>] as [string, React.ReactNode]]
+      : []),
+    ...(st.previous_attempts?.length
+      ? [[
+          "Intentos previos",
+          <ul key="a" className="space-y-1">
+            {st.previous_attempts.map((a) => (
+              <li key={a.n}>
+                <span className="font-medium">#{a.n} {statusLabel(a.status)}</span> — {a.stop_reason || "—"}
+                <div className="text-muted-foreground">
+                  archivo <span className="font-mono">{a.archive}</span>
+                  {a.branch ? <> · rama <span className="font-mono">{a.branch}</span></> : null}
+                </div>
+              </li>
+            ))}
+          </ul>,
+        ] as [string, React.ReactNode]]
+      : []),
   ];
   return (
     <div className="space-y-4 p-4">

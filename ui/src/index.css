@@ -25,50 +25,83 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-danger: var(--danger);
+  --color-elevated: var(--elevated);
+  --color-role-intake: var(--role-intake);
+  --color-role-planner: var(--role-planner);
+  --color-role-coder: var(--role-coder);
+  --color-role-test: var(--role-test);
+  --color-role-verify: var(--role-verify);
+  --color-role-reviewer: var(--role-reviewer);
+  --color-role-security: var(--role-security);
+  --color-role-evidence: var(--role-evidence);
+  --color-role-human: var(--role-human);
   --font-sans: "Inter", "Segoe UI", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
 }
 
 :root {
-  --background: #f8f9fb;
-  --foreground: #161a23;
+  --background: #f5f6fa;
+  --foreground: #141824;
   --card: #ffffff;
+  --elevated: #fbfbfe;
   --popover: #ffffff;
   --primary: #4f46e5;
   --primary-foreground: #ffffff;
-  --secondary: #eef0f4;
-  --muted: #eef0f4;
-  --muted-foreground: #626a7a;
-  --accent: #e9ebf1;
-  --border: #dfe2e8;
-  --input: #d5d9e1;
+  --secondary: #eef0f6;
+  --muted: #eff1f6;
+  --muted-foreground: #5b6377;
+  --accent: #e8eaf3;
+  --border: #e1e4ee;
+  --input: #d3d8e4;
   --ring: #6366f1;
-  --sidebar: #f1f3f7;
+  --sidebar: #eef0f6;
   --info: #2563eb;
   --success: #15803d;
   --warning: #b45309;
   --danger: #dc2626;
+  /* un color estable por rol: se reconoce en el diagrama, la actividad y Ajustes */
+  --role-intake: #0284c7;
+  --role-planner: #7c3aed;
+  --role-coder: #2563eb;
+  --role-test: #0d9488;
+  --role-verify: #0891b2;
+  --role-reviewer: #c026d3;
+  --role-security: #e11d48;
+  --role-evidence: #059669;
+  --role-human: #d97706;
+  --shadow-glow: 0 0 0 1px color-mix(in srgb, var(--primary) 25%, transparent),
+    0 8px 24px -8px color-mix(in srgb, var(--primary) 35%, transparent);
 }
 
 .dark {
-  --background: #0f1117;
-  --foreground: #e6e8ee;
-  --card: #151821;
-  --popover: #181b25;
-  --primary: #6d68f5;
+  --background: #0b0d14;
+  --foreground: #e7e9f0;
+  --card: #121521;
+  --elevated: #171b2a;
+  --popover: #171b2a;
+  --primary: #7c74ff;
   --primary-foreground: #ffffff;
-  --secondary: #222634;
-  --muted: #1c1f2b;
-  --muted-foreground: #8d94a6;
-  --accent: #232737;
-  --border: #262a38;
-  --input: #2d3242;
-  --ring: #7c78ff;
-  --sidebar: #12141c;
+  --secondary: #1d2233;
+  --muted: #161a27;
+  --muted-foreground: #9097ab;
+  --accent: #1d2233;
+  --border: #232839;
+  --input: #2b3145;
+  --ring: #8b85ff;
+  --sidebar: #0e1019;
   --info: #60a5fa;
   --success: #4ade80;
   --warning: #fbbf24;
   --danger: #f87171;
+  --role-intake: #38bdf8;
+  --role-planner: #a78bfa;
+  --role-coder: #60a5fa;
+  --role-test: #2dd4bf;
+  --role-verify: #22d3ee;
+  --role-reviewer: #e879f9;
+  --role-security: #fb7185;
+  --role-evidence: #34d399;
+  --role-human: #fbbf24;
 }
 
 html,
@@ -168,4 +201,228 @@ body {
 .prose-factory a {
   color: var(--primary);
   text-decoration: underline;
+}
+
+/* ------------------------------------------------------------ animaciones de estado */
+@keyframes flow-dash {
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--pulse, var(--primary)) 55%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 10px color-mix(in srgb, var(--pulse, var(--primary)) 0%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: -200% 0;
+  }
+  to {
+    background-position: 200% 0;
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0.6;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes breathe {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+.anim-flow {
+  stroke-dasharray: 6 6;
+  animation: flow-dash 0.9s linear infinite;
+}
+.anim-pulse {
+  animation: pulse-ring 1.8s ease-out infinite;
+}
+.anim-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--pulse, var(--primary)) 45%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+.anim-pop {
+  animation: pop-in 0.25s ease-out both;
+}
+.anim-breathe {
+  animation: breathe 2s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------ movimiento de toda la UI */
+/* Cortas (150-250 ms) y sin partir de opacidad 0: si la pagina esta en segundo plano la
+   animacion se congela en su primer cuadro y no debe verse apagada. */
+@keyframes enter {
+  from {
+    opacity: 0.55;
+    transform: translateY(6px);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes fade-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes zoom-in {
+  from {
+    opacity: 0.4;
+    transform: translateY(8px) scale(0.96);
+  }
+}
+@keyframes zoom-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0.4;
+    transform: translateX(24px);
+  }
+}
+@keyframes toast-out {
+  to {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+}
+@keyframes toast-timer {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+@keyframes menu-in {
+  from {
+    opacity: 0.4;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+
+.anim-enter {
+  animation: enter 0.22s ease-out both;
+}
+/* cascada al cargar: cada hijo con style="--i: n" (sin repetir en cada tick del SSE) */
+.anim-list > * {
+  animation: enter 0.22s ease-out both;
+  animation-delay: calc(min(var(--i, 0), 12) * 22ms);
+}
+.anim-menu {
+  animation: menu-in 0.16s ease-out both;
+  transform-origin: top right;
+}
+.dialog-overlay[data-state="open"] {
+  animation: fade-in 0.18s ease-out;
+}
+.dialog-overlay[data-state="closed"] {
+  animation: fade-out 0.15s ease-in forwards;
+}
+.dialog-content[data-state="open"] {
+  animation: zoom-in 0.2s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.dialog-content[data-state="closed"] {
+  animation: zoom-out 0.15s ease-in forwards;
+}
+.toast[data-leaving="false"] {
+  animation: toast-in 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.toast[data-leaving="true"] {
+  animation: toast-out 0.18s ease-in forwards;
+}
+.toast-timer {
+  transform-origin: left;
+  animation: toast-timer var(--toast-ms, 3500ms) linear forwards;
+}
+.tab-trigger {
+  position: relative;
+}
+.tab-trigger::after {
+  content: "";
+  position: absolute;
+  left: 0.5rem;
+  right: 0.5rem;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--primary);
+  transform: scaleX(0);
+  transition: transform 0.2s ease-out;
+}
+.tab-trigger[data-state="active"]::after {
+  transform: scaleX(1);
+}
+.tab-content[data-state="active"] {
+  animation: enter 0.2s ease-out;
+}
+.skeleton {
+  background-color: color-mix(in srgb, var(--muted-foreground) 14%, transparent);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--foreground) 8%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+.nav-indicator {
+  transition: transform 0.25s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .anim-flow,
+  .anim-pulse,
+  .anim-shimmer,
+  .anim-pop,
+  .anim-breathe,
+  .anim-enter,
+  .anim-list > *,
+  .anim-menu,
+  .dialog-overlay,
+  .dialog-content,
+  .toast,
+  .toast-timer,
+  .tab-content,
+  .skeleton,
+  .animate-spin {
+    animation: none !important;
+  }
+  .tab-trigger::after,
+  .nav-indicator,
+  * {
+    transition-duration: 0s !important;
+  }
 }

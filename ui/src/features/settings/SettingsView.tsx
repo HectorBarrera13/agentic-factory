@@ -1,4 +1,4 @@
-import { Bot, FolderTree, GitBranch, Pencil, Plus, Save, ShieldCheck, Trash2, Undo2, Users } from "lucide-react";
+import { Bot, FolderTree, GitBranch, KeyRound, Pencil, Plus, Save, ShieldCheck, Trash2, Undo2, Users } from "lucide-react";
 import * as React from "react";
 import {
   Badge,
@@ -17,15 +17,30 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui";
-import { api, errorMessage, type Profile, type ProjectConfig } from "@/lib/api";
-import { useApp } from "@/lib/app-state";
+import {
+  api,
+  errorMessage,
+  probeKey,
+  roleLabel,
+  type AgentOverride,
+  type Probes,
+  type Profile,
+  type ProjectConfig,
+  type ProviderId,
+  type ProviderInfo,
+} from "@/lib/api";
+import { useApp, useLoad } from "@/lib/app-state";
+import { ProviderLogo } from "@/components/ProviderLogo";
+import { RoleIcon } from "@/lib/roles";
+import { cn } from "@/lib/utils";
+import { EnvOverrideNote } from "@/features/factory/RunBoard";
+import { ModelPicker, resetModelCache } from "./ModelPicker";
+import { isConfigured, ProvidersPanel } from "./ProvidersPanel";
+import { TemperatureField } from "./TemperatureField";
 import { VerifyEditor } from "./VerifyEditor";
 
-const list = (v: string) =>
-  v
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+const DEFAULT_CATALOG = ["product owner", "tech lead", "human reviewer", "reviewer", "release manager"];
+const FALLBACK_RANGE: [number, number] = [0, 2];
 
 const ROLE_LABEL: Record<string, string> = {
   intake: "Intake",
@@ -45,12 +60,29 @@ const GATE_LABEL: Record<string, string> = {
   release: "Gate release",
 };
 
+const PROJECT_TABS = ["agents", "verify", "paths", "gates"];
+const GLOBAL_TABS = ["providers", "profiles"];
+
 export function SettingsView() {
-  const { session, meta, refreshSession, notify } = useApp();
+  const { session, meta, refreshSession, notify, probeTick, settingsTab, setSettingsTab } = useApp();
   const saved = session?.project?.config ?? null;
   const [draft, setDraft] = React.useState<ProjectConfig | null>(saved);
+  // pestaña desde la ruta (#/settings/<tab>); las de proyecto solo existen con proyecto
+  const tabs = draft ? [...PROJECT_TABS, ...GLOBAL_TABS] : GLOBAL_TABS;
+  const tab = settingsTab && tabs.includes(settingsTab) ? settingsTab : draft ? "agents" : "profiles";
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
+  const [providersVersion, setProvidersVersion] = React.useState(0);
+  const providers = useLoad(() => api.providers(), [providersVersion]);
+  const probes = useLoad(() => api.probes(), [probeTick]);
+  const inUse = useLoad(
+    () => (saved ? api.modelsInUse() : Promise.resolve({ items: [] })),
+    [probeTick, JSON.stringify(saved?.agents)],
+  );
+  const providerChanged = () => {
+    resetModelCache();
+    setProvidersVersion((v) => v + 1);
+  };
 
   React.useEffect(() => setDraft(saved), [saved]);
 
@@ -70,7 +102,7 @@ export function SettingsView() {
     try {
       await api.saveConfig(draft);
       await refreshSession();
-      notify("Ajustes guardados en .factory/config.toml", "success");
+      notify("Ajustes guardados en .factory/config.toml; probando los modelos en uso…", "success");
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -106,7 +138,7 @@ export function SettingsView() {
           </div>
         ) : null}
       </header>
-      <Tabs defaultValue={draft ? "agents" : "profiles"} className="flex min-h-0 flex-1 flex-col">
+      <Tabs value={tab} onValueChange={setSettingsTab} className="flex min-h-0 flex-1 flex-col">
         <TabsList className="px-6">
           {draft ? (
             <>
@@ -116,6 +148,7 @@ export function SettingsView() {
               <TabsTrigger value="gates"><GitBranch /> Gates y git</TabsTrigger>
             </>
           ) : null}
+          <TabsTrigger value="providers"><KeyRound /> Proveedores</TabsTrigger>
           <TabsTrigger value="profiles"><Users /> Perfiles</TabsTrigger>
         </TabsList>
         <div className="min-h-0 flex-1 overflow-auto px-6 py-5">
@@ -124,56 +157,15 @@ export function SettingsView() {
             {draft ? (
               <>
                 <TabsContent value="agents" className="space-y-4">
-                  <Card>
-                    <CardHeader title="Modelo por defecto" description="Lo usan todos los agentes salvo que se cambie por rol. FACTORY_MODEL (entorno) tiene prioridad." />
-                    <div className="grid grid-cols-2 gap-3 p-4">
-                      <Field label="Modelo">
-                        <Input value={draft.agents.model} onChange={(e) => patch((c) => (c.agents.model = e.target.value))} />
-                      </Field>
-                      <Field label={`Temperatura (${draft.agents.temperature})`}>
-                        <input
-                          type="range"
-                          min={0}
-                          max={1}
-                          step={0.05}
-                          aria-label="Temperatura por defecto"
-                          value={draft.agents.temperature}
-                          onChange={(e) => patch((c) => (c.agents.temperature = Number(e.target.value)))}
-                          className="mt-2 accent-[var(--primary)]"
-                        />
-                      </Field>
-                    </div>
-                  </Card>
-                  <Card>
-                    <CardHeader title="Por agente" description="Vacío = usa el valor por defecto." />
-                    <div className="divide-y divide-border">
-                      {(meta?.agent_roles ?? Object.keys(ROLE_LABEL)).map((role) => {
-                        const o = draft.agents.roles[role] ?? {};
-                        const set = (p: { model?: string | null; temperature?: number | null }) =>
-                          patch((c) => {
-                            const next = { ...(c.agents.roles[role] ?? {}), ...p };
-                            if (!next.model && (next.temperature === null || next.temperature === undefined)) delete c.agents.roles[role];
-                            else c.agents.roles[role] = next;
-                          });
-                        return (
-                          <div key={role} className="grid grid-cols-[9rem_1fr_8rem] items-center gap-3 px-4 py-2">
-                            <span className="text-sm">{ROLE_LABEL[role] ?? role}</span>
-                            <Input aria-label={`Modelo ${role}`} placeholder={draft.agents.model} value={o.model ?? ""} onChange={(e) => set({ model: e.target.value || null })} />
-                            <Input
-                              aria-label={`Temperatura ${role}`}
-                              type="number"
-                              min={0}
-                              max={2}
-                              step={0.05}
-                              placeholder={String(draft.agents.temperature)}
-                              value={o.temperature ?? ""}
-                              onChange={(e) => set({ temperature: e.target.value === "" ? null : Number(e.target.value) })}
-                            />
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </Card>
+                  <EnvOverrideNote items={inUse.data?.items ?? []} />
+                  <AgentsPanel
+                    draft={draft}
+                    patch={patch}
+                    roles={meta?.agent_roles ?? Object.keys(ROLE_LABEL)}
+                    providers={providers.data?.items ?? []}
+                    probes={probes.data}
+                    providersVersion={providersVersion}
+                  />
                   <Card>
                     <CardHeader title="Límites de rondas" description="Al agotarse, el run se escala a un humano (nunca se aprueba solo)." />
                     <div className="grid grid-cols-2 gap-3 p-4">
@@ -182,6 +174,12 @@ export function SettingsView() {
                       </Field>
                       <Field label="Rondas de review → Coder Fix">
                         <Input type="number" min={1} max={10} value={draft.limits.review_rounds} onChange={(e) => patch((c) => (c.limits.review_rounds = Number(e.target.value)))} />
+                      </Field>
+                      <Field label="Aclaraciones del PO por intento" hint="Al agotarse, el run se escala sin gate abierto: solo sigue con Reintentar.">
+                        <Input type="number" min={1} max={10} value={draft.limits.clarification_rounds} onChange={(e) => patch((c) => (c.limits.clarification_rounds = Number(e.target.value)))} />
+                      </Field>
+                      <Field label="Intentos por CR" hint="Pasado el tope, Reintentar pide confirmación explícita.">
+                        <Input type="number" min={1} max={10} value={draft.limits.attempts} onChange={(e) => patch((c) => (c.limits.attempts = Number(e.target.value)))} />
                       </Field>
                     </div>
                   </Card>
@@ -256,14 +254,23 @@ export function SettingsView() {
 
                 <TabsContent value="gates" className="space-y-4">
                   <Card>
-                    <CardHeader title="Roles autorizados por gate" description="Quien firma debe tener uno de estos roles en su perfil." />
+                    <CardHeader title="Roles autorizados por gate" description="Quien firma debe tener uno de estos roles en su perfil. Solo roles del catálogo; cada gate necesita al menos uno." />
                     <div className="divide-y divide-border">
-                      {(meta?.gate_keys ?? Object.keys(GATE_LABEL)).map((g) => (
-                        <div key={g} className="grid grid-cols-[10rem_1fr] items-center gap-3 px-4 py-2">
-                          <span className="text-sm">{GATE_LABEL[g] ?? g}</span>
-                          <ListInput aria-label={`Roles ${g}`} value={draft.gates.roles[g] ?? []} onChange={(v) => patch((c) => (c.gates.roles[g] = v))} />
-                        </div>
-                      ))}
+                      {(meta?.gate_keys ?? Object.keys(GATE_LABEL)).map((g) => {
+                        const current = draft.gates.roles[g] ?? [];
+                        return (
+                          <div key={g} className="grid grid-cols-[10rem_1fr] items-center gap-3 px-4 py-2">
+                            <span className="text-sm">{GATE_LABEL[g] ?? g}</span>
+                            <RoleChips
+                              label={`Roles ${g}`}
+                              catalog={meta?.role_catalog ?? DEFAULT_CATALOG}
+                              value={current}
+                              keepOne
+                              onChange={(v) => patch((c) => (c.gates.roles[g] = v))}
+                            />
+                          </div>
+                        );
+                      })}
                     </div>
                   </Card>
                   <Card>
@@ -280,6 +287,10 @@ export function SettingsView() {
                 </TabsContent>
               </>
             ) : null}
+            <TabsContent value="providers">
+              {providers.error ? <Callout tone="danger">{providers.error}</Callout> : null}
+              {providers.data ? <ProvidersPanel providers={providers.data.items} onChanged={providerChanged} /> : null}
+            </TabsContent>
             <TabsContent value="profiles">
               <ProfilesPanel />
             </TabsContent>
@@ -291,10 +302,9 @@ export function SettingsView() {
 }
 
 function ProfilesPanel() {
-  const { session, refreshSession, notify, signer, setSigner } = useApp();
+  const { session, meta, refreshSession, notify, signer, setSigner } = useApp();
   const profiles = session?.profiles ?? [];
-  const gateRoles = session?.project?.config.gates.roles ?? {};
-  const knownRoles = Array.from(new Set(Object.values(gateRoles).flat()));
+  const catalog = meta?.role_catalog ?? DEFAULT_CATALOG;
   const [editing, setEditing] = React.useState<Profile | "new" | null>(null);
 
   const remove = async (p: Profile) => {
@@ -336,11 +346,16 @@ function ProfilesPanel() {
                 </p>
                 <div className="mt-1 flex flex-wrap gap-1">
                   {p.roles.map((r) => (
-                    <Badge key={r}>{r}</Badge>
+                    <Badge key={r}>{roleLabel(r)}</Badge>
                   ))}
+                  {p.incomplete ? (
+                    <Badge tone="warning" title="Tenía roles que ya no están en el catálogo; edítalo y guárdalo.">
+                      roles retirados: revisa el perfil
+                    </Badge>
+                  ) : null}
                 </div>
               </div>
-              {signer.profile?.id !== p.id ? (
+              {signer.profile?.id !== p.id && p.roles.length ? (
                 <Button variant="outline" size="xs" onClick={() => setSigner(p.id)}>
                   Usar
                 </Button>
@@ -358,7 +373,7 @@ function ProfilesPanel() {
       <ProfileDialog
         key={editing === "new" ? "new" : editing?.id ?? "none"}
         profile={editing}
-        knownRoles={knownRoles}
+        catalog={catalog}
         onClose={() => setEditing(null)}
       />
     </Card>
@@ -367,31 +382,28 @@ function ProfilesPanel() {
 
 function ProfileDialog({
   profile,
-  knownRoles,
+  catalog,
   onClose,
 }: {
   profile: Profile | "new" | null;
-  knownRoles: string[];
+  catalog: string[];
   onClose: () => void;
 }) {
   const { refreshSession, setSigner, signer } = useApp();
   const existing = profile && profile !== "new" ? profile : null;
   const [name, setName] = React.useState(existing?.name ?? "");
-  const [roles, setRoles] = React.useState<string[]>(existing?.roles ?? []);
-  const [extra, setExtra] = React.useState("");
+  const [roles, setRoles] = React.useState<string[]>(existing?.roles.filter((r) => catalog.includes(r)) ?? []);
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
-  const options = Array.from(new Set([...knownRoles, ...roles]));
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
-    const all = Array.from(new Set([...roles, ...list(extra)]));
     setBusy(true);
     setError(null);
     try {
       const saved = existing
-        ? await api.updateProfile(existing.id, name, all)
-        : await api.createProfile(name, all);
+        ? await api.updateProfile(existing.id, name, roles)
+        : await api.createProfile(name, roles);
       if (!signer.profile) setSigner(saved.id);
       await refreshSession();
       onClose();
@@ -410,38 +422,225 @@ function ProfileDialog({
             <Input autoFocus value={name} onChange={(e) => setName(e.target.value)} placeholder="Ana López" />
           </Field>
           <div className="space-y-1.5">
-            <p className="text-xs font-medium text-muted-foreground">Roles (de los gates del proyecto)</p>
-            <div className="flex flex-wrap gap-1.5">
-              {options.map((r) => {
-                const on = roles.includes(r);
-                return (
-                  <button
-                    key={r}
-                    type="button"
-                    aria-pressed={on}
-                    onClick={() => setRoles(on ? roles.filter((x) => x !== r) : [...roles, r])}
-                    className={
-                      "rounded-full border px-2.5 py-1 text-xs transition-colors " +
-                      (on ? "border-primary bg-primary/15 text-primary" : "border-border hover:bg-accent")
-                    }
-                  >
-                    {r}
-                  </button>
-                );
-              })}
-            </div>
+            <p className="text-xs font-medium text-muted-foreground">Roles (catálogo de la fábrica)</p>
+            <RoleChips label="Roles del perfil" catalog={catalog} value={roles} onChange={setRoles} />
           </div>
-          <Field label="Otros roles (separados por comas)">
-            <Input value={extra} onChange={(e) => setExtra(e.target.value)} />
-          </Field>
+          {existing?.incomplete ? (
+            <Callout tone="warning">Este perfil tenía roles que ya no existen; al guardar se quitan definitivamente.</Callout>
+          ) : null}
           {error ? <Callout tone="danger">{error}</Callout> : null}
           <div className="flex justify-end">
-            <Button type="submit" loading={busy} disabled={!name.trim() || (!roles.length && !extra.trim())}>
+            <Button type="submit" loading={busy} disabled={!name.trim() || !roles.length}>
               <Save /> Guardar
             </Button>
           </div>
         </form>
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Selector de roles del catalogo (sin texto libre). `keepOne` impide quitar el ultimo. */
+export function RoleChips({
+  label,
+  catalog,
+  value,
+  onChange,
+  keepOne = false,
+}: {
+  label: string;
+  catalog: string[];
+  value: string[];
+  onChange: (v: string[]) => void;
+  keepOne?: boolean;
+}) {
+  return (
+    <div role="group" aria-label={label} className="flex flex-wrap gap-1.5">
+      {catalog.map((r) => {
+        const on = value.includes(r);
+        const locked = on && keepOne && value.length === 1;
+        return (
+          <button
+            key={r}
+            type="button"
+            aria-pressed={on}
+            disabled={locked}
+            title={locked ? "Cada gate necesita al menos un rol" : undefined}
+            onClick={() => onChange(on ? value.filter((x) => x !== r) : catalog.filter((x) => x === r || value.includes(x)))}
+            className={
+              "rounded-full border px-2.5 py-1 text-xs transition-colors disabled:cursor-not-allowed " +
+              (on ? "border-primary bg-primary/15 text-primary" : "border-border hover:bg-accent")
+            }
+          >
+            {roleLabel(r)}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------- agentes
+export function ProviderSelect({
+  label,
+  value,
+  onChange,
+  providers,
+  inherit,
+  inherited,
+}: {
+  label: string;
+  value: ProviderId | "";
+  onChange: (v: ProviderId | "") => void;
+  providers: ProviderInfo[];
+  /** etiqueta de la opcion "heredar" (solo por rol) */
+  inherit?: string;
+  /** proveedor que se usa cuando `value` hereda (para mostrar su logo) */
+  inherited?: ProviderId;
+}) {
+  const shown = value || inherited;
+  return (
+    <div className="relative">
+      <ProviderLogo provider={shown} decorative className={cn("pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2", !value && "opacity-50")} />
+      <Select aria-label={label} className="pl-8" value={value} onChange={(e) => onChange(e.target.value as ProviderId | "")}>
+        {inherit ? <option value="">{inherit}</option> : null}
+        {providers.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.label}
+            {isConfigured(p) ? "" : " (sin configurar)"}
+          </option>
+        ))}
+      </Select>
+    </div>
+  );
+}
+
+function AgentsPanel({
+  draft,
+  patch,
+  roles,
+  providers,
+  probes,
+  providersVersion,
+}: {
+  draft: ProjectConfig;
+  patch: (fn: (c: ProjectConfig) => void) => void;
+  roles: string[];
+  providers: ProviderInfo[];
+  probes: Probes | null;
+  providersVersion: number;
+}) {
+  const a = draft.agents;
+  const range = (id: ProviderId): [number, number] => providers.find((p) => p.id === id)?.temperature_range ?? FALLBACK_RANGE;
+  const supported = (provider: ProviderId, model: string) => probes?.items[probeKey(provider, model)]?.temperature_supported;
+  const defaultInfo = providers.find((p) => p.id === a.provider);
+
+  return (
+    <>
+      <Card>
+        <CardHeader
+          title="Proveedor y modelo por defecto"
+          description="Lo usan todos los agentes salvo que se cambie por rol. Configura las claves en la pestaña Proveedores. FACTORY_MODEL (entorno) solo cambia el modelo si el proveedor es Gemini."
+        />
+        <div className="space-y-3 p-4">
+          {defaultInfo && !isConfigured(defaultInfo) ? (
+            <Callout tone="warning">{defaultInfo.label} aún no está configurado: los runs reales (adk) fallarán hasta agregar su acceso en Proveedores.</Callout>
+          ) : null}
+          <div className="grid grid-cols-[12rem_1fr] gap-3">
+            <Field label="Proveedor">
+              <ProviderSelect
+                label="Proveedor por defecto"
+                value={a.provider}
+                providers={providers}
+                onChange={(v) =>
+                  patch((c) => {
+                    if (!v || v === c.agents.provider) return;
+                    c.agents.provider = v;
+                    c.agents.model = ""; // el nombre de otro proveedor no sirve: elegir de nuevo
+                    for (const o of Object.values(c.agents.roles)) if (o.provider === v) o.provider = null;
+                  })
+                }
+              />
+            </Field>
+            <Field label="Modelo">
+              <ModelPicker
+                label="Modelo por defecto"
+                provider={a.provider}
+                value={a.model}
+                onChange={(v) => patch((c) => (c.agents.model = v))}
+                probes={probes}
+                providersVersion={providersVersion}
+              />
+            </Field>
+          </div>
+          <Field label="Temperatura por defecto" hint="Baja = respuestas más estables; los roles de la fábrica son deterministas.">
+            <TemperatureField
+              label="Temperatura por defecto"
+              value={a.temperature}
+              onChange={(v) => patch((c) => (c.agents.temperature = v ?? 0.2))}
+              range={range(a.provider)}
+              supported={supported(a.provider, a.model)}
+            />
+          </Field>
+        </div>
+      </Card>
+      <Card>
+        <CardHeader title="Por agente" description="Vacío = hereda el valor por defecto. Si cambias el proveedor de un agente, elige también su modelo." />
+        <div className="divide-y divide-border">
+          {roles.map((role) => {
+            const o: AgentOverride = a.roles[role] ?? {};
+            const provider = (o.provider || a.provider) as ProviderId;
+            const ownProvider = Boolean(o.provider && o.provider !== a.provider);
+            const model = o.model || (ownProvider ? "" : a.model);
+            const set = (p: AgentOverride) =>
+              patch((c) => {
+                const next = { ...(c.agents.roles[role] ?? {}), ...p };
+                if (next.provider === c.agents.provider) next.provider = null;
+                const empty = !next.provider && !next.model && (next.temperature === null || next.temperature === undefined);
+                if (empty) delete c.agents.roles[role];
+                else c.agents.roles[role] = next;
+              });
+            return (
+              <div key={role} className="space-y-2 px-4 py-3">
+                <div className="grid grid-cols-[8rem_minmax(12rem,16rem)_minmax(0,1fr)] items-start gap-3">
+                  <span className="flex min-w-0 items-center gap-2 pt-1.5 text-sm font-medium">
+                    <RoleIcon role={role} size="sm" />
+                    <span className="truncate" title={ROLE_LABEL[role] ?? role}>{ROLE_LABEL[role] ?? role}</span>
+                  </span>
+                  <ProviderSelect
+                    label={`Proveedor ${role}`}
+                    value={o.provider ?? ""}
+                    inherit={`Hereda · ${providers.find((p) => p.id === a.provider)?.label ?? a.provider}`}
+                    inherited={a.provider}
+                    providers={providers}
+                    onChange={(v) => set({ provider: v || null, model: v && v !== a.provider ? null : o.model ?? null })}
+                  />
+                  <ModelPicker
+                    label={`Modelo ${role}`}
+                    provider={provider}
+                    value={o.model ?? ""}
+                    placeholder={ownProvider ? undefined : a.model}
+                    onChange={(v) => set({ model: v || null })}
+                    probes={probes}
+                    providersVersion={providersVersion}
+                  />
+                </div>
+                <div className="grid grid-cols-[8rem_1fr] gap-3">
+                  <span className="pt-1 text-xs text-muted-foreground">Temperatura</span>
+                  <TemperatureField
+                    label={`Temperatura ${role}`}
+                    value={o.temperature ?? null}
+                    inherited={a.temperature}
+                    onChange={(v) => set({ temperature: v })}
+                    range={range(provider)}
+                    supported={model ? supported(provider, model) : undefined}
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </Card>
+    </>
   );
 }

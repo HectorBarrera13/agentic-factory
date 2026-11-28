@@ -54,7 +54,9 @@ def test_escalated_ambiguity_resumes_after_po_decision(sandbox):  # noqa: F811
         ORCH.advance("CR-T", FakeExecutor())
     # la aclaracion solo reanuda: el intake regenerado exige una aprobacion NUEVA del PO
     assert exc.value.gate == "requirements"
-    assert state(run)["po_clarification"] == "aclaracion del PO"
+    assert "1. [requirements" in state(run)["po_clarification"]
+    assert "aclaracion del PO" in state(run)["po_clarification"]
+    assert [c["reason"] for c in state(run)["po_clarifications"]] == ["aclaracion del PO"]
     assert (run / "human-requirements-decision-clarification.json").is_file()
     assert not (run / "03-implementation-plan.md").exists()
     approve(run, "requirements")

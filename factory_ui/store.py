@@ -8,7 +8,6 @@ contra los roles autorizados de cada gate del proyecto.
 from __future__ import annotations
 
 import json
-import os
 import re
 import threading
 import uuid
@@ -16,13 +15,19 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, field_validator
 
+from factory_app.credentials import home
+from factory_app.project import ROLE_CATALOG
+
 MAX_RECENT = 10
+__all__ = ["Profile", "Store", "home"]
 
 
 class Profile(BaseModel):
     id: str = Field(default_factory=lambda: uuid.uuid4().hex[:12])
     name: str
     roles: list[str]
+    # guardado con roles que ya no estan en el catalogo (se quitaron al cargar)
+    incomplete: bool = False
 
     @field_validator("name")
     @classmethod
@@ -35,20 +40,17 @@ class Profile(BaseModel):
     @field_validator("roles")
     @classmethod
     def _roles(cls, v: list[str]) -> list[str]:
-        cleaned = [r.strip() for r in v if r.strip()]
+        cleaned = list(dict.fromkeys(r.strip().lower() for r in v if r.strip()))
         if not cleaned:
             raise ValueError("el perfil necesita al menos un rol")
-        if any(re.search(r"[()\n]", r) or len(r) > 60 for r in cleaned):
-            raise ValueError("rol invalido")
+        extra = [r for r in cleaned if r not in ROLE_CATALOG]
+        if extra:
+            raise ValueError(f"roles fuera del catalogo: {extra} (validos: {list(ROLE_CATALOG)})")
         return cleaned
 
     def signature(self, role: str) -> str:
-        """Firma 'Nombre (Rol)' que valida factory_app.roles."""
-        return f"{self.name} ({role})"
-
-
-def home() -> Path:
-    return Path(os.environ.get("FACTORY_HOME") or Path.home() / ".agentic-factory")
+        """Firma 'Nombre (Rol)' que valida factory_app.roles (rol del catalogo, en Title Case)."""
+        return f"{self.name} ({role.strip().title()})"
 
 
 class Store:
@@ -74,7 +76,20 @@ class Store:
 
     # -------------------------------------------------------- perfiles
     def profiles(self) -> list[Profile]:
-        return [Profile.model_validate(p) for p in self._read("profiles.json", [])]
+        out = []
+        for raw in self._read("profiles.json", []):
+            if not isinstance(raw, dict) or not raw.get("name"):
+                continue
+            roles = list(dict.fromkeys(str(r).strip().lower() for r in raw.get("roles", [])))
+            known = [r for r in roles if r in ROLE_CATALOG]
+            if known and len(known) == len(roles):
+                out.append(Profile.model_validate({**raw, "roles": known, "incomplete": False}))
+            else:
+                # carga tolerante: datos viejos con roles fuera del catalogo no rompen la UI
+                out.append(Profile.model_construct(
+                    id=str(raw.get("id") or uuid.uuid4().hex[:12]), name=str(raw["name"]),
+                    roles=known, incomplete=True))
+        return out
 
     def profile(self, profile_id: str) -> Profile | None:
         return next((p for p in self.profiles() if p.id == profile_id), None)

@@ -1,13 +1,24 @@
 import * as React from "react";
 import { api, errorMessage, type Meta, type Profile, type SessionInfo } from "./api";
+import { formatRoute, parseHash, type Route, type View } from "./route";
 
-export type View = "code" | "factory" | "settings";
+export type { View } from "./route";
 export type Theme = "dark" | "light";
+
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
 
 interface Toast {
   id: number;
   tone: "info" | "success" | "danger";
   text: string;
+  /** ms visibles (la barra de tiempo del toast dura lo mismo) */
+  ms: number;
+  /** saliendo: animacion de salida antes de quitarlo */
+  leaving: boolean;
+  action?: ToastAction;
 }
 
 export interface Signer {
@@ -27,9 +38,12 @@ interface AppState {
   signer: Signer;
   setSigner: (profileId: string | null, role?: string) => void;
   toasts: Toast[];
-  notify: (text: string, tone?: Toast["tone"]) => void;
+  notify: (text: string, tone?: Toast["tone"], action?: ToastAction) => void;
+  dismissToast: (id: number) => void;
   /** Cambia cada vez que el backend reporta un cambio (SSE). */
   tick: number;
+  /** Cambia cuando llega un resultado (o inicio) de probe de modelo. */
+  probeTick: number;
   live: boolean;
   /** Run abierto en el tablero (compartido con el selector de raiz del editor). */
   selectedRun: string | null;
@@ -37,6 +51,11 @@ interface AppState {
   openFile: (root: string, path: string) => void;
   pendingOpen: { root: string; path: string } | null;
   clearPendingOpen: () => void;
+  /** Pestaña de Ajustes en la ruta (null = la de por defecto). */
+  settingsTab: string | null;
+  setSettingsTab: (tab: string) => void;
+  /** El editor informa el archivo activo para que la ruta lo recuerde. */
+  setCodeFile: (file: { root: string; path: string } | null) => void;
 }
 
 const Ctx = React.createContext<AppState | null>(null);
@@ -63,7 +82,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = React.useState<SessionInfo | null>(null);
   const [meta, setMeta] = React.useState<Meta | null>(null);
   const [loadError, setLoadError] = React.useState<string | null>(null);
-  const [view, setView] = React.useState<View>("factory");
+  const [route, setRoute] = React.useState<Route>(() => parseHash(window.location.hash));
+  const view = route.view;
   const [theme, setTheme] = React.useState<Theme>(() =>
     readJson<Theme>(LS_THEME, window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"),
   );
@@ -72,15 +92,68 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   );
   const [toasts, setToasts] = React.useState<Toast[]>([]);
   const [tick, setTick] = React.useState(0);
+  const [probeTick, setProbeTick] = React.useState(0);
   const [live, setLive] = React.useState(false);
-  const [selectedRun, setSelectedRun] = React.useState<string | null>(null);
-  const [pendingOpen, setPendingOpen] = React.useState<{ root: string; path: string } | null>(null);
+  const selectedRun = route.run;
+  // al recargar en #/code?root=&path= se vuelve a abrir ese archivo
+  const [pendingOpen, setPendingOpen] = React.useState<{ root: string; path: string } | null>(() => route.file);
 
-  const notify = React.useCallback((text: string, tone: Toast["tone"] = "info") => {
-    const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, tone, text }]);
-    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "danger" ? 7000 : 3500);
+  const patchRoute = React.useCallback((patch: Partial<Route>) => {
+    setRoute((r) => {
+      const next = { ...r, ...patch };
+      return formatRoute(next) === formatRoute(r) ? r : next;
+    });
   }, []);
+  const setView = React.useCallback((v: View) => patchRoute({ view: v }), [patchRoute]);
+  const setSelectedRun = React.useCallback((id: string | null) => patchRoute({ run: id }), [patchRoute]);
+  const setSettingsTab = React.useCallback((tab: string) => patchRoute({ tab }), [patchRoute]);
+  const setCodeFile = React.useCallback(
+    (file: { root: string; path: string } | null) => patchRoute({ file }),
+    [patchRoute],
+  );
+
+  // ruta -> URL: cambiar de vista es una entrada del historial; lo demas la reemplaza
+  const lastView = React.useRef(view);
+  React.useEffect(() => {
+    const hash = formatRoute(route);
+    if (window.location.hash !== hash) {
+      const url = `${window.location.pathname}${window.location.search}${hash}`;
+      if (lastView.current !== route.view) window.history.pushState(null, "", url);
+      else window.history.replaceState(null, "", url);
+    }
+    lastView.current = route.view;
+  }, [route]);
+
+  // URL -> ruta (atras/adelante o un hash pegado a mano)
+  React.useEffect(() => {
+    const onNav = () => {
+      const next = parseHash(window.location.hash);
+      setRoute((r) => (formatRoute(r) === formatRoute(next) ? r : next));
+      if (next.file) setPendingOpen(next.file);
+    };
+    window.addEventListener("popstate", onNav);
+    window.addEventListener("hashchange", onNav);
+    return () => {
+      window.removeEventListener("popstate", onNav);
+      window.removeEventListener("hashchange", onNav);
+    };
+  }, []);
+
+  const dismissToast = React.useCallback((id: number) => {
+    // primero la animacion de salida, despues se quita
+    setToasts((t) => t.map((x) => (x.id === id ? { ...x, leaving: true } : x)));
+    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 180);
+  }, []);
+
+  const notify = React.useCallback(
+    (text: string, tone: Toast["tone"] = "info", action?: ToastAction) => {
+      const id = Date.now() + Math.random();
+      const ms = action ? 8000 : tone === "danger" ? 7000 : 3500;
+      setToasts((t) => [...t.slice(-4), { id, tone, text, ms, leaving: false, action }]);
+      window.setTimeout(() => dismissToast(id), ms);
+    },
+    [dismissToast],
+  );
 
   const refreshSession = React.useCallback(async () => {
     try {
@@ -105,7 +178,23 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   React.useEffect(() => {
     if (typeof EventSource === "undefined") return;
     const source = new EventSource("/api/events");
-    source.addEventListener("change", () => setTick((t) => t + 1));
+    let lastRuns = "";
+    let lastProbes: unknown = undefined;
+    source.addEventListener("change", (ev) => {
+      // los probes de modelos tienen su propio contador: no recargan tableros de runs
+      let snap: Record<string, unknown> = {};
+      try {
+        snap = JSON.parse((ev as MessageEvent).data ?? "{}");
+      } catch {
+        /* snapshot ilegible: se trata como cambio de runs */
+      }
+      const { probes, ...runs } = snap;
+      const runsKey = JSON.stringify(runs);
+      if (runsKey !== lastRuns || !Object.keys(snap).length) setTick((t) => t + 1);
+      if (probes !== lastProbes) setProbeTick((t) => t + 1);
+      lastRuns = runsKey;
+      lastProbes = probes;
+    });
     source.onopen = () => setLive(true);
     source.onerror = () => setLive(false);
     return () => source.close();
@@ -133,8 +222,10 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     signer: { profile, role },
     setSigner,
     toasts,
+    dismissToast,
     notify,
     tick,
+    probeTick,
     live,
     selectedRun,
     setSelectedRun,
@@ -144,6 +235,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     pendingOpen,
     clearPendingOpen: () => setPendingOpen(null),
+    settingsTab: route.tab,
+    setSettingsTab,
+    setCodeFile,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

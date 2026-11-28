@@ -13,8 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+from factory_app import activity, control, services
 from factory_app import orchestrator as ORCH
-from factory_app import services
 from factory_app.context import FACTORY_REPO, use_project
 from factory_app.project import Project, normalize_change_id
 from factory_app.roles import FactoryError
@@ -38,6 +38,7 @@ class RunManager:
     def __init__(self):
         self._locks: dict[str, threading.Lock] = {}
         self._outcomes: dict[str, dict] = {}
+        self._controls: dict[str, control.RunControl] = {}
         self._guard = threading.Lock()
         self.version = 0  # cambia con cada outcome (lo mira el SSE)
 
@@ -61,6 +62,9 @@ class RunManager:
                 load_dotenv(FACTORY_REPO / ".env")
             except ImportError:  # pragma: no cover
                 pass
+            from factory_app import credentials
+
+            credentials.apply_to_env()  # claves guardadas desde la UI (el entorno real gana)
             return ORCH.ADKExecutor()
         raise FactoryError(f"modo desconocido: {mode!r} (fake | adk)")
 
@@ -73,13 +77,17 @@ class RunManager:
             lock = self._locks.setdefault(key, threading.Lock())
             if not lock.acquire(blocking=False):
                 raise FactoryError(f"{cid} ya esta avanzando; espera a que se detenga")
+        ctl = control.RunControl()
+        self._controls[key] = ctl
         self._set(key, {"kind": "running", "mode": mode, "at": time.time()})
 
         def work():
             try:
-                with use_project(project):
+                with use_project(project), control.use_control(ctl):
                     st = ORCH.advance(cid, executor)
                 self._set(key, {"kind": "done", "status": st["status"]})
+            except control.Paused as exc:
+                self._set(key, {"kind": "paused", "message": str(exc), "mode": mode})
             except ORCH.AwaitingHuman as exc:
                 self._set(key, {"kind": "awaiting", "gate": exc.gate, "message": exc.why})
             except ORCH.Blocked as exc:
@@ -91,6 +99,7 @@ class RunManager:
             except Exception as exc:  # noqa: BLE001 — se reporta a la UI, el run queda en checkpoint
                 self._set(key, {"kind": "error", "message": f"{type(exc).__name__}: {exc}"})
             finally:
+                self._controls.pop(key, None)
                 lock.release()
 
         ctx = contextvars.copy_context()
@@ -98,6 +107,17 @@ class RunManager:
         thread.start()
         if wait:
             thread.join()
+        return self.outcome(project, cid) or {}
+
+    def pause(self, project: Project, change_id: str) -> dict:
+        """Pausa inmediata: cancela la llamada en curso; el run vuelve a su checkpoint."""
+        cid = normalize_change_id(change_id)
+        key = self._key(project, cid)
+        ctl = self._controls.get(key)
+        if ctl is None or not self.busy(project, cid):
+            raise FactoryError(f"{cid} no esta avanzando: no hay nada que pausar")
+        ctl.pause()
+        self._set(key, {**(self._outcomes.get(key) or {}), "kind": "running", "pausing": True})
         return self.outcome(project, cid) or {}
 
     def _set(self, key: str, outcome: dict) -> None:
@@ -172,6 +192,7 @@ def detail(project: Project, manager: RunManager, change_id: str) -> dict:
         if gate
         else None,
         "findings": _findings(project, run, state),
+        "live": activity.live(run) if manager.busy(project, cid) else None,
         "worktree": state.get("worktree") if (project.root / str(state.get("worktree") or "-"))
         .exists() else None,
     }
@@ -240,5 +261,14 @@ def snapshot(project: Project | None, manager: RunManager) -> dict:
                 stamps[path.parent.name] = path.stat().st_mtime_ns
             except OSError:
                 continue
+    # actividad en vivo: cada evento nuevo (fase, tool, comando) cambia el snapshot
+    live = {}
+    if project.runs_dir.is_dir():
+        for path in project.runs_dir.glob(f"CR-*/{activity.ACTIVITY_FILE}"):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            live[path.parent.name] = [st.st_mtime_ns, st.st_size]
     crs = project.cr_dir.stat().st_mtime_ns if project.cr_dir.is_dir() else 0
-    return {"version": manager.version, "runs": stamps, "crs": crs}
+    return {"version": manager.version, "runs": stamps, "crs": crs, "activity": live}

@@ -26,7 +26,7 @@ export function VerifyEditor({
         </p>
       ) : null}
       {commands.map((c, i) => (
-        <div key={i} className="grid grid-cols-[8rem_1fr_7rem_auto] gap-2">
+        <div key={i} className="anim-enter grid grid-cols-[8rem_minmax(0,1fr)_9rem_auto] gap-2">
           <Input
             aria-label="Nombre"
             value={c.name}

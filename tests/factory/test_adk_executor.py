@@ -156,3 +156,29 @@ def test_agent_tools_have_no_defaults_and_document_args(fn):
     assert "Returns:" in doc
     if any(True for _ in inspect.signature(fn).parameters):
         assert "Args:" in doc
+
+
+def test_run_records_provider_model_and_effective_temperature(fake_model):
+    _llm, tmp, _closed = fake_model
+    run_dir = tmp / "runs" / "CR-001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "factory-state.json").write_text(json.dumps({"status": "PLANNING"}))
+    ADKExecutor().run_agent("plan", {"change_id": "CR-001", "cr_text": "CR body"})
+    state = json.loads((run_dir / "factory-state.json").read_text(encoding="utf-8"))
+    agents_cfg = project().config.agents
+    assert state["models"]["planner"] == {
+        "provider": "gemini", "model": agents_cfg.model_for("planner"),
+        "temperature_requested": agents_cfg.temperature,
+        "temperature_effective": agents_cfg.temperature,
+    }
+    assert state["status"] == "PLANNING"  # registrar el modelo no es una transicion
+
+
+def test_temperature_is_omitted_when_the_probe_says_the_model_rejects_it(fake_model,
+                                                                         monkeypatch):
+    llm, _tmp, _closed = fake_model
+    monkeypatch.setattr(agents, "temperature_supported", lambda p, m: False)
+    assert agents.make_planner_agent().generate_content_config.temperature is None
+    assert agents.model_settings("planner")["temperature_effective"] is None
+    ADKExecutor().run_agent("plan", {"change_id": "CR-001", "cr_text": "CR body"})
+    assert llm.requests[-1].config.temperature is None

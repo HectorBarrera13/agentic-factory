@@ -27,6 +27,9 @@ RECOMMENDATION_RULE = """
 OUTPUT CONTRACT (parsed deterministically): the LAST line of your answer must be exactly
 `RECOMMENDATION: PROCEED` or `RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED`.
 Without that line the factory stops the run for a human.
+If PO_CLARIFICATION lists previous Product Owner answers, they are binding decisions:
+apply them and never ask those points again; only request clarification for what
+is still genuinely undecided.
 """
 INTAKE_INSTRUCTION += RECOMMENDATION_RULE
 

@@ -1,7 +1,7 @@
 import { FileText, Hand, ShieldAlert, Signature } from "lucide-react";
 import * as React from "react";
 import { Badge, Button, Callout, Card, CardHeader, Field, Select, Textarea } from "@/components/ui";
-import type { RunDetail } from "@/lib/api";
+import { roleLabel, type RunDetail } from "@/lib/api";
 import type { Signer } from "@/lib/app-state";
 
 const DECISION_LABEL: Record<string, string> = {
@@ -53,7 +53,7 @@ export function GateCard({
         <div className="flex items-end justify-between gap-3 p-4 text-xs">
           <div className="min-w-0 space-y-1">
             <p className="text-muted-foreground">
-              Firmado por <span className="font-medium text-foreground">{r.recorded_by}</span>
+              Firmado por <span className="break-words font-medium text-foreground">{r.recorded_by}</span>
             </p>
             <p className="break-words">«{r.reason}»</p>
           </div>
@@ -108,8 +108,8 @@ export function GateCard({
         {!signer.profile ? (
           <Callout tone="warning" title="Elige un perfil para firmar">Usa el selector de perfil en la barra inferior.</Callout>
         ) : !roleOk ? (
-          <Callout tone="warning" title={`El rol «${signer.role}» no puede firmar este gate`}>
-            Roles autorizados: {gate.roles.join(", ")}.
+          <Callout tone="warning" title={`El rol «${roleLabel(signer.role)}» no puede firmar este gate`}>
+            Roles autorizados: {gate.roles.map(roleLabel).join(", ")}.
           </Callout>
         ) : null}
         <div className="grid grid-cols-[12rem_1fr] gap-3">
@@ -137,7 +137,7 @@ export function GateCard({
             <Signature className="size-3.5" />
             {signer.profile ? (
               <>
-                Firma: <span className="font-medium text-foreground">{signer.profile.name} ({signer.role})</span>
+                Firma: <span className="font-medium text-foreground">{signer.profile.name} ({roleLabel(signer.role)})</span>
               </>
             ) : (
               "Sin firma"

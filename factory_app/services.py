@@ -32,6 +32,9 @@ EXPORT_REQUIRED = (
 __all__ = [
     "FactoryError",
     "approve_gate",
+    "archive_change_request",
+    "cr_lifecycle",
+    "delete_change_request",
     "create_change_request",
     "decide_findings",
     "export_evidence",
@@ -40,6 +43,8 @@ __all__ = [
     "list_runs",
     "read_state",
     "report_finding_ids",
+    "restore_change_request",
+    "retry_run",
     "start_run",
 ]
 
@@ -76,9 +81,10 @@ def list_change_requests(project: Project) -> list[dict]:
         if not m:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
         title = next(
-            (line.lstrip("# ").strip() for line in text.splitlines() if line.startswith("#")),
-            path.stem,
+            (line[2:].strip() for line in lines if line.startswith("# ")),
+            next((line.lstrip("# ").strip() for line in lines if line.startswith("#")), path.stem),
         )
         cid = m.group(1).upper()
         out.append(
@@ -114,18 +120,221 @@ def create_change_request(project: Project, change_id: str, title: str, body: st
         raise FactoryError(f"Ya existe un Change Request {cid}")
     project.cr_dir.mkdir(parents=True, exist_ok=True)
     path = project.cr_dir / f"{cid}-{_slug(title)}.md"
-    content = body if body.lstrip().startswith("#") else f"# {cid} — {title.strip()}\n\n{body}"
+    # solo un H1 propio cuenta como titulo: "## Problema" no lo es
+    content = body if body.lstrip().startswith("# ") else f"# {cid} — {title.strip()}\n\n{body}"
     path.write_text(content.rstrip() + "\n", encoding="utf-8")
     return path
 
 
-def update_change_request(project: Project, change_id: str, body: str) -> Path:
-    """Edita un CR SIN run: con run iniciado el CR es evidencia (00-change-request.md)."""
-    path = find_change_request(project, change_id)
-    if _state_path(project, _cid(change_id)).is_file():
-        raise FactoryError(f"{change_id} ya tiene un run: el CR quedo congelado como evidencia")
-    path.write_text(body.rstrip() + "\n", encoding="utf-8")
+def update_change_request(
+    project: Project, change_id: str, body: str, busy: bool = False
+) -> Path:
+    """Edita un CR mientras su intake no corrio (sin run, o run creado sin avanzar).
+
+    Despues el CR es evidencia (00-change-request.md) y queda congelado; para cambiarlo
+    tras un ESCALATED / NOT READY esta Reintentar."""
+    cid = _cid(change_id)
+    path = find_change_request(project, cid)
+    life = cr_lifecycle(project, cid, busy=busy)
+    if not life["editable"]:
+        raise FactoryError(f"{cid}: {life['reason']}", code="cr_frozen")
+    if not body.strip():
+        raise FactoryError("El Change Request no puede quedar vacio")
+    text = body.rstrip() + "\n"
+    path.write_text(text, encoding="utf-8")
+    copy = project.run_dir(cid) / "00-change-request.md"
+    if copy.is_file():  # run creado sin avanzar: su copia de evidencia sigue al CR
+        copy.write_text(text, encoding="utf-8")
     return path
+
+
+# ---------------------------------------------------------------- ciclo de vida del CR
+ARCHIVE_DIR = "archivados"
+ARCHIVE_RECORD = "archivo.json"
+
+
+def _finished(state: dict) -> bool:
+    """Terminado de verdad: listo, no listo, o escalado sin gate que lo reanude."""
+    status = state.get("status")
+    if status == "ESCALATED":
+        return not state.get("awaiting_gate")
+    return status in ("READY FOR HUMAN MERGE", "NOT READY")
+
+
+def cr_lifecycle(project: Project, change_id: str, busy: bool = False) -> dict:
+    """Que admite el CR ahora: editarse, archivarse, eliminarse (y por que no)."""
+    cid = _cid(change_id)
+    run = project.run_dir(cid)
+    state_path = run / "factory-state.json"
+    if not state_path.is_file():
+        return {"editable": True, "archivable": False, "deletable": True, "reason": ""}
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    untouched = (
+        state.get("status") == "INTAKE_PENDING"
+        and not state.get("paused")
+        and not (run / "01-intake-report.md").exists()
+    )
+    finished = _finished(state)
+    if busy:
+        reason = "el run esta avanzando; espera a que se detenga"
+    elif untouched:
+        reason = ""
+    elif finished:
+        reason = "el run termino: el CR es evidencia; usa Reintentar para cambiarlo"
+    else:
+        reason = "el intake ya corrio: el CR quedo congelado como evidencia del run"
+    return {
+        "editable": untouched and not busy,
+        "archivable": finished and not busy,
+        "deletable": finished and not busy,
+        "reason": reason,
+    }
+
+
+def _inside(path: Path, root: Path) -> Path:
+    resolved = path.resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        raise FactoryError(f"Ruta fuera de la carpeta de la fabrica: {path}")
+    return resolved
+
+
+def _archived_cr(project: Project, cid: str) -> Path | None:
+    folder = project.cr_dir / ARCHIVE_DIR
+    matches = sorted(folder.glob(f"{cid}-*.md")) + sorted(folder.glob(f"{cid}.md"))
+    return matches[0] if len(matches) == 1 else None
+
+
+def list_archived(project: Project) -> list[dict]:
+    """CRs archivados con su registro (quien, cuando, estado final)."""
+    out = []
+    folder = project.cr_dir / ARCHIVE_DIR
+    if not folder.is_dir():
+        return out
+    for path in sorted(folder.glob("CR-*.md")):
+        m = re.match(r"^(CR-[A-Za-z0-9]+)", path.stem)
+        if not m:
+            continue
+        cid = m.group(1).upper()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        lines = text.splitlines()
+        title = next((line[2:].strip() for line in lines if line.startswith("# ")), path.stem)
+        record_path = project.runs_dir / ARCHIVE_DIR / cid / ARCHIVE_RECORD
+        record = {}
+        if record_path.is_file():
+            try:
+                record = json.loads(record_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                record = {}
+        out.append({
+            "change_id": cid,
+            "file": path.relative_to(project.root).as_posix(),
+            "title": title,
+            "archived": True,
+            "archived_at": record.get("archived_at"),
+            "archived_by": record.get("archived_by"),
+            "status": record.get("status"),
+        })
+    return out
+
+
+def _drop_worktree(project: Project, cid: str) -> bool:
+    from .context import use_project
+    from .orchestrator import remove_worktree
+
+    with use_project(project):
+        return remove_worktree(cid)
+
+
+def archive_change_request(
+    project: Project, change_id: str, recorded_by: str, busy: bool = False
+) -> dict:
+    """Archiva un CR terminado y su run (se ocultan, se pueden restaurar). La rama queda."""
+    cid = _cid(change_id)
+    life = cr_lifecycle(project, cid, busy=busy)
+    if busy:
+        raise FactoryError(life["reason"], code="busy")
+    if not life["archivable"]:
+        raise FactoryError(
+            f"{cid}: solo se archiva un run terminado (listo, no listo o escalado sin "
+            "reanudacion)", code="not_finished")
+    source = _inside(find_change_request(project, cid), project.cr_dir)
+    run = _inside(project.run_dir(cid), project.runs_dir)
+    cr_dest = project.cr_dir / ARCHIVE_DIR / source.name
+    run_dest = project.runs_dir / ARCHIVE_DIR / cid
+    if cr_dest.exists() or run_dest.exists():
+        raise FactoryError(f"Ya hay un {cid} archivado: restauralo o eliminalo antes",
+                           code="exists")
+    state = json.loads((run / "factory-state.json").read_text(encoding="utf-8"))
+    worktree_removed = _drop_worktree(project, cid)
+    cr_dest.parent.mkdir(parents=True, exist_ok=True)
+    run_dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), str(cr_dest))
+    shutil.move(str(run), str(run_dest))
+    record = {
+        "change_id": cid,
+        "archived_at": _now(),
+        "archived_by": recorded_by,
+        "status": state.get("status"),
+        "branch": state.get("branch"),
+        "worktree_removed": worktree_removed,
+    }
+    (run_dest / ARCHIVE_RECORD).write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return record
+
+
+def restore_change_request(project: Project, change_id: str) -> dict:
+    """Devuelve un CR archivado (y su run) a la lista activa."""
+    cid = _cid(change_id)
+    source = _archived_cr(project, cid)
+    if source is None:
+        raise FactoryError(f"No hay un {cid} archivado")
+    run_src = project.runs_dir / ARCHIVE_DIR / cid
+    if list(project.cr_dir.glob(f"{cid}-*.md")) or (project.cr_dir / f"{cid}.md").exists() \
+            or project.run_dir(cid).exists():
+        raise FactoryError(f"Ya existe un {cid} activo: no se puede restaurar encima",
+                           code="exists")
+    shutil.move(str(source), str(project.cr_dir / source.name))
+    if run_src.is_dir():
+        (run_src / ARCHIVE_RECORD).unlink(missing_ok=True)
+        shutil.move(str(run_src), str(project.run_dir(cid)))
+    return {"change_id": cid, "restored": True}
+
+
+def delete_change_request(
+    project: Project, change_id: str, confirm: str, busy: bool = False
+) -> dict:
+    """Elimina para siempre un CR (sin run, o con run terminado) y su evidencia.
+
+    Exige teclear el ID. Borra el worktree pero conserva la rama de git. Vale tambien para
+    un CR archivado."""
+    cid = _cid(change_id)
+    if (confirm or "").strip().upper() != cid:
+        raise FactoryError(f"Escribe {cid} para confirmar la eliminacion",
+                           code="confirm_mismatch")
+    archived = _archived_cr(project, cid)
+    removed: list[str] = []
+    if archived is not None and not list(project.cr_dir.glob(f"{cid}-*.md")):
+        run = project.runs_dir / ARCHIVE_DIR / cid
+        source = archived
+    else:
+        life = cr_lifecycle(project, cid, busy=busy)
+        if busy:
+            raise FactoryError(life["reason"], code="busy")
+        if not life["deletable"]:
+            raise FactoryError(
+                f"{cid}: solo se elimina un CR sin run o con el run terminado",
+                code="not_finished")
+        source = find_change_request(project, cid)
+        run = project.run_dir(cid)
+        if _drop_worktree(project, cid):
+            removed.append("worktree")
+    source = _inside(source, project.cr_dir)
+    if run.exists():
+        shutil.rmtree(_inside(run, project.runs_dir))
+        removed.append(run.relative_to(project.root).as_posix())
+    source.unlink()
+    removed.append(source.relative_to(project.root).as_posix())
+    return {"change_id": cid, "deleted": removed}
 
 
 # ---------------------------------------------------------------- runs
@@ -156,6 +365,122 @@ def start_run(project: Project, change_id: str) -> dict:
     return state
 
 
+RETRYABLE = ("ESCALATED", "NOT READY")
+ATTEMPTS_DIR = "intentos"
+
+
+def retry_run(
+    project: Project,
+    change_id: str,
+    body: str,
+    reason: str,
+    recorded_by: str,
+    force: bool = False,
+) -> dict:
+    """Reintentar: nuevo intento del MISMO CR (editado) tras ESCALATED / NOT READY.
+
+    No reanuda nada: el intento anterior se archiva entero en `runs/<CR>/intentos/<n>/`,
+    su rama se renombra a `<rama>-intento<n>` (se conserva) y el nuevo intento empieza en
+    INTAKE_PENDING con todos los gates en PENDING. Firma el Product Owner (roles del gate
+    requirements). Superado `limits.attempts` exige `force` (decision explicita)."""
+    from .context import use_project
+    from .orchestrator import archive_run_branch
+
+    cid, reason = _cid(change_id), reason.strip()
+    state = read_state(project, cid)
+    status = state.get("status")
+    if status not in RETRYABLE:
+        raise FactoryError(
+            f"Solo se reintenta un run ESCALATED o NOT READY ({cid} esta en {status})"
+        )
+    if not reason:
+        raise FactoryError("Reintentar requiere un motivo")
+    if not body.strip():
+        raise FactoryError("El Change Request no puede quedar vacio")
+    if not recorded_by.strip() or "TODO" in recorded_by:
+        raise FactoryError('Identifique al humano: "Nombre (Rol)"')
+    role = validate_role("requirements", recorded_by, project.config.gates.roles)
+    attempt = int(state.get("attempt", 1))
+    cap = project.config.limits.attempts
+    if attempt >= cap and not force:
+        raise FactoryError(
+            f"{cid} ya lleva {attempt} intento(s) (tope {cap}). Si el CR sigue sin salir, "
+            "considera dividirlo o reescribir su alcance; reintenta de todos modos solo si "
+            "lo decides explicitamente.",
+            code="attempts_exhausted",
+        )
+
+    run = project.run_dir(cid)
+    source = find_change_request(project, cid)
+    previous_cr = (run / "00-change-request.md").read_text(encoding="utf-8", errors="replace")
+    archive = run / ATTEMPTS_DIR / str(attempt)
+    if archive.exists():
+        raise FactoryError(f"Ya existe el archivo del intento {attempt}: {archive}")
+    with use_project(project):
+        branch = archive_run_branch(cid, attempt)
+    archive.mkdir(parents=True)
+    for item in sorted(run.iterdir()):
+        if item.name != ATTEMPTS_DIR:
+            shutil.move(str(item), str(archive / item.name))
+
+    text = body.rstrip() + "\n"
+    source.write_text(text, encoding="utf-8")
+    (run / "00-change-request.md").write_text(text, encoding="utf-8")
+    now = _now()
+    previous = [
+        *state.get("previous_attempts", []),
+        {
+            "n": attempt,
+            "status": status,
+            "stop_reason": state.get("stop_reason", ""),
+            "branch": branch,
+            "archive": archive.relative_to(project.root).as_posix(),
+            "archived_at": now,
+        },
+    ]
+    retry = {
+        "by": recorded_by,
+        "role": role,
+        "reason": reason,
+        "at": now,
+        "forced": bool(attempt >= cap),
+        "cr_changed": previous_cr.rstrip() != body.rstrip(),
+    }
+    new = {
+        **initial_state(cid),
+        "attempt": attempt + 1,
+        "previous_attempts": previous,
+        "retry": retry,
+        "transitions": [{"status": "INTAKE_PENDING", "event": "RETRY", "at": now}],
+    }
+    (run / "factory-state.json").write_text(json.dumps(new, indent=2), encoding="utf-8")
+    (run / "00-retry-decision.md").write_text(
+        "\n".join(
+            [
+                f"# Reintento — {cid} (intento {attempt + 1})",
+                "",
+                f"- Decidido por: {recorded_by}",
+                f"- Fecha: {now}",
+                f"- Motivo: {reason}",
+                f"- Intento anterior: #{attempt} {status} — {state.get('stop_reason') or '-'}",
+                f"- Archivo del intento anterior: {previous[-1]['archive']}",
+                f"- Rama conservada: {branch or '(no llego a crear rama)'}",
+                f"- CR modificado: {'si' if retry['cr_changed'] else 'no'}",
+                *(
+                    [f"- Tope de intentos ({cap}) superado por decision explicita"]
+                    if retry["forced"]
+                    else []
+                ),
+                "",
+                "> Nuevo intento: todos los gates humanos vuelven a PENDING. Nada se reanuda.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return new
+
+
 def list_runs(project: Project) -> list[dict]:
     out = []
     if not project.runs_dir.is_dir():
@@ -172,6 +497,8 @@ def list_runs(project: Project) -> list[dict]:
                 "awaiting_gate": st.get("awaiting_gate") or "",
                 "stop_reason": st.get("stop_reason") or "",
                 "created_at": st.get("created_at"),
+                "attempt": st.get("attempt", 1),
+                "paused": bool(st.get("paused")),
             }
         )
     return out

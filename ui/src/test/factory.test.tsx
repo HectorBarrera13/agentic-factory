@@ -69,7 +69,7 @@ describe("GateCard", () => {
     render(<GateCard gate={gate} decisions={DECISIONS} signer={signer("tech lead")} pendingFindings={0} onOpenArtifact={() => undefined} onDecide={onDecide} />);
     const submit = screen.getByRole("button", { name: /registrar decisión/i });
     expect(submit).toBeDisabled();
-    expect(screen.getByText("Ana (tech lead)")).toBeInTheDocument();
+    expect(screen.getByText("Ana (Tech Lead)")).toBeInTheDocument();
     await userEvent.type(screen.getByLabelText("Motivo"), "Plan acotado al CR");
     await userEvent.selectOptions(screen.getByLabelText("Decisión"), "MODIFIED");
     await userEvent.click(submit);
@@ -97,10 +97,10 @@ describe("GateCard", () => {
   });
 
   it("con decision registrada muestra la firma y permite cambiarla", async () => {
-    const recorded = { decision: "APPROVED", reason: "Plan ok", recorded_by: "Ana (tech lead)", recorded_at: "2026-11-27T10:00:00Z" };
+    const recorded = { decision: "APPROVED", reason: "Plan ok", recorded_by: "Ana (Tech Lead)", recorded_at: "2026-11-27T10:00:00Z" };
     render(<GateCard gate={{ ...gate, recorded }} decisions={DECISIONS} signer={signer("tech lead")} pendingFindings={0} onOpenArtifact={() => undefined} onDecide={vi.fn()} />);
     expect(screen.getByText(/decisión registrada/i)).toBeInTheDocument();
-    expect(screen.getByText("Ana (tech lead)")).toBeInTheDocument();
+    expect(screen.getByText("Ana (Tech Lead)")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /registrar decisión/i })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /cambiar decisión/i }));
     expect(screen.getByRole("button", { name: /registrar decisión/i })).toBeInTheDocument();
