@@ -1,4 +1,4 @@
-import { FilePlus2, FileText, Lock, Pencil, Play, Rocket, Save, X } from "lucide-react";
+import { AlertTriangle, CheckCircle2, CircleDashed, FilePlus2, FileText, Hand, Loader2, Lock, Pause, Pencil, Play, Rocket, Save, X } from "lucide-react";
 import * as React from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -73,7 +73,8 @@ export function FactoryView() {
                 <div className="flex items-center justify-between gap-2">
                   <span className="font-mono text-xs font-semibold">{cr.change_id}</span>
                   {r ? (
-                    <Badge tone={statusTone(r.status, r.awaiting_gate)} className="max-w-36 truncate">
+                    <Badge tone={statusTone(r.status, r.awaiting_gate)} className="max-w-36 truncate" data-run-status={r.busy ? "running" : r.status}>
+                      <RunStatusIcon run={r} />
                       {r.busy ? "en curso" : statusLabel(r.status, r.awaiting_gate)}
                     </Badge>
                   ) : (
@@ -270,4 +271,15 @@ function CreateCrDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/** Icono del estado en la lista de CRs: que se lea de un vistazo sin leer la etiqueta. */
+function RunStatusIcon({ run }: { run: RunSummary }) {
+  const cls = "size-3 shrink-0";
+  if (run.busy) return <Loader2 aria-hidden className={cn(cls, "animate-spin")} />;
+  if (run.status === "READY FOR HUMAN MERGE") return <CheckCircle2 aria-hidden className={cls} />;
+  if (run.status === "ESCALATED" || run.status === "NOT READY") return <AlertTriangle aria-hidden className={cls} />;
+  if (run.awaiting_gate) return <Hand aria-hidden className={cls} />;
+  if (run.paused) return <Pause aria-hidden className={cls} />;
+  return <CircleDashed aria-hidden className={cls} />;
 }

@@ -73,6 +73,7 @@ function mockBase(run: RunDetail, models: ModelInUse[]) {
   vi.spyOn(api, "meta").mockResolvedValue(META);
   vi.spyOn(api, "run").mockResolvedValue(run);
   vi.spyOn(api, "modelsInUse").mockResolvedValue({ items: models });
+  vi.spyOn(api, "activity").mockResolvedValue({ items: [], last: 0 });
 }
 
 beforeEach(() => {

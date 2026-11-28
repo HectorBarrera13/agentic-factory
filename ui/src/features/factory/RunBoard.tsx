@@ -8,7 +8,7 @@ import {
   FolderGit2,
   GitCompare,
   FlaskConical,
-  History,
+  Activity,
   Pause,
   Play,
   RotateCcw,
@@ -32,18 +32,21 @@ import {
 } from "@/components/ui";
 import { api, errorMessage, roleLabel, type ModelInUse, type RunDetail } from "@/lib/api";
 import { useApp, useLoad } from "@/lib/app-state";
+import { deriveFlow, useActivity } from "@/lib/activity";
 import { statusLabel, statusTone, TERMINAL } from "@/lib/phases";
 import { cn, formatTime, languageFor } from "@/lib/utils";
+import { ProviderLogo } from "@/components/ProviderLogo";
 import { FindingsTable } from "./FindingsTable";
 import { GateCard } from "./GateCard";
-import { PhaseStepper } from "./PhaseStepper";
+import { ActivityLog } from "./ActivityLog";
+import { FlowDiagram } from "./FlowDiagram";
+import { NowStrip } from "./NowStrip";
 import { RetryDialog } from "./RetryDialog";
 
 /** Terminados que admiten Reintentar (nuevo intento del CR editado). */
 const RETRYABLE = ["ESCALATED", "NOT READY"];
 
 const OUTCOME_COPY: Record<string, { tone: "info" | "warning" | "danger" | "success"; title: string }> = {
-  running: { tone: "info", title: "Avanzando…" },
   awaiting: { tone: "warning", title: "Detenido en un gate humano" },
   blocked: { tone: "danger", title: "Bloqueado" },
   transient: { tone: "warning", title: "Error transitorio del modelo: reintenta más tarde" },
@@ -93,6 +96,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
   const [artifact, setArtifact] = React.useState<string | null>(null);
   const [starting, setStarting] = React.useState(false);
   const [retrying, setRetrying] = React.useState(false);
+  const events = useActivity(changeId, tick, run.data?.state.attempt ?? 1);
 
   if (run.error && !run.data) {
     return <div className="p-6"><Callout tone="danger" title="No se pudo cargar el run">{run.error}</Callout></div>;
@@ -149,6 +153,8 @@ export function RunBoard({ changeId }: { changeId: string }) {
       setPausing(false);
     }
   };
+
+  const flow = deriveFlow(st, events, meta.phases, d.busy);
 
   const showArtifact = (name: string) => {
     setArtifact(name);
@@ -210,9 +216,18 @@ export function RunBoard({ changeId }: { changeId: string }) {
 
       <div className="min-h-0 flex-1 overflow-auto">
         <div className="space-y-4 p-5">
-          <Card className="px-4 py-4">
-            <PhaseStepper phases={meta.phases} state={st} busy={d.busy} />
+          <Card className="px-3 py-3">
+            <FlowDiagram
+              flow={flow}
+              phases={meta.phases}
+              state={st}
+              busy={d.busy}
+              artifacts={d.artifacts.map((a) => a.name)}
+              onOpenArtifact={showArtifact}
+            />
           </Card>
+
+          <NowStrip flow={flow} live={d.live} busy={d.busy} message={d.outcome?.kind === "running" ? d.outcome.message : undefined} />
 
           {!terminal && notOk.length ? <ModelWarning items={notOk} /> : null}
           {!terminal ? <EnvOverrideNote items={models} /> : null}
@@ -264,7 +279,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
               <TabsList>
                 <TabsTrigger value="artifacts"><FileText /> Artefactos ({d.artifacts.length})</TabsTrigger>
                 <TabsTrigger value="diff"><GitCompare /> Diff</TabsTrigger>
-                <TabsTrigger value="timeline"><History /> Línea de tiempo</TabsTrigger>
+                <TabsTrigger value="activity"><Activity /> Actividad{events.length ? ` (${events.length})` : ""}</TabsTrigger>
                 <TabsTrigger value="summary"><FileCode2 /> Estado</TabsTrigger>
               </TabsList>
               <TabsContent value="artifacts">
@@ -273,8 +288,8 @@ export function RunBoard({ changeId }: { changeId: string }) {
               <TabsContent value="diff">
                 <DiffPane changeId={changeId} hasBranch={Boolean(st.branch)} tick={tick} onOpenWorktree={(p) => openFile(`run:${changeId}`, p)} worktree={Boolean(d.worktree)} />
               </TabsContent>
-              <TabsContent value="timeline">
-                <Timeline detail={d} />
+              <TabsContent value="activity">
+                {events.length ? <ActivityLog events={events} busy={d.busy} /> : <Timeline detail={d} />}
               </TabsContent>
               <TabsContent value="summary">
                 <StateSummary detail={d} />
@@ -325,7 +340,7 @@ function RunAlerts({ detail, clarificationCap }: { detail: RunDetail; clarificat
       </Callout>,
     );
   }
-  if (o && o.kind !== "awaiting" && o.kind !== "done" && o.kind !== "paused" && !(o.kind === "running" && !detail.busy)) {
+  if (o && o.kind !== "awaiting" && o.kind !== "done" && o.kind !== "paused" && o.kind !== "running") {
     const copy = OUTCOME_COPY[o.kind];
     alerts.push(
       <Callout key="outcome" tone={copy.tone} title={copy.title}>
@@ -357,6 +372,7 @@ function ModelWarning({ items }: { items: ModelInUse[] }) {
       <ul className="mt-1 space-y-0.5">
         {items.map((m) => (
           <li key={`${m.provider}:${m.model}`}>
+            <ProviderLogo provider={m.provider} decorative className="mr-1 inline size-3.5 align-[-2px]" />
             <span className="font-mono">{m.provider}/{m.model}</span> ({m.roles.join(", ")}): <strong>{probeWords(m)}</strong>
             {m.probe?.message ? <span className="text-muted-foreground"> — {m.probe.message}</span> : null}
           </li>
@@ -546,7 +562,7 @@ function DiffPane({
   );
 }
 
-/** Linea de tiempo desde el disco: artefactos por fecha + decisiones humanas + resultado. */
+/** Runs sin activity.jsonl (anteriores): linea de tiempo desde el disco (artefactos + gates). */
 function Timeline({ detail }: { detail: RunDetail }) {
   const events = [...detail.artifacts]
     .sort((a, b) => b.modified - a.modified)

@@ -191,6 +191,8 @@ export interface RunSummary {
   created_at?: string;
   attempt?: number;
   busy?: boolean;
+  /** Pausado por un humano (se reanuda desde su ultimo checkpoint). */
+  paused?: boolean;
 }
 
 export interface Outcome {
@@ -250,10 +252,59 @@ export interface PreviousAttempt {
   archived_at: string;
 }
 
+/** Evento de la actividad en vivo de un run (activity.jsonl). */
+export interface ActivityEvent {
+  seq: number;
+  ts: string;
+  kind: string;
+  phase?: string;
+  role?: string;
+  agent?: string;
+  provider?: string;
+  model?: string;
+  tool?: string;
+  target?: string;
+  command?: string;
+  cmd_kind?: string;
+  returncode?: number | null;
+  gate?: string;
+  roles?: string[];
+  decision?: string;
+  by?: string;
+  fix?: "verify" | "review";
+  n?: number;
+  cap?: number;
+  ok?: boolean;
+  tests?: number;
+  failed?: number;
+  duration_ms?: number;
+  reason?: string;
+  message?: string;
+  status?: string;
+  error?: string;
+  recommendation?: string;
+  findings?: number;
+  /** scan_end: los escaneres bloquean el release / cuales no corrieron */
+  blocked?: boolean;
+  degraded?: string[];
+}
+
+/** Fase abierta en este momento (solo mientras el run avanza). */
+export interface LiveWork {
+  phase: string;
+  role?: string;
+  provider?: string;
+  model?: string;
+  since: string;
+  tool?: string;
+  target?: string;
+}
+
 export interface RunDetail {
   change_id: string;
   state: RunState;
   busy: boolean;
+  live?: LiveWork | null;
   outcome: Outcome | null;
   artifacts: Artifact[];
   gate: {
@@ -362,6 +413,8 @@ export const api = {
   advance: (id: string, mode: "fake" | "adk") =>
     request<Outcome>("POST", `/api/runs/${enc(id)}/advance`, { mode }),
   pause: (id: string) => request<Outcome>("POST", `/api/runs/${enc(id)}/pause`),
+  activity: (id: string, after = 0) =>
+    request<{ items: ActivityEvent[]; last: number }>("GET", `/api/runs/${enc(id)}/activity?after=${after}`),
   retry: (id: string, body: { body: string; reason: string; profile_id: string; role: string; force?: boolean }) =>
     request<RunState>("POST", `/api/runs/${enc(id)}/retry`, body),
   decideGate: (id: string, gate: string, body: Json) =>
