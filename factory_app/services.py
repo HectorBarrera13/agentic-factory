@@ -290,6 +290,7 @@ def list_runs(project: Project) -> list[dict]:
                 "stop_reason": st.get("stop_reason") or "",
                 "created_at": st.get("created_at"),
                 "attempt": st.get("attempt", 1),
+                "paused": bool(st.get("paused")),
             }
         )
     return out

@@ -13,7 +13,7 @@ import threading
 import time
 from pathlib import Path
 
-from factory_app import control, services
+from factory_app import activity, control, services
 from factory_app import orchestrator as ORCH
 from factory_app.context import FACTORY_REPO, use_project
 from factory_app.project import Project, normalize_change_id
@@ -192,6 +192,7 @@ def detail(project: Project, manager: RunManager, change_id: str) -> dict:
         if gate
         else None,
         "findings": _findings(project, run, state),
+        "live": activity.live(run) if manager.busy(project, cid) else None,
         "worktree": state.get("worktree") if (project.root / str(state.get("worktree") or "-"))
         .exists() else None,
     }
@@ -260,5 +261,14 @@ def snapshot(project: Project | None, manager: RunManager) -> dict:
                 stamps[path.parent.name] = path.stat().st_mtime_ns
             except OSError:
                 continue
+    # actividad en vivo: cada evento nuevo (fase, tool, comando) cambia el snapshot
+    live = {}
+    if project.runs_dir.is_dir():
+        for path in project.runs_dir.glob(f"CR-*/{activity.ACTIVITY_FILE}"):
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            live[path.parent.name] = [st.st_mtime_ns, st.st_size]
     crs = project.cr_dir.stat().st_mtime_ns if project.cr_dir.is_dir() else 0
-    return {"version": manager.version, "runs": stamps, "crs": crs}
+    return {"version": manager.version, "runs": stamps, "crs": crs, "activity": live}

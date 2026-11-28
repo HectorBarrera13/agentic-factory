@@ -223,6 +223,28 @@ def test_retry_signs_as_po_and_reports_the_attempt_cap(client, project_dir):
     assert client.post("/api/runs/CR-001/retry", json={**body, "force": True}).status_code == 200
 
 
+def test_activity_endpoint_pages_and_snapshot_follows_it(client, project_dir):
+    from factory_app import activity
+
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    assert client.get("/api/runs/CR-001/activity").json() == {"items": [], "last": 0}
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    out = client.get("/api/runs/CR-001/activity").json()
+    kinds = [e["kind"] for e in out["items"]]
+    assert kinds[:2] == ["phase_start", "phase_end"] and "gate_open" in kinds
+    assert out["items"][0]["role"] == "intake" and out["last"] == len(out["items"])
+    assert client.get(f"/api/runs/CR-001/activity?after={out['last']}").json()["items"] == []
+    assert client.get("/api/runs/CR-999/activity").status_code == 400
+    # un evento nuevo cambia el snapshot del SSE (la UI se entera sin sondear)
+    p = Project(project_dir)
+    run = p.run_dir("CR-001")
+    before = runs_mod.snapshot(p, runs_mod.RunManager())
+    activity.emit("tool_start", run, phase="plan", tool="read_repo_file", target="x")
+    assert runs_mod.snapshot(p, runs_mod.RunManager()) != before
+    # sin fase abierta no hay "live" (el run no esta avanzando)
+    assert client.get("/api/runs/CR-001").json()["live"] is None
+
+
 # ---------------------------------------------------------------- flujo completo
 @pytest.mark.skipif(GIT is None, reason="git no disponible")
 def test_full_flow_through_the_api_reaches_ready_for_human_merge(client, project_dir):
@@ -461,10 +483,13 @@ def test_pause_from_the_api_cuts_the_run_and_resume_continues(client, monkeypatc
     assert out["kind"] == "paused" and out["mode"] == "adk"
     st = client.get("/api/runs/CR-001").json()["state"]
     assert st["status"] == "INTAKE_PENDING" and st["paused"]["status"] == "INTAKE_PENDING"
+    listed = {r["change_id"]: r for r in client.get("/api/runs").json()["items"]}
+    assert listed["CR-001"]["paused"] is True  # la lista de CRs lo muestra pausado
     monkeypatch.setattr(runs_mod.RunManager, "_executor", lambda self, mode: ORCH.FakeExecutor())
     out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
     assert out["kind"] == "awaiting" and out["gate"] == "requirements"
     assert "paused" not in client.get("/api/runs/CR-001").json()["state"]
+    assert client.get("/api/runs").json()["items"][0]["paused"] is False
 
 
 def test_models_in_use_report_probe_and_env_override(client, monkeypatch):

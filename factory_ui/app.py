@@ -468,6 +468,14 @@ def create_app(
     def run_detail(change_id: str):
         return runs_mod.detail(session.require(), session.runs, change_id)
 
+    @app.get("/api/runs/{change_id}/activity")
+    def run_activity(change_id: str, after: int = 0):
+        from factory_app import activity
+
+        p = session.require()
+        services.read_state(p, change_id)  # FactoryError si no existe
+        return activity.read(p.run_dir(change_id), after=after)
+
     @app.get("/api/runs/{change_id}/artifacts/{name}")
     def run_artifact(change_id: str, name: str):
         return {"name": name, "content": runs_mod.read_artifact(session.require(), change_id, name)}
