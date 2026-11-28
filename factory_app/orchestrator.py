@@ -30,7 +30,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import control
+from . import activity, control
 from .context import project, run_scope
 from .project import Limits
 
@@ -405,6 +405,73 @@ class ADKExecutor(AgentExecutor):
         return "\n\n".join(bits)
 
 
+PHASE_ROLE = {
+    "intake": "intake",
+    "plan": "planner",
+    "implement": "coder",
+    "fix": "coder",
+    "test_analysis": "test_analyst",
+    "review": "reviewer",
+    "security": "security",
+    "evidence": "evidence",
+}
+
+
+class _Tracked(AgentExecutor):
+    """Envuelve al ejecutor real y deja en activity.jsonl quien trabaja en que y cuanto
+    tarda (inicio/fin/error de cada fase y de la verificacion). No cambia resultados."""
+
+    def __init__(self, inner: AgentExecutor, run_dir: Path):
+        self.inner, self.run_dir = inner, run_dir
+
+    def _who(self, phase: str) -> dict:
+        role = PHASE_ROLE.get(phase, phase)
+        if isinstance(self.inner, FakeExecutor):
+            return {"role": role, "provider": "fake", "model": "simulación"}
+        try:
+            provider, model = project().config.agents.provider_model_for(role)
+        except Exception:  # noqa: BLE001 - rol sin config: se muestra sin modelo
+            provider, model = "", ""
+        return {"role": role, "provider": provider, "model": model}
+
+    def _timed(self, phase: str, who: dict, fn):
+        import time
+
+        activity.emit("phase_start", self.run_dir, phase=phase, **who)
+        t0 = time.monotonic()
+        try:
+            out = fn()
+        except control.Paused:
+            raise  # la pausa la registra advance() como evento propio
+        except BaseException as exc:
+            activity.emit(
+                "phase_error", self.run_dir, phase=phase, **who,
+                duration_ms=int((time.monotonic() - t0) * 1000),
+                message=f"{type(exc).__name__}: {exc}"[:300],
+            )
+            raise
+        return out, int((time.monotonic() - t0) * 1000)
+
+    def run_agent(self, phase: str, context: dict) -> dict:
+        who = self._who(phase)
+        out, ms = self._timed(phase, who, lambda: self.inner.run_agent(phase, context))
+        activity.emit(
+            "phase_end", self.run_dir, phase=phase, **who, duration_ms=ms,
+            recommendation=out.get("recommendation") if isinstance(out, dict) else None,
+        )
+        return out
+
+    def run_verification(self) -> dict:
+        who = {"role": "verify"}
+        out, ms = self._timed("verify", who, self.inner.run_verification)
+        tests, failed, _ = parse_verification(out)
+        activity.emit(
+            "phase_end", self.run_dir, phase="verify", **who, duration_ms=ms,
+            ok=bool(out.get("ok")), tests=tests, failed=failed,
+        )
+        return out
+
+
 # ================================================================= estado
 def _state_path(run_dir: Path) -> Path:
     return run_dir / "factory-state.json"
@@ -462,6 +529,8 @@ def _record_pause(change_id: str, why: str) -> None:
         reset = True
     state["paused"] = {"at": _now(), "status": state.get("status"), "reason": why,
                        "worktree_reset": reset}
+    activity.emit("paused", run_dir, status=state.get("status"), reason=why,
+                  worktree_reset=reset)
     state.setdefault("transitions", []).append(
         {"status": state.get("status"), "event": "PAUSED", "at": _now()})
     _state_path(run_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -474,6 +543,7 @@ def _resume_if_paused(change_id: str) -> None:
     state = _load_state(run_dir)
     if not state.pop("paused", None):
         return
+    activity.emit("resumed", run_dir, status=state.get("status"))
     state.setdefault("transitions", []).append(
         {"status": state.get("status"), "event": "RESUMED", "at": _now()})
     _state_path(run_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -509,6 +579,10 @@ def _open_gate(run_dir: Path, change_id: str, gate: str, why: str, state: dict, 
     (reanudar sin decision no invalida una decision registrada entre dos advance)."""
     if state.get("awaiting_gate") != gate:
         kw.update(awaiting_gate=gate, gate_opened_at=_now_precise())
+        activity.emit(
+            "gate_open", run_dir, gate=gate, reason=why,
+            roles=project().config.gates.roles.get(gate, []),
+        )
     if kw:
         _update_state(run_dir, **kw)
     raise AwaitingHuman(change_id, gate, why)
@@ -518,6 +592,7 @@ def _escalate(run_dir: Path, change_id: str, reason: str, **kw) -> dict:
     """ESCALATED + evidencia consolidada (factory-run.json, resumen, trazabilidad) para que
     un escalamiento tambien sea exportable y auditable."""
     kw.setdefault("awaiting_gate", "")
+    activity.emit("escalated", run_dir, reason=reason, gate=kw.get("awaiting_gate") or None)
     state = _update_state(
         run_dir, status="ESCALATED", stop_reason=reason, escalated_at=_now(), **kw
     )
@@ -573,6 +648,10 @@ def _apply_gate_decision(
     """Consume la decision: cierra el gate y la registra en human_gates.
     REJECTED/DEFERRED escalan (requirements, plan, review); no hay continuacion automatica."""
     _write_gate_artifact(run_dir, gate, decision)
+    activity.emit(
+        "gate_decision", run_dir, gate=gate, decision=decision["decision"],
+        by=decision.get("recorded_by"),
+    )
     gates = {**state["human_gates"], gate: decision["decision"]}
     if decision["decision"] in {"APPROVED", "MODIFIED"}:
         return _update_state(run_dir, awaiting_gate="", human_gates=gates)
@@ -827,12 +906,18 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
     Durante el avance el run queda activo: las tools trabajan en SU worktree."""
     change_id = change_id.strip().upper()
     with run_scope(change_id):
+        run_dir = project().run_dir(change_id)
         _resume_if_paused(change_id)
-        try:
-            return _advance(change_id, executor or FakeExecutor())
-        except control.Paused as exc:
-            _record_pause(change_id, str(exc))
-            raise
+        tracked = _Tracked(executor or FakeExecutor(), run_dir)
+        with activity.track(run_dir):
+            try:
+                state = _advance(change_id, tracked)
+            except control.Paused as exc:
+                _record_pause(change_id, str(exc))
+                raise
+        if state.get("status") in {"READY FOR HUMAN MERGE", "NOT READY"}:
+            activity.emit("done", run_dir, status=state["status"])
+        return state
 
 
 def _advance(change_id: str, executor: AgentExecutor) -> dict:
@@ -1025,6 +1110,8 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                     verification=ver,
                 )
                 raise Blocked(f"{change_id}: verification FAIL persistente -> ESCALATED a humano")
+            activity.emit("fix_round", run_dir, fix="verify", n=verify_rounds + 1,
+                          cap=limits.verify_rounds)
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
@@ -1083,8 +1170,14 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
             from .scanners import run_security_scans
 
+            activity.emit("scan_start", run_dir, phase="security", role="security")
             scans = run_security_scans(
                 project().work_root(change_id), project().semgrep_targets()
+            )
+            activity.emit(
+                "scan_end", run_dir, phase="security", role="security",
+                blocked=bool(scans["blocked"]),
+                degraded=scans["degraded_scanners"] or None,
             )
             scan_rows = [
                 f"{f['id']} | HIGH | - | {f.get('file')}:{f.get('line')} | "
@@ -1163,6 +1256,8 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 + _read(run_dir / "09-security-report.md")
             )
             details = "\n".join(segments.get(fid, fid).strip() for fid in blocking)
+            activity.emit("fix_round", run_dir, fix="review", n=review_rounds + 1,
+                          cap=limits.review_rounds, findings=blocking)
             _update_state(
                 run_dir,
                 status="IMPLEMENT_PENDING",
@@ -1179,7 +1274,16 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
     # ---- 6 EVIDENCIA + gate release
     if status == "EVIDENCE_PENDING":
         state = _load_state(run_dir)
+        first = not state.get("evidence")
+        if first:
+            import time
+
+            activity.emit("phase_start", run_dir, phase="evidence", role="evidence")
+            t0 = time.monotonic()
         _write_consolidated_evidence(change_id, state, run_dir)
+        if first:
+            activity.emit("phase_end", run_dir, phase="evidence", role="evidence",
+                          duration_ms=int((time.monotonic() - t0) * 1000))
         decision = _gate_decision(run_dir, "release", state)
         if decision is None:
             _open_gate(
@@ -1191,6 +1295,10 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 **({} if state.get("evidence") == "CONSOLIDATED" else {"evidence": "CONSOLIDATED"}),
             )
         verdict = decision["decision"]
+        activity.emit(
+            "gate_decision", run_dir, gate="release", decision=verdict,
+            by=decision.get("recorded_by"),
+        )
         final = {"APPROVED": "READY FOR HUMAN MERGE", "REJECTED": "NOT READY"}.get(
             verdict, "ESCALATED"
         )
@@ -1203,6 +1311,8 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             release_decision=decision,
             **({"stop_reason": f"gate release: {verdict}"} if final == "ESCALATED" else {}),
         )
+        if final == "ESCALATED":
+            activity.emit("escalated", run_dir, reason=f"gate release: {verdict}")
         (run_dir / "15-release-decision.json").write_text(
             json.dumps({**decision, "final_status": final}, indent=2), encoding="utf-8"
         )

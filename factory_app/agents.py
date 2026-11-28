@@ -17,7 +17,7 @@ Configuracion comun:
 from google.adk.agents.llm_agent import LlmAgent
 from google.genai import types
 
-from .audit import record_tool_call, record_tool_error
+from .audit import record_tool_call, record_tool_error, record_tool_start
 from .context import project
 from .models import build_llm
 from .probe import temperature_supported
@@ -88,6 +88,7 @@ def _agent(name: str, description: str, instruction: str, tools: list, output_ke
         output_key=output_key,
         generate_content_config=config,
         # Auditoria: cada llamada a tool queda en runs/<CR>/tool-calls.jsonl.
+        before_tool_callback=record_tool_start,
         after_tool_callback=record_tool_call,
         on_tool_error_callback=record_tool_error,
     )
