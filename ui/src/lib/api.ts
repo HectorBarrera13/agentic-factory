@@ -112,7 +112,7 @@ export interface ProjectConfig {
     temperature: number;
     roles: Record<string, AgentOverride>;
   };
-  limits: { verify_rounds: number; review_rounds: number };
+  limits: { verify_rounds: number; review_rounds: number; clarification_rounds: number; attempts: number };
   gates: { roles: Record<string, string[]> };
   scanners: { semgrep_targets: string[] };
   ids: { acceptance: string; requirement: string };
@@ -189,6 +189,7 @@ export interface RunSummary {
   awaiting_gate: string;
   stop_reason: string;
   created_at?: string;
+  attempt?: number;
   busy?: boolean;
 }
 
@@ -231,7 +232,22 @@ export interface RunState {
   worktree?: string;
   /** Pausa humana: el run quedo en `status` (su ultimo checkpoint). */
   paused?: { at: string; status: string; reason: string; worktree_reset: boolean };
+  /** Intento actual del CR (1 si nunca se reintento). */
+  attempt?: number;
+  previous_attempts?: PreviousAttempt[];
+  retry?: { by: string; role: string; reason: string; at: string; forced: boolean; cr_changed: boolean };
+  /** Respuestas del PO a pedidos de aclaracion (acumuladas, con tope por intento). */
+  po_clarifications?: { n: number; gate: string; reason: string; by: string; at: string }[];
   [key: string]: unknown;
+}
+
+export interface PreviousAttempt {
+  n: number;
+  status: string;
+  stop_reason: string;
+  branch: string | null;
+  archive: string;
+  archived_at: string;
 }
 
 export interface RunDetail {
@@ -270,10 +286,13 @@ export interface Detected {
 export class ApiError extends Error {
   status: number;
   details?: unknown;
-  constructor(message: string, status: number, details?: unknown) {
+  /** Caso concreto del backend (p. ej. "attempts_exhausted") para reaccionar sin parsear. */
+  code?: string;
+  constructor(message: string, status: number, details?: unknown, code?: string) {
     super(message);
     this.status = status;
     this.details = details;
+    this.code = code;
   }
 }
 
@@ -292,10 +311,10 @@ async function request<T>(method: string, url: string, body?: unknown): Promise<
     data = text;
   }
   if (!res.ok) {
-    const obj = (data ?? {}) as { error?: string; detail?: unknown; details?: unknown };
+    const obj = (data ?? {}) as { error?: string; detail?: unknown; details?: unknown; code?: string };
     let message = obj.error ?? `Error ${res.status}`;
     if (!obj.error && Array.isArray(obj.detail)) message = "Datos invalidos";
-    throw new ApiError(message, res.status, obj.details ?? obj.detail);
+    throw new ApiError(message, res.status, obj.details ?? obj.detail, obj.code);
   }
   return data as T;
 }
@@ -323,7 +342,7 @@ export const api = {
 
   crs: () => request<{ items: ChangeRequest[] }>("GET", "/api/crs"),
   cr: (id: string) =>
-    request<{ change_id: string; file: string; body: string; frozen: boolean }>(
+    request<{ change_id: string; file: string; body: string; frozen: boolean; retryable: boolean }>(
       "GET",
       `/api/crs/${enc(id)}`,
     ),
@@ -343,6 +362,8 @@ export const api = {
   advance: (id: string, mode: "fake" | "adk") =>
     request<Outcome>("POST", `/api/runs/${enc(id)}/advance`, { mode }),
   pause: (id: string) => request<Outcome>("POST", `/api/runs/${enc(id)}/pause`),
+  retry: (id: string, body: { body: string; reason: string; profile_id: string; role: string; force?: boolean }) =>
+    request<RunState>("POST", `/api/runs/${enc(id)}/retry`, body),
   decideGate: (id: string, gate: string, body: Json) =>
     request<Json>("POST", `/api/runs/${enc(id)}/gates/${enc(gate)}`, body),
   decideFindings: (id: string, body: Json) =>

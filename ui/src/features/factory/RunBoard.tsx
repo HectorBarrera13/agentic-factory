@@ -11,6 +11,7 @@ import {
   History,
   Pause,
   Play,
+  RotateCcw,
   Settings2,
   Trash2,
 } from "lucide-react";
@@ -36,6 +37,10 @@ import { cn, formatTime, languageFor } from "@/lib/utils";
 import { FindingsTable } from "./FindingsTable";
 import { GateCard } from "./GateCard";
 import { PhaseStepper } from "./PhaseStepper";
+import { RetryDialog } from "./RetryDialog";
+
+/** Terminados que admiten Reintentar (nuevo intento del CR editado). */
+const RETRYABLE = ["ESCALATED", "NOT READY"];
 
 const OUTCOME_COPY: Record<string, { tone: "info" | "warning" | "danger" | "success"; title: string }> = {
   running: { tone: "info", title: "Avanzando…" },
@@ -87,6 +92,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
   const [tab, setTab] = React.useState("artifacts");
   const [artifact, setArtifact] = React.useState<string | null>(null);
   const [starting, setStarting] = React.useState(false);
+  const [retrying, setRetrying] = React.useState(false);
 
   if (run.error && !run.data) {
     return <div className="p-6"><Callout tone="danger" title="No se pudo cargar el run">{run.error}</Callout></div>;
@@ -95,7 +101,11 @@ export function RunBoard({ changeId }: { changeId: string }) {
   if (!d || !meta) return <div className="p-6 text-sm text-muted-foreground">Cargando run…</div>;
 
   const st = d.state;
-  const terminal = TERMINAL.includes(st.status);
+  // un ESCALATED por ambiguedad con su gate abierto se reanuda: no es terminal en la UI
+  const resumable = st.status === "ESCALATED" && Boolean(st.awaiting_gate);
+  const terminal = TERMINAL.includes(st.status) && !resumable;
+  const retryable = RETRYABLE.includes(st.status) && !d.busy;
+  const attempts = session?.project?.config.limits?.attempts ?? 3;
   const signature = signer.profile ? { profile_id: signer.profile.id, role: signer.role } : null;
 
   const models = inUse.data?.items ?? [];
@@ -154,6 +164,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
             <Badge tone={statusTone(st.status, st.awaiting_gate)}>{statusLabel(st.status, st.awaiting_gate)}</Badge>
             {d.busy ? <Badge tone="info">{isPausing ? "pausando…" : "en curso"}</Badge> : null}
             {paused ? <Badge tone="warning"><Pause className="size-3" /> Pausada en {statusLabel(paused.status)}</Badge> : null}
+            {(st.attempt ?? 1) > 1 ? <Badge tone={(st.attempt ?? 1) > attempts ? "warning" : "neutral"}>Intento {st.attempt}/{attempts}</Badge> : null}
           </div>
           <p className="mt-0.5 text-xs text-muted-foreground">
             {st.branch ? <>rama <span className="font-mono">{st.branch}</span> · </> : null}
@@ -161,6 +172,11 @@ export function RunBoard({ changeId }: { changeId: string }) {
           </p>
         </div>
         <div className="flex-1" />
+        {retryable ? (
+          <Button variant="outline" size="sm" onClick={() => setRetrying(true)} title="Editar el CR y correr un intento nuevo (el actual se archiva)">
+            <RotateCcw /> Reintentar
+          </Button>
+        ) : null}
         {!terminal ? (
           <div className="flex items-center gap-2">
             <Select aria-label="Modo de ejecución" className="h-8 w-64 text-xs" value={mode} disabled={d.busy} onChange={(e) => setMode(e.target.value as Mode)}>
@@ -201,7 +217,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
           {!terminal && notOk.length ? <ModelWarning items={notOk} /> : null}
           {!terminal ? <EnvOverrideNote items={models} /> : null}
 
-          <RunAlerts detail={d} />
+          <RunAlerts detail={d} clarificationCap={session?.project?.config.limits?.clarification_rounds ?? 3} />
 
           {d.gate ? (
             <GateCard
@@ -267,18 +283,31 @@ export function RunBoard({ changeId }: { changeId: string }) {
           </Card>
         </div>
       </div>
+      <RetryDialog open={retrying} onOpenChange={setRetrying} state={st} onRetried={run.reload} />
     </div>
   );
 }
 
-function RunAlerts({ detail }: { detail: RunDetail }) {
+function RunAlerts({ detail, clarificationCap }: { detail: RunDetail; clarificationCap: number }) {
   const st = detail.state;
   const o = detail.outcome;
   const alerts: React.ReactNode[] = [];
-  if (st.status === "ESCALATED" || st.status === "NOT READY") {
+  const used = st.po_clarifications?.length ?? 0;
+  if (st.status === "ESCALATED" && st.awaiting_gate) {
     alerts.push(
-      <Callout key="stop" tone="danger" icon={<AlertTriangle />} title={st.status === "ESCALATED" ? "Run escalado a un humano" : "No listo para merge"}>
-        {st.stop_reason || "Sin motivo registrado."}
+      <Callout key="stop" tone="warning" icon={<AlertTriangle />} title="Escalado: el agente pide una aclaración (reanudable)">
+        <p>{st.stop_reason || "Sin motivo registrado."}</p>
+        <p className="mt-1">
+          Registra tu aclaración como decisión en el gate <span className="font-mono">{st.awaiting_gate}</span> y pulsa Avanzar, o
+          edita el CR con Reintentar. Aclaraciones usadas: {used}/{clarificationCap}.
+        </p>
+      </Callout>,
+    );
+  } else if (st.status === "ESCALATED" || st.status === "NOT READY") {
+    alerts.push(
+      <Callout key="stop" tone="danger" icon={<AlertTriangle />} title={st.status === "ESCALATED" ? "Run escalado a un humano (no se reanuda)" : "No listo para merge"}>
+        <p>{st.stop_reason || "Sin motivo registrado."}</p>
+        <p className="mt-1">Usa Reintentar para editar el CR y correr un intento nuevo; este intento se archiva y su rama se conserva.</p>
       </Callout>,
     );
   } else if (st.status === "READY FOR HUMAN MERGE") {
@@ -563,6 +592,25 @@ function StateSummary({ detail }: { detail: RunDetail }) {
     ["Review", st.review ? `${st.review.status} · must fix ${st.review.must_fix} · should fix ${st.review.should_fix}` : "—"],
     ["Seguridad", st.security ? `${st.security.status} · high ${st.security.high} · medium ${st.security.medium}` : "—"],
     ["Worktree", detail.worktree ? <span className="font-mono">{detail.worktree}</span> : "—"],
+    ...(st.po_clarifications?.length
+      ? [["Aclaraciones PO", <ol key="c" className="list-decimal pl-4">{st.po_clarifications.map((c) => <li key={c.n}>{c.reason} <span className="text-muted-foreground">({c.by})</span></li>)}</ol>] as [string, React.ReactNode]]
+      : []),
+    ...(st.previous_attempts?.length
+      ? [[
+          "Intentos previos",
+          <ul key="a" className="space-y-1">
+            {st.previous_attempts.map((a) => (
+              <li key={a.n}>
+                <span className="font-medium">#{a.n} {statusLabel(a.status)}</span> — {a.stop_reason || "—"}
+                <div className="text-muted-foreground">
+                  archivo <span className="font-mono">{a.archive}</span>
+                  {a.branch ? <> · rama <span className="font-mono">{a.branch}</span></> : null}
+                </div>
+              </li>
+            ))}
+          </ul>,
+        ] as [string, React.ReactNode]]
+      : []),
   ];
   return (
     <div className="space-y-4 p-4">

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RunBoard } from "@/features/factory/RunBoard";
 import { OpenProjectDialog } from "@/features/project/OpenProject";
 import {
+  ApiError,
   api,
   type Meta,
   type ModelInUse,
@@ -178,6 +179,75 @@ describe("RunBoard", () => {
     expect(screen.queryByRole("button", { name: /Pausar/ })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Reanudar/ }));
     expect(advance).toHaveBeenCalledWith("CR-001", "adk");
+  });
+});
+
+describe("Escalado y Reintentar", () => {
+  const PO = { id: "p1", name: "Ana", roles: ["product owner"] };
+  const withPo = () => {
+    vi.spyOn(api, "session").mockResolvedValue({ ...SESSION, profiles: [PO] });
+    localStorage.setItem("factory.signer", JSON.stringify({ id: "p1", role: "product owner" }));
+  };
+  const mockRun = (st: Partial<RunState>) => {
+    mockBase(detail({}, st), [model("OK")]);
+    withPo();
+    vi.spyOn(api, "cr").mockResolvedValue({ change_id: "CR-001", file: "crs/CR-001.md", body: "# CR-001\nviejo", frozen: true, retryable: true });
+  };
+
+  it("Reintentar aparece en ESCALATED y NOT READY, no en READY", async () => {
+    mockRun({ status: "READY FOR HUMAN MERGE" });
+    const { unmount } = render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
+    expect((await screen.findAllByText("Listo para merge humano")).length).toBeGreaterThan(0);
+    expect(screen.queryByRole("button", { name: /Reintentar/ })).not.toBeInTheDocument();
+    unmount();
+    vi.restoreAllMocks();
+    mockRun({ status: "NOT READY", stop_reason: "gate release: REJECTED" });
+    render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
+    expect(await screen.findByRole("button", { name: /Reintentar/ })).toBeInTheDocument();
+  });
+
+  it("el escalado definitivo y el reanudable se explican distinto", async () => {
+    mockRun({ status: "ESCALATED", stop_reason: "gate plan: REJECTED" });
+    const { unmount } = render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
+    expect(await screen.findByText(/no se reanuda/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Avanzar/ })).not.toBeInTheDocument();
+    unmount();
+    vi.restoreAllMocks();
+    mockRun({
+      status: "ESCALATED",
+      awaiting_gate: "requirements",
+      stop_reason: "intake: requiere clarificacion del Product Owner",
+      po_clarifications: [{ n: 1, gate: "requirements", reason: "r1", by: "Ana (Product Owner)", at: "x" }],
+    });
+    render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
+    expect(await screen.findByText(/reanudable/)).toBeInTheDocument();
+    expect(screen.getByText(/Aclaraciones usadas: 1\/3/)).toBeInTheDocument();
+    // reanudable: Avanzar sigue disponible (antes quedaba oculto por ser ESCALATED)
+    expect(screen.getByRole("button", { name: /Avanzar/ })).toBeInTheDocument();
+  });
+
+  it("envia el CR editado, el motivo y la firma; el tope pide confirmar y fuerza", async () => {
+    mockRun({ status: "ESCALATED", stop_reason: "gate plan: REJECTED", attempt: 3 });
+    const retry = vi
+      .spyOn(api, "retry")
+      .mockRejectedValueOnce(new ApiError("ya lleva 3 intentos", 400, undefined, "attempts_exhausted"))
+      .mockResolvedValueOnce(runState({ attempt: 4 }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
+    expect(await screen.findByText("Intento 3/3")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /Reintentar/ }));
+    const editor = await screen.findByLabelText("Contenido del CR");
+    await waitFor(() => expect(editor).toHaveValue("# CR-001\nviejo"));
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "# CR-001 nuevo");
+    await userEvent.type(screen.getByLabelText("Motivo del reintento"), "alcance aclarado");
+    const buttons = screen.getAllByRole("button", { name: /Reintentar/ });
+    await userEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    const base = { body: "# CR-001 nuevo", reason: "alcance aclarado", profile_id: "p1", role: "product owner" };
+    expect(retry).toHaveBeenNthCalledWith(1, "CR-001", { ...base, force: false });
+    expect(confirm).toHaveBeenCalled();
+    expect(retry).toHaveBeenNthCalledWith(2, "CR-001", { ...base, force: true });
   });
 });
 

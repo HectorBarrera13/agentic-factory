@@ -172,6 +172,12 @@ export function SettingsView() {
                       <Field label="Rondas de review → Coder Fix">
                         <Input type="number" min={1} max={10} value={draft.limits.review_rounds} onChange={(e) => patch((c) => (c.limits.review_rounds = Number(e.target.value)))} />
                       </Field>
+                      <Field label="Aclaraciones del PO por intento" hint="Al agotarse, el run se escala sin gate abierto: solo sigue con Reintentar.">
+                        <Input type="number" min={1} max={10} value={draft.limits.clarification_rounds} onChange={(e) => patch((c) => (c.limits.clarification_rounds = Number(e.target.value)))} />
+                      </Field>
+                      <Field label="Intentos por CR" hint="Pasado el tope, Reintentar pide confirmación explícita.">
+                        <Input type="number" min={1} max={10} value={draft.limits.attempts} onChange={(e) => patch((c) => (c.limits.attempts = Number(e.target.value)))} />
+                      </Field>
                     </div>
                   </Card>
                 </TabsContent>
