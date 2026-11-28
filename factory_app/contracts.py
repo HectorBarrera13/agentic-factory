@@ -47,7 +47,8 @@ CONTRACTS: dict[str, dict] = {
     "coder": {
         "agent": "CoderAgent",
         "role": "Coder Agent — implementa solo el plan aprobado o los findings autorizados",
-        "context": ["03-implementation-plan.md aprobado", "findings ACCEPTED/MODIFIED bloqueantes"],
+        "context": ["03-implementation-plan.md aprobado",
+                    "findings ACCEPTED/MODIFIED bloqueantes (o marcados por el Human Reviewer)"],
         "allow": ["list_repo_files", "read_repo_file", "write_product_file"],
         "deny": ["write_run_evidence", "edit_requirements", "edit_factory", "self_approve",
                  *GLOBAL_DENY],

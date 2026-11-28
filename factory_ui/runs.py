@@ -135,12 +135,18 @@ def _artifacts(run: Path) -> list[dict]:
     ]
 
 
+def _finding_source(fid: str) -> str:
+    """Quien encontro el finding: Reviewer IA, Human Reviewer, Security o escaner."""
+    if fid.startswith("SEC-SCAN-"):
+        return "scanner"
+    return {"RF": "reviewer", "HR": "human", "SEC": "security"}.get(fid.split("-", 1)[0], "")
+
+
 def _findings(project: Project, run: Path, state: dict) -> dict:
     ids = sorted(services.report_finding_ids(run))
     with use_project(project):
         severities = ORCH.finding_severities(run)
-        reports = [ORCH._read(run / n) for n in ("08-review-report.md", "09-security-report.md")]
-        segments = ORCH.finding_segments("\n".join(reports))
+        segments = ORCH.report_segments(run)
     path = run / "human-findings-decisions.json"
     decided = {}
     # Con review abierto se muestra lo que se va clasificando; ya cerrado, lo que se decidio
@@ -149,14 +155,17 @@ def _findings(project: Project, run: Path, state: dict) -> dict:
     review_closed = (state.get("human_gates") or {}).get("review", "PENDING") != "PENDING"
     if path.is_file() and (review_open or review_closed):
         data = json.loads(path.read_text(encoding="utf-8"))
-        decided = {d["finding_id"]: d["decision"] for d in data.get("decisions", [])}
+        decided = {d["finding_id"]: d for d in data.get("decisions", [])}
     return {
         "items": [
             {
                 "id": fid,
                 "severity": severities.get(fid, "UNKNOWN"),
                 "blocking": severities.get(fid, "MUST FIX") in ORCH.BLOCKING_SEVERITIES,
-                "decision": decided.get(fid),
+                "decision": (decided.get(fid) or {}).get("decision"),
+                "reason": (decided.get(fid) or {}).get("reason") or "",
+                "human_blocking": (decided.get(fid) or {}).get("blocking") is True,
+                "source": _finding_source(fid),
                 "excerpt": segments.get(fid, "").strip()[:600],
             }
             for fid in ids

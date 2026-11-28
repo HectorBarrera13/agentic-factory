@@ -64,6 +64,8 @@ export interface ProbeResult {
   temperature_supported: boolean | null;
   at: number;
   seconds: number;
+  /** "run": el resultado viene de una fase real que agoto la cuota, no de la prueba. */
+  source?: "run";
 }
 
 export interface ModelInUse {
@@ -236,9 +238,27 @@ export interface Outcome {
 export interface Finding {
   id: string;
   severity: string;
+  /** Bloqueante por su severidad (MUST FIX / HIGH). */
   blocking: boolean;
   decision: string | null;
   excerpt: string;
+  /** Motivo del Human Reviewer para esta clasificacion. */
+  reason?: string;
+  /** Marcado "corregir en este ciclo" por el Human Reviewer. */
+  human_blocking?: boolean;
+  source?: "reviewer" | "human" | "security" | "scanner" | "";
+}
+
+/** Veredicto de un finding: solo la decision, o con motivo / "corregir en este ciclo". */
+export type FindingVerdict = string | { decision: string; reason?: string; blocking?: boolean };
+
+/** Finding propio del Human Reviewer (queda como HR-NN). */
+export interface AddedFinding {
+  severity: string;
+  title: string;
+  detail?: string;
+  ac?: string;
+  blocking?: boolean;
 }
 
 export interface Artifact {
@@ -470,7 +490,7 @@ export const api = {
   decideGate: (id: string, gate: string, body: Json) =>
     request<Json>("POST", `/api/runs/${enc(id)}/gates/${enc(gate)}`, body),
   decideFindings: (id: string, body: Json) =>
-    request<{ decisions: unknown[]; pending: string[] }>(
+    request<{ decisions: unknown[]; pending: string[]; added?: string[] }>(
       "POST",
       `/api/runs/${enc(id)}/findings`,
       body,

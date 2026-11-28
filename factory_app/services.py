@@ -19,8 +19,14 @@ from .roles import FactoryError, validate_role
 VALID_GATES = ("requirements", "plan", "review", "release")
 VALID_DECISIONS = ("APPROVED", "MODIFIED", "REJECTED", "DEFERRED")
 VERDICTS = ("ACCEPTED", "REJECTED", "MODIFIED", "DEFERRED")
-FINDING_RE = re.compile(r"^(RF|SEC|SEC-SCAN)-\d{2,}$")
-REPORT_ID_RE = re.compile(r"\b(?:RF|SEC(?:-SCAN)?)-\d{2,}\b")
+FINDING_RE = re.compile(r"^(RF|HR|SEC|SEC-SCAN)-\d{2,}$")
+REPORT_ID_RE = re.compile(r"\b(?:RF|HR|SEC(?:-SCAN)?)-\d{2,}\b")
+# mismos nombres que orchestrator.FINDING_REPORTS (services no importa el motor)
+HUMAN_FINDINGS = "08b-human-review-findings.md"
+FINDING_REPORTS = ("08-review-report.md", HUMAN_FINDINGS, "09-security-report.md")
+FIX_VERDICTS = ("ACCEPTED", "MODIFIED")  # los unicos que pueden autorizar un Coder Fix
+HUMAN_SEVERITIES = ("MUST FIX", "SHOULD FIX")  # findings que añade el Human Reviewer
+MAX_FINDING_TEXT = 2000
 TERMINAL = ("READY FOR HUMAN MERGE", "NOT READY", "ESCALATED")
 EXPORT_REQUIRED = (
     "00-change-request.md",
@@ -82,11 +88,14 @@ def list_change_requests(project: Project) -> list[dict]:
             continue
         text = path.read_text(encoding="utf-8", errors="replace")
         lines = text.splitlines()
-        title = next(
-            (line[2:].strip() for line in lines if line.startswith("# ")),
-            next((line.lstrip("# ").strip() for line in lines if line.startswith("#")), path.stem),
-        )
         cid = m.group(1).upper()
+        title = next((line[2:].strip() for line in lines if line.startswith("# ")), None)
+        if title is None:
+            # sin H1 (CRs antiguos): el nombre del archivo dice mas que su primer "## Problema"
+            slug = path.stem[len(m.group(1)) :].strip("-_ ")
+            title = slug.replace("-", " ").replace("_", " ").strip().capitalize() or next(
+                (line.lstrip("# ").strip() for line in lines if line.startswith("#")), cid
+            )
         out.append(
             {
                 "change_id": cid,
@@ -506,10 +515,11 @@ def list_runs(project: Project) -> list[dict]:
 
 def report_finding_ids(run: Path) -> set[str]:
     """IDs de finding presentes en los reportes de la ronda actual."""
-    text = ""
-    for name in ("08-review-report.md", "09-security-report.md"):
-        if (run / name).is_file():
-            text += (run / name).read_text(encoding="utf-8") + "\n"
+    text = "\n".join(
+        (run / name).read_text(encoding="utf-8")
+        for name in FINDING_REPORTS
+        if (run / name).is_file()
+    )
     return set(REPORT_ID_RE.findall(text))
 
 
@@ -568,23 +578,78 @@ def approve_gate(
     return evidence
 
 
+def _verdict(fid: str, raw: object) -> dict:
+    """Normaliza "ACCEPTED" o {"decision", "reason"?, "blocking"?} a una decision validada."""
+    data = raw if isinstance(raw, dict) else {"decision": raw}
+    verdict = str(data.get("decision") or "").strip().upper()
+    if verdict not in VERDICTS:
+        raise FactoryError(f"verdict invalido para {fid}: {verdict} -> {sorted(VERDICTS)}")
+    reason = str(data.get("reason") or "").strip()
+    if len(reason) > MAX_FINDING_TEXT:
+        raise FactoryError(f"motivo de {fid} demasiado largo (max {MAX_FINDING_TEXT})")
+    blocking = bool(data.get("blocking"))
+    if blocking and verdict not in FIX_VERDICTS:
+        raise FactoryError(
+            f"{fid}: solo un finding ACCEPTED o MODIFIED se puede corregir en este ciclo"
+        )
+    return {"finding_id": fid, "decision": verdict, "reason": reason, "blocking": blocking}
+
+
+def _added_findings(run: Path, added: list[dict], recorded_by: str) -> tuple[list[str], list[dict]]:
+    """Findings del Human Reviewer -> filas HR-NN (mismo formato que el Reviewer IA) y su
+    decision ACCEPTED. Valida todo antes de escribir nada."""
+    path = run / HUMAN_FINDINGS
+    taken = [int(n) for n in re.findall(r"\bHR-(\d{2,})\b", _read_text(path))]
+    rows, decisions = [], []
+    for i, item in enumerate(added, start=(max(taken) if taken else 0) + 1):
+        severity = str(item.get("severity") or "").strip().upper()
+        if severity not in HUMAN_SEVERITIES:
+            raise FactoryError(f"severidad invalida: {severity} -> {list(HUMAN_SEVERITIES)}")
+        title = " ".join(str(item.get("title") or "").split()).replace("|", "/")
+        detail = " ".join(str(item.get("detail") or "").split()).replace("|", "/")
+        ac = " ".join(str(item.get("ac") or "").split()).replace("|", "/") or "-"
+        if not title:
+            raise FactoryError("cada finding añadido necesita un titulo")
+        if len(title) > 200 or len(detail) > MAX_FINDING_TEXT or len(ac) > 40:
+            raise FactoryError("finding añadido demasiado largo")
+        fid = f"HR-{i:02d}"
+        text = f"{title}: {detail}" if detail else title
+        rows.append(f"{fid} | {severity} | {ac} | - | {text} (por {recorded_by})")
+        decisions.append({"finding_id": fid, "decision": "ACCEPTED",
+                          "reason": "añadido por el Human Reviewer",
+                          "blocking": bool(item.get("blocking"))})
+    return rows, decisions
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8") if path.is_file() else ""
+
+
 def decide_findings(
-    project: Project, change_id: str, verdicts: dict[str, str], recorded_by: str
+    project: Project,
+    change_id: str,
+    verdicts: dict[str, object],
+    recorded_by: str,
+    added: list[dict] | None = None,
 ) -> dict:
     """Clasificacion humana por finding. Las llamadas de una ronda se ACUMULAN (la ultima
-    decision por finding gana). Devuelve {"decisions", "pending", "path"}."""
+    decision por finding gana). Cada veredicto es "ACCEPTED" o {decision, reason, blocking}:
+    `blocking` = "corregir en este ciclo" (escala un finding no bloqueante al Coder Fix).
+    `added` son findings propios del Human Reviewer (HR-NN, aceptados por quien los añade).
+    Devuelve {"decisions", "pending", "added", "path"}."""
     cid = _cid(change_id)
     role = validate_role("findings", recorded_by, project.config.gates.roles)
-    if not verdicts:
+    added = list(added or [])
+    if not verdicts and not added:
         raise FactoryError("Include at least one FINDING=VERDICT pair")
     decisions = []
     for fid, verdict in verdicts.items():
-        fid, verdict = fid.strip().upper(), verdict.strip().upper()
+        fid = fid.strip().upper()
         if not FINDING_RE.match(fid):
-            raise FactoryError(f"finding id invalido: {fid} (usa RF-##, SEC-## o SEC-SCAN-##)")
-        if verdict not in VERDICTS:
-            raise FactoryError(f"verdict invalido para {fid}: {verdict} -> {sorted(VERDICTS)}")
-        decisions.append({"finding_id": fid, "decision": verdict})
+            raise FactoryError(
+                f"finding id invalido: {fid} (usa RF-##, HR-##, SEC-## o SEC-SCAN-##)"
+            )
+        decisions.append(_verdict(fid, verdict))
     state = read_state(project, cid)
     if state.get("awaiting_gate") != "review":
         raise FactoryError(
@@ -597,25 +662,39 @@ def decide_findings(
     unknown = [d["finding_id"] for d in decisions if known and d["finding_id"] not in known]
     if unknown:
         raise FactoryError(f"findings no presentes en los reportes del run: {unknown}")
+    rows, added_decisions = _added_findings(run, added, recorded_by)
+    if rows:
+        human = run / HUMAN_FINDINGS
+        header = "" if human.is_file() else (
+            f"# Findings del Human Reviewer — {cid}\n\n"
+            "Formato del Reviewer: id | severidad | AC | archivo | evidencia.\n\n"
+        )
+        with human.open("a", encoding="utf-8") as fh:
+            fh.write(header + "\n".join(rows) + "\n")
+        known |= {d["finding_id"] for d in added_decisions}
+    now = _now()
     path = run / "human-findings-decisions.json"
     merged: dict[str, dict] = {}
     if path.is_file():  # misma ronda: se acumula (las rondas previas ya fueron archivadas)
         for d in json.loads(path.read_text(encoding="utf-8")).get("decisions", []):
             merged[d["finding_id"]] = d
-    for d in decisions:
-        merged[d["finding_id"]] = d
+    for d in [*decisions, *added_decisions]:
+        merged[d["finding_id"]] = {**d, "recorded_by": recorded_by, "role": role,
+                                   "recorded_at": now}
     payload = {
         "change_id": cid,
         "gate": "findings",
         "decisions": sorted(merged.values(), key=lambda d: d["finding_id"]),
         "recorded_by": recorded_by,
         "role": role,
-        "recorded_at": _now(),
-        "note": "Los ACCEPTED/MODIFIED bloqueantes autorizan Coder Fix; el resto no cambia codigo.",
+        "recorded_at": now,
+        "note": "Los ACCEPTED/MODIFIED bloqueantes (MUST FIX/HIGH o marcados 'corregir en este "
+        "ciclo' por el Human Reviewer) autorizan Coder Fix; el resto no cambia codigo.",
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return {
         "decisions": payload["decisions"],
+        "added": [d["finding_id"] for d in added_decisions],
         "pending": sorted(known - set(merged)),
         "path": path.relative_to(project.root).as_posix(),
     }

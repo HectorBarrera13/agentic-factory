@@ -6,6 +6,7 @@ Solo sugiere; el humano revisa y guarda. Nada se escribe aqui.
 from __future__ import annotations
 
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -109,6 +110,19 @@ def _node(root: Path) -> dict:
     }
 
 
+def current_branch(root: Path) -> str | None:
+    """Rama actual del repo (None en detached HEAD, sin git o si git falla)."""
+    try:
+        out = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=root, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    branch = out.stdout.strip()
+    return branch if out.returncode == 0 and branch else None
+
+
 def detect(root: Path) -> dict:
     """{"config": ProjectConfig sugerida (dict), "notes": [...]} para revisar en el asistente."""
     root = Path(root).resolve()
@@ -126,8 +140,13 @@ def detect(root: Path) -> dict:
         notes.append("No se detecto el lenguaje: revisa areas y comandos.")
     if not found["commands"]:
         notes.append("Sin comandos de verificacion: la verificacion fallara hasta configurarlos.")
+    base_branch = "main"
     if not (root / ".git").exists():
         notes.append("La carpeta no es un repo git: sin git no hay rama ni worktree por run.")
+    elif branch := current_branch(root):
+        base_branch = branch
+        if branch != "main":
+            notes.append(f"Rama base: {branch} (la rama actual); cambiala en Git si no es esa.")
     missing = [s for s in found["source"] if not (root / s).exists()]
     if missing:
         notes.append(
@@ -145,6 +164,7 @@ def detect(root: Path) -> dict:
             "code": {"source": found["source"], "tests": tests, "language": found["language"]},
             "docs": docs,
             "verify": {"commands": found["commands"]},
+            "git": {"base_branch": base_branch},
         }
     )
     return {"config": config.model_dump(), "notes": notes,

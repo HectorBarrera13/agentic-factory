@@ -140,8 +140,23 @@ class RetryBody(BaseModel):
     force: bool = False
 
 
+class FindingVerdict(BaseModel):
+    decision: str
+    reason: str = ""
+    blocking: bool = False  # "corregir en este ciclo": escala un finding no bloqueante
+
+
+class AddedFinding(BaseModel):
+    severity: str
+    title: str
+    detail: str = ""
+    ac: str = ""
+    blocking: bool = False
+
+
 class FindingsBody(BaseModel):
-    verdicts: dict[str, str]
+    verdicts: dict[str, str | FindingVerdict] = {}
+    added: list[AddedFinding] = []
     profile_id: str
     role: str
 
@@ -540,7 +555,11 @@ def create_app(
     def decide_findings(change_id: str, body: FindingsBody):
         p = session.require()
         signed = _signature(session, body.profile_id, body.role)
-        return services.decide_findings(p, change_id, body.verdicts, signed)
+        verdicts = {
+            fid: v if isinstance(v, str) else v.model_dump() for fid, v in body.verdicts.items()
+        }
+        added = [a.model_dump() for a in body.added]
+        return services.decide_findings(p, change_id, verdicts, signed, added)
 
     @app.get("/api/runs/{change_id}/diff")
     def run_diff(change_id: str):

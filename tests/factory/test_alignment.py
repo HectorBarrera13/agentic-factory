@@ -167,6 +167,44 @@ def test_severity_parsing_same_line_before_segment():
     assert set(seg) == {"RF-01", "RF-02", "SEC-01"}
 
 
+REVIEW_E2E = (
+    "# Review CR-05\n\n"
+    "RF-01 | SHOULD FIX | AC-03 | js/app.js | no se llama a resolveConflicts\n"
+    "  la marca 'en conflicto' nunca llega al navegador\n\n"
+    "MUST FIX: 0\nSHOULD FIX: 1\n"
+)
+SECURITY_E2E = (
+    "# Security CR-05\n\nHIGH: 0\nMEDIUM: 0\n\n"
+    "## Hallazgos HIGH de escaner\nninguno\n\n```json\n{\"semgrep\": []}\n```\n"
+)
+
+
+def test_a_finding_excerpt_stops_at_the_end_of_its_own_report(tmp_path):
+    (tmp_path / "08-review-report.md").write_text(REVIEW_E2E, encoding="utf-8")
+    (tmp_path / "09-security-report.md").write_text(SECURITY_E2E, encoding="utf-8")
+    seg = ORCH.report_segments(tmp_path)["RF-01"]
+    assert seg.startswith("RF-01 | SHOULD FIX")
+    assert "nunca llega al navegador" in seg  # la linea de evidencia sigue siendo suya
+    for leak in ("SHOULD FIX: 1", "# Security", "HIGH: 0", "semgrep"):
+        assert leak not in seg
+    # la severidad sale de su fila, no del "HIGH: 0" del reporte de seguridad
+    assert ORCH.finding_severities(tmp_path) == {"RF-01": "SHOULD FIX"}
+
+
+def test_a_summary_mention_does_not_steal_the_start_of_the_finding():
+    text = "MUST FIX: 1 (RF-01, RF-02)\n\nRF-01 | MUST FIX | race\nRF-02 | SHOULD FIX | nombre\n"
+    seg = ORCH.finding_segments(text)
+    assert seg["RF-01"] == "RF-01 | MUST FIX | race\n"
+    assert seg["RF-02"] == "RF-02 | SHOULD FIX | nombre\n"
+
+
+def test_table_rows_and_headings_are_finding_rows():
+    text = "| RF-01 | MUST FIX | a |\n| RF-02 | SHOULD FIX | b |\n### SEC-01\nHIGH sql\n## Fin\n"
+    seg = ORCH.finding_segments(text)
+    assert seg["RF-01"] == "| RF-01 | MUST FIX | a |\n"
+    assert seg["SEC-01"] == "### SEC-01\nHIGH sql\n"
+
+
 # ---------------------------------------------------------------- #8 artefactos §17
 def test_instructivo_named_artifacts_are_written(sandbox):  # noqa: F811
     run = sandbox()
@@ -220,6 +258,76 @@ def test_traceability_links_only_what_evidence_supports(sandbox, monkeypatch):  
     assert one["findings"] == ["RF-01"] and one["decisions"] == ["ACCEPTED"]
     assert two["tasks"] == two["code"] == two["tests"] == [ORCH.UNMAPPED]
     assert ORCH.traceability_gaps(list(rows.values())) == 3
+
+
+def test_evidence_names_who_signed_each_gate_and_is_rewritten_after_release(sandbox):  # noqa: F811
+    run = sandbox()
+    drive(run, FakeExecutor(), stop_at="plan")
+    (run / "human-plan-decision.json").write_text(json.dumps({
+        "decision": "APPROVED", "reason": "ok", "recorded_by": "Tony (Product Owner)",
+        "role": "Product Owner",
+        "recorded_at": __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc).isoformat(),
+    }), encoding="utf-8")
+    drive(run, FakeExecutor())
+    run_json = json.loads((run / "factory-run.json").read_text())
+    assert run_json["gate_signers"]["plan"] == {
+        "by": "Tony (Product Owner)", "role": "Product Owner",
+        "at": run_json["gate_signers"]["plan"]["at"]}
+    summary = (run / "14-evidence-summary.md").read_text(encoding="utf-8")
+    assert "plan: APPROVED por Tony (Product Owner)" in summary
+    # tras el release, resumen y trazabilidad muestran el estado final
+    trace = (run / "traceability.md").read_text(encoding="utf-8")
+    assert "READY FOR HUMAN MERGE" in trace and "AWAITING RELEASE DECISION" not in trace
+    assert "release: APPROVED por" in trace
+
+
+PROSE_PLAN = """# Implementation Plan
+
+### B. Relay Server (`server/relay.mjs`)
+- Manages rooms.
+- **AC-01 Enforcement**: rejects the 6th connection.
+
+### C. Client UI (`js/app.js`, `index.html`)
+- Handles `?room=<id>` on load (AC-02).
+- Task 3: mark revisions "en conflicto" (AC-03)
+  - edits `sync.js` and renders the badge
+
+## 3. Likely Files
+1. **`js/sync.js` (NEW)**: pure logic.
+"""
+
+
+def test_traceability_reads_prose_plans_sections_and_task_names(sandbox, monkeypatch):  # noqa: F811
+    run = sandbox(
+        cr_text="# CR-T\n\n- AC-01 cupo\n- AC-02 enlace\n- AC-03 conflictos\n- AC-010 x\n"
+    )
+    p = ORCH.project()
+    monkeypatch.setattr(p.config.ids, "acceptance", r"AC-\d+")
+    (run / "03-implementation-plan.md").write_text(PROSE_PLAN, encoding="utf-8")
+    changed = "server/relay.mjs\njs/app.js\njs/sync.js\nindex.html\nREADME.md\n"
+    monkeypatch.setattr(ORCH, "_git", lambda args: SimpleNamespace(stdout=changed, returncode=0))
+    # como ada-07: carpetas Y un archivo suelto como areas de codigo
+    monkeypatch.setattr(ORCH, "_code_paths", lambda: ["server", "js", "index.html", "tests"])
+    rows = {r["ac"]: r for r in ORCH.compute_traceability(run)}
+    assert rows["AC-01"]["code"] == ["server/relay.mjs"]  # por el encabezado de su seccion
+    assert rows["AC-02"]["code"] == ["index.html", "js/app.js"]
+    assert rows["AC-03"]["tasks"] == ["T3"]  # "Task 3"
+    assert "js/sync.js" in rows["AC-03"]["code"]  # "sync.js" en su sub-vineta, unico en el diff
+    assert rows["AC-010"]["code"] == [ORCH.UNMAPPED]  # AC-01 no es AC-010
+
+
+def test_node_describe_blocks_cite_their_ac(sandbox, monkeypatch):  # noqa: F811
+    run = sandbox(cr_text="# CR-T\n\n- AC-02 enlace\n")
+    p = ORCH.project()
+    monkeypatch.setattr(p.config.ids, "acceptance", r"AC-\d+")
+    tests_dir = p.work_root(run.name) / p.config.code.tests
+    tests_dir.mkdir(parents=True, exist_ok=True)
+    (tests_dir / "test_sync.py").write_text(
+        'describe("Sync: URL Room Link Parsing (AC-02)", () => {\n'
+        '  it("extracts the room", () => {});\n});\n', encoding="utf-8")
+    rows = {r["ac"]: r for r in ORCH.compute_traceability(run)}
+    assert rows["AC-02"]["tests"] == ["test_sync.py::Sync: URL Room Link Parsing (AC-02)"]
 
 
 # ---------------------------------------------------------------- tools acotadas

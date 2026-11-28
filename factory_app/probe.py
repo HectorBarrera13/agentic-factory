@@ -10,6 +10,9 @@ ADK) con una tool trivial `ping`. Cuesta pocos tokens. Resultado:
 - QUOTA        sin cuota / rate limit (429)
 - ERROR        otro problema (mensaje incluido)
 
+Si una fase real agota la cuota del modelo, `record_runtime_failure` reemplaza el OK guardado
+por QUOTA (`source: "run"`): la prueba minima no garantiza la cuota de una fase entera.
+
 Ademas `temperature_supported`: si el proveedor rechaza el parametro temperature, se
 reintenta sin el y se marca False (los agentes lo omitiran para ese modelo).
 Los resultados se guardan en `~/.agentic-factory/model-probes.json` (sin claves).
@@ -217,6 +220,30 @@ def _probe(provider, model, llm, temperature, build_llm) -> dict:
         "temperature_supported": temp_ok if responded else None,
         "at": time.time(),
         "seconds": round(time.time() - started, 1),
+    }
+    _store(provider, model, outcome)
+    return outcome
+
+
+def record_runtime_failure(provider: str, model: str, phase: str, exc: BaseException) -> dict:
+    """Una fase real fallo por cuota/rate limit con este modelo: el resultado guardado deja
+    de ser OK (la prueba minima puede pasar con un limite por minuto que la fase agota)."""
+    status = classify(exc)
+    if status not in {"QUOTA", "ERROR"}:
+        status = "QUOTA"
+    outcome = {
+        "provider": provider,
+        "model": model,
+        "status": status,
+        "message": redact(
+            f"fallo en una fase real ({phase}, {time.strftime('%H:%M')}): "
+            f"{type(exc).__name__}: {str(exc)[:240]}",
+            provider,
+        ),
+        "temperature_supported": (result(provider, model) or {}).get("temperature_supported"),
+        "source": "run",
+        "at": time.time(),
+        "seconds": 0,
     }
     _store(provider, model, outcome)
     return outcome

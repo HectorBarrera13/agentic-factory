@@ -69,6 +69,15 @@ _TRANSIENT_MARKERS = (
 )
 
 
+def _probe_failed(model: tuple[str, str] | None, phase: str, exc: BaseException) -> None:
+    """La prueba del modelo dijo OK pero una fase real agoto la cuota: deja de valer."""
+    if model is None:
+        return
+    from . import probe
+
+    probe.record_runtime_failure(model[0], model[1], phase, exc)
+
+
 def _is_transient(exc: BaseException) -> bool:
     text = f"{type(exc).__name__} {exc}".lower()
     return any(m in text for m in _TRANSIENT_MARKERS)
@@ -292,12 +301,12 @@ class ADKExecutor(AgentExecutor):
         from google.genai import types
 
         from . import agents as A
-        from .tools import select_context
+        from .tools import phase_reads, select_context
 
         # Instancia NUEVA por fase: sin padre, sin estado compartido con otras fases.
         agent = A.AGENT_FACTORIES[self.AGENT_FOR_PHASE[phase]]()
-        _record_model(context["change_id"], A.ROLE_OF[agent.name],
-                      A.model_settings(A.ROLE_OF[agent.name]))
+        settings = A.model_settings(A.ROLE_OF[agent.name])
+        _record_model(context["change_id"], A.ROLE_OF[agent.name], settings)
         # Context engineering (§12): solo lo relevante, con manifiesto auditable en el run.
         context = {**context, "selected_context": select_context(context["change_id"])["text"]}
         prompt = self._prompt(phase, context)
@@ -346,20 +355,26 @@ class ADKExecutor(AgentExecutor):
 
         def _call() -> str:
             control.check_pause(f"pausado antes de {phase}")
-            return asyncio.run(_guarded())
+            with phase_reads():  # sesion de modelo nueva: no conoce ningun archivo aun
+                return asyncio.run(_guarded())
 
-        report = self._call_with_backoff(_call, phase, context["change_id"])
+        report = self._call_with_backoff(
+            _call, phase, context["change_id"], model=(settings["provider"], settings["model"])
+        )
         return {
             "report": report or f"# {phase} {context['change_id']} (respuesta vacía)",
             # vacia o sin linea RECOMMENDATION => el run escala (nunca PROCEED por defecto)
             "recommendation": judge_report(report or ""),
         }
 
-    def _call_with_backoff(self, fn, phase: str, change_id: str):
+    def _call_with_backoff(
+        self, fn, phase: str, change_id: str, model: tuple[str, str] | None = None
+    ):
         """§20: exponential backoff + jitter ante 429/503/high-demand.
 
         Reintentos quedan registrados en factory-state.json (metrica §19.1).
-        Agotados los reintentos: TransientModelError; el run NO pierde checkpoint.
+        Agotados los reintentos: TransientModelError; el run NO pierde checkpoint, y la
+        prueba guardada del modelo (`model`) deja de decir OK: fallo en una fase real.
         """
         import random
 
@@ -376,6 +391,7 @@ class ADKExecutor(AgentExecutor):
                     # cuota diaria: reintentar YA gastaria quota sin posibilidad;
                     # checkpoint intacto + mensaje con ventana de resume (§20)
                     self._record_retries(change_id, phase, attempt, exhausted=True)
+                    _probe_failed(model, phase, exc)
                     raise TransientModelError(
                         f"{phase}: cuota free-tier; reintentar en ~{hint // 60} min O "
                         "cambiar FACTORY_MODEL (pool de quota distinto, p. ej. "
@@ -383,6 +399,7 @@ class ADKExecutor(AgentExecutor):
                     ) from exc
                 if attempt >= max_retries:
                     self._record_retries(change_id, phase, attempt, exhausted=True)
+                    _probe_failed(model, phase, exc)
                     raise TransientModelError(
                         f"{phase}: {max_retries} reintentos agotados; el run sigue en su "
                         "ultimo checkpoint — reanudar con la misma linea --adk"
@@ -399,15 +416,17 @@ class ADKExecutor(AgentExecutor):
 
     @staticmethod
     def _record_retries(change_id: str, phase: str, n: int, exhausted: bool) -> None:
-        """Persiste la metrica de rate-limit retries en factory-state.json."""
-        if n == 0 and not exhausted:
-            return
+        """Persiste la metrica de rate-limit retries en factory-state.json. Una fase que sale
+        bien borra la nota EXHAUSTED de un intento anterior (ya no describe el run)."""
         run_dir = project().run_dir(change_id)
         if not _state_path(run_dir).is_file():
             return
-        prior = json.loads(_state_path(run_dir).read_text(encoding="utf-8")).get(
-            "llm_retries", 0
-        )
+        current = json.loads(_state_path(run_dir).read_text(encoding="utf-8"))
+        if n == 0 and not exhausted:
+            if "EXHAUSTED" in str(current.get("last_llm_note", "")):
+                _update_state(run_dir, last_llm_note=f"{phase}: reanudado sin reintentos")
+            return
+        prior = current.get("llm_retries", 0)
         _update_state(
             run_dir,
             llm_retries=prior + n,
@@ -683,6 +702,28 @@ def _write_gate_artifact(run_dir: Path, gate: str, decision: dict, extra: str = 
     )
 
 
+def _signer(decision: dict) -> dict:
+    """Quien firmo un gate y con que rol (un plan lo puede firmar un Product Owner)."""
+    by = str(decision.get("recorded_by", ""))
+    role = str(decision.get("role") or "")
+    if not role and by.endswith(")") and "(" in by:
+        role = by[by.rindex("(") + 1 : -1]
+    return {"by": by, "role": role, "at": str(decision.get("recorded_at", ""))}
+
+
+def signed_gates(run: dict) -> list[str]:
+    """"plan: APPROVED por Tony (Product Owner)" por cada gate decidido, en orden."""
+    gates = {"requirements": "product_owner", "plan": "tech_lead", "review": "reviewer",
+             "release": "release_manager"}
+    out = []
+    for gate, key in gates.items():
+        verdict = run["human_gates"].get(key, "PENDING")
+        signer = (run.get("gate_signers") or {}).get(gate)
+        out.append(f"{gate}: {verdict}" + (f" por {signer['by']}" if signer and signer.get("by")
+                                           else ""))
+    return out
+
+
 def _apply_gate_decision(
     run_dir: Path, change_id: str, gate: str, decision: dict, state: dict
 ) -> dict:
@@ -694,9 +735,11 @@ def _apply_gate_decision(
         by=decision.get("recorded_by"),
     )
     gates = {**state["human_gates"], gate: decision["decision"]}
+    signers = {**state.get("gate_signers", {}), gate: _signer(decision)}
     if decision["decision"] in {"APPROVED", "MODIFIED"}:
-        return _update_state(run_dir, awaiting_gate="", human_gates=gates)
-    _escalate(run_dir, change_id, f"gate {gate}: {decision['decision']}", human_gates=gates)
+        return _update_state(run_dir, awaiting_gate="", human_gates=gates, gate_signers=signers)
+    _escalate(run_dir, change_id, f"gate {gate}: {decision['decision']}", human_gates=gates,
+              gate_signers=signers)
     raise AwaitingHuman(change_id, gate, f"decision {decision['decision']}: intervenga un humano")
 
 
@@ -1178,9 +1221,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             re_review = (run_dir / "08-review-report.md").is_file()
             if re_review:  # re-review: conservar la ronda anterior, no sobrescribirla
                 prior_findings = (
-                    _read(run_dir / "08-review-report.md")
-                    + "\n"
-                    + _read(run_dir / "09-security-report.md")
+                    "\n".join(finding_reports(run_dir))
                     + "\nFIX AUTORIZADO: "
                     + str(state.get("last_fix_reason", ""))
                 )
@@ -1208,6 +1249,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 n = len(list(run_dir.glob("08-review-report-round*.md")))
                 _archive(run_dir, "08-review-report.md", n)
                 _archive(run_dir, "09-security-report.md", n)
+                _archive(run_dir, HUMAN_FINDINGS, n)
             (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
             from .scanners import run_security_scans
 
@@ -1276,6 +1318,11 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             if decision["decision"] in {"APPROVED", "MODIFIED"}
             else []
         )
+        # motivos humanos por finding, leidos ANTES de cerrar el gate (despues ya no valen)
+        notes = {
+            d["finding_id"]: str(d.get("reason") or "").strip()
+            for d in findings_decisions(run_dir, state).get("decisions", [])
+        }
         _record_review_decisions(run_dir, rounds, decision, blocking, state)
         state = _apply_gate_decision(run_dir, change_id, "review", decision, state)
         if blocking:
@@ -1291,12 +1338,12 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             _archive(run_dir, "human-review-decision.json", rounds)
             _archive(run_dir, "human-findings-decisions.json", rounds)
             reason = "findings bloqueantes aceptados: " + ", ".join(blocking)
-            segments = finding_segments(
-                _read(run_dir / "08-review-report.md")
-                + "\n"
-                + _read(run_dir / "09-security-report.md")
+            segments = report_segments(run_dir)
+            details = "\n".join(
+                segments.get(fid, fid).strip()
+                + (f"\n  Nota del Human Reviewer: {notes[fid]}" if notes.get(fid) else "")
+                for fid in blocking
             )
-            details = "\n".join(segments.get(fid, fid).strip() for fid in blocking)
             activity.emit("fix_round", run_dir, fix="review", n=review_rounds + 1,
                           cap=limits.review_rounds, findings=blocking)
             _update_state(
@@ -1349,6 +1396,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             evidence="CONSOLIDATED",
             awaiting_gate="",
             human_gates={**state["human_gates"], "release": verdict},
+            gate_signers={**state.get("gate_signers", {}), "release": _signer(decision)},
             release_decision=decision,
             **({"stop_reason": f"gate release: {verdict}"} if final == "ESCALATED" else {}),
         )
@@ -1357,9 +1405,8 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
         (run_dir / "15-release-decision.json").write_text(
             json.dumps({**decision, "final_status": final}, indent=2), encoding="utf-8"
         )
-        (run_dir / "factory-run.json").write_text(
-            json.dumps(build_factory_run(change_id, state, run_dir), indent=2), encoding="utf-8"
-        )
+        # resumen y trazabilidad tambien: no deben quedarse en "AWAITING RELEASE DECISION"
+        _write_consolidated_evidence(change_id, state, run_dir)
         return state
 
     raise Blocked(f"{change_id}: estado {status} requiere accion humana explicita")
@@ -1491,35 +1538,67 @@ def count_findings(text: str) -> dict:
     }
 
 
-FINDING_ID_RE = re.compile(r"\b(?:RF|SEC(?:-SCAN)?)-\d{2,}\b")
+FINDING_ID_RE = re.compile(r"\b(?:RF|HR|SEC(?:-SCAN)?)-\d{2,}\b")
 SEVERITY_RE = re.compile(r"\b(?:MUST FIX|SHOULD FIX|OPTIONAL|CRITICAL|HIGH|MEDIUM|LOW)\b", re.I)
 BLOCKING_SEVERITIES = {"MUST FIX", "CRITICAL", "HIGH"}
+# Reportes con findings clasificables, en orden: Reviewer IA, Human Reviewer, Security.
+FINDING_REPORTS = ("08-review-report.md", "08b-human-review-findings.md", "09-security-report.md")
+HUMAN_FINDINGS = "08b-human-review-findings.md"
+# Una fila de finding empieza por su id: "RF-01 | ...", "| RF-01 | ...", "### SEC-01",
+# "- **HR-01**".
+_ROW_RE = re.compile(r"^\s*(?:[|>*-]|#+)?\s*\**\s*((?:RF|HR|SEC(?:-SCAN)?)-\d{2,})\b")
+# Fin de segmento: encabezado, linea resumen ("MUST FIX: 1", "HIGH: 0") o bloque de codigo.
+_SEGMENT_END_RE = re.compile(
+    r"^\s*(?:#|```|(?:MUST FIX|SHOULD FIX|OPTIONAL|CRITICAL|HIGH|MEDIUM|LOW)\s*:\s*\d)", re.I
+)
 
 
 def finding_segments(text: str) -> dict[str, str]:
-    """finding id -> texto desde su primera aparicion hasta el siguiente finding distinto."""
-    hits: list[tuple[str, int]] = []
-    seen: set[str] = set()
-    for m in FINDING_ID_RE.finditer(text):
-        if m.group(0) not in seen:
-            seen.add(m.group(0))
-            hits.append((m.group(0), m.start()))
-    return {
-        fid: text[start : hits[i + 1][1] if i + 1 < len(hits) else len(text)]
-        for i, (fid, start) in enumerate(hits)
-    }
+    """finding id -> su extracto dentro de UN reporte: desde su fila (la linea que empieza por
+    el id; si no hay, la primera linea que lo menciona) hasta la siguiente fila de otro
+    finding, encabezado, linea resumen o bloque de codigo. Nunca cruza a otro reporte."""
+    lines = text.splitlines()
+    rows: dict[str, int] = {}
+    mentions: dict[str, int] = {}
+    for n, line in enumerate(lines):
+        if (m := _ROW_RE.match(line)) and m.group(1) not in rows:
+            rows[m.group(1)] = n
+        for fid in FINDING_ID_RE.findall(line):
+            mentions.setdefault(fid, n)
+    out: dict[str, str] = {}
+    for fid in sorted(mentions, key=lambda f: rows.get(f, mentions[f])):
+        start = rows.get(fid, mentions[fid])
+        end = start + 1
+        while end < len(lines):
+            row = _ROW_RE.match(lines[end])
+            if (row and row.group(1) != fid) or _SEGMENT_END_RE.match(lines[end]):
+                break
+            end += 1
+        out[fid] = "\n".join(lines[start:end]).rstrip() + "\n"
+    return out
+
+
+def finding_reports(run_dir: Path) -> list[str]:
+    """Texto de cada reporte con findings de la ronda actual (los que no existen, vacios)."""
+    return [_read(run_dir / name) for name in FINDING_REPORTS]
+
+
+def report_segments(run_dir: Path) -> dict[str, str]:
+    """Extractos de todos los findings de la ronda, segmentando cada reporte por separado."""
+    out: dict[str, str] = {}
+    for text in finding_reports(run_dir):
+        for fid, segment in finding_segments(text).items():
+            out.setdefault(fid, segment)
+    return out
 
 
 def finding_severities(run_dir: Path) -> dict[str, str]:
-    """Severidad de cada finding segun los reportes de la ronda actual (misma linea del id
-    primero; si no, dentro de su segmento). Sin severidad detectable => no se incluye."""
-    text = _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
+    """Severidad de cada finding segun los reportes de la ronda actual (su fila primero; si
+    no, dentro de su extracto). Sin severidad detectable => no se incluye."""
     out: dict[str, str] = {}
-    for fid, segment in finding_segments(text).items():
-        line_start = text.find(segment)
-        line_end = text.find("\n", line_start)
-        line = text[text.rfind("\n", 0, line_start) + 1 : line_end if line_end != -1 else None]
-        m = SEVERITY_RE.search(line) or SEVERITY_RE.search(segment)
+    for fid, segment in report_segments(run_dir).items():
+        first = segment.split("\n", 1)[0]
+        m = SEVERITY_RE.search(first) or SEVERITY_RE.search(segment)
         if m:
             out[fid] = m.group(0).upper()
     return out
@@ -1538,9 +1617,10 @@ def findings_decisions(run_dir: Path, state: dict) -> dict:
 
 
 def accepted_blocking(run_dir: Path, state: dict) -> list[str]:
-    """Findings que el humano ACEPTO/MODIFICO Y que son bloqueantes (MUST FIX / HIGH).
-    Un SHOULD FIX aceptado NO dispara un ciclo de fix; sin severidad parseable se trata
-    como bloqueante (conservador)."""
+    """Findings que el humano ACEPTO/MODIFICO Y que son bloqueantes: MUST FIX / HIGH, o los
+    que el Human Reviewer marco "corregir en este ciclo" (`blocking`). Un SHOULD FIX aceptado
+    sin esa marca NO dispara un ciclo de fix; sin severidad parseable se trata como
+    bloqueante (conservador)."""
     data = findings_decisions(run_dir, state)
     if not data:
         return []  # sin decision explicita, ningun finding se auto-aplica (Gate 2 real)
@@ -1549,7 +1629,10 @@ def accepted_blocking(run_dir: Path, state: dict) -> list[str]:
         d["finding_id"]
         for d in data.get("decisions", [])
         if d.get("decision") in {"ACCEPTED", "MODIFIED"}
-        and severities.get(d["finding_id"], "MUST FIX") in BLOCKING_SEVERITIES
+        and (
+            d.get("blocking") is True
+            or severities.get(d["finding_id"], "MUST FIX") in BLOCKING_SEVERITIES
+        )
     ]
 
 
@@ -1568,11 +1651,13 @@ def _record_review_decisions(
         f"- Reason: {decision.get('reason', '')}",
         f"- Blocking accepted (authorize Coder Fix): {', '.join(blocking) or 'none'}",
         "",
-        "| Finding | Severity | Human decision |",
-        "|---|---|---|",
+        "| Finding | Severity | Human decision | Blocking (fix) | Reason | Recorded by |",
+        "|---|---|---|---|---|---|",
         *[
             f"| {d['finding_id']} | {severities.get(d['finding_id'], 'unknown')} "
-            f"| {d['decision']} |"
+            f"| {d['decision']} | {'yes' if d['finding_id'] in blocking else 'no'}"
+            f"{' (human)' if d.get('blocking') is True else ''} "
+            f"| {_cell(d.get('reason'))} | {_cell(d.get('recorded_by'))} |"
             for d in data.get("decisions", [])
         ],
         "",
@@ -1580,6 +1665,12 @@ def _record_review_decisions(
     header = "" if path.is_file() else f"# Human review decisions — {run_dir.name}\n\n"
     with path.open("a", encoding="utf-8") as fh:
         fh.write(header + "\n".join(lines) + "\n")
+
+
+def _cell(value: object) -> str:
+    """Texto seguro para una celda de tabla Markdown (una linea, sin barras)."""
+    text = " ".join(str(value or "").split()).replace("|", "/")
+    return text or "-"
 
 
 def _as_dict(value: object, default: dict) -> dict:
@@ -1629,6 +1720,8 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
             "reviewer": state["human_gates"].get("review", "PENDING"),
             "release_manager": state["human_gates"].get("release", "PENDING"),
         },
+        # quien firmo cada gate y con que rol (las claves de human_gates son el rol esperado)
+        "gate_signers": state.get("gate_signers", {}),
         "iterations": state.get("iterations", 0),
         "traceability_gaps": traceability_gaps(compute_traceability(run_dir)),
         "history": state.get("transitions", []),
@@ -1655,6 +1748,7 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
                 f"- Review: {run['review']}",
                 f"- Security: {run['security']}",
                 f"- Gates humanos: {run['human_gates']}",
+                f"- Firmas: {'; '.join(signed_gates(run))}",
                 f"- Iteraciones fix: {run['iterations']}",
                 *(
                     [
@@ -1683,12 +1777,70 @@ UNMAPPED = "UNMAPPED"
 
 
 def _diff_files(run_dir: Path) -> list[str]:
-    paths = tuple(f"{c}/" for c in _code_paths())
+    # una entrada de codigo puede ser carpeta ("js") o archivo ("index.html")
+    areas = [c.strip("/") for c in _code_paths()]
     return [
         f
-        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.split()
-        if f.startswith(paths)
+        for f in _git(["diff", "--name-only", _run_diff_range(run_dir)]).stdout.splitlines()
+        if any(f == a or f.startswith(a + "/") for a in areas)
     ]
+
+
+_AC_BOUNDARY = r"(?![\w.])"  # "AC-01" no cita "AC-010" ni "AC-01.2"
+_TASK_WORD_RE = re.compile(r"\b(?:Task|Tarea|Paso|Step)\s*#?\s*(\d+)\b", re.I)
+_TASK_NUM_RE = re.compile(r"^\s*(?:[-*]\s+)?\**\s*(\d+)[.)]\s")
+
+
+def _indent(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _plan_cites(lines: list[str], ac: str) -> list[str]:
+    """Lineas del plan que vinculan un AC: la linea que lo cita, el encabezado de su seccion
+    (p. ej. "### B. Relay Server (`server/relay.mjs`)") y su bloque (las sub-vinetas mas
+    indentadas debajo; si es un encabezado, hasta el siguiente encabezado de igual o mayor
+    nivel). Asi un plan en prosa tambien enlaza tareas y archivos."""
+    cite = re.compile(re.escape(ac) + _AC_BOUNDARY)
+    out: list[str] = []
+    for n, line in enumerate(lines):
+        if not cite.search(line):
+            continue
+        out.append(line)
+        heading = re.match(r"^(#+)\s", line)
+        if not heading:
+            section = next((h for h in reversed(lines[:n]) if re.match(r"^#+\s", h)), None)
+            if section:
+                out.append(section)
+        for nxt in lines[n + 1 :]:
+            if heading:
+                other = re.match(r"^(#+)\s", nxt)
+                if other and len(other.group(1)) <= len(heading.group(1)):
+                    break
+            elif nxt.strip() and _indent(nxt) <= _indent(line):
+                break
+            out.append(nxt)
+    return out
+
+
+def _task_ids(line: str) -> set[str]:
+    """TASK-1 / T1, y tambien "Task 1", "Tarea 1", "Paso 1" o "1." al inicio -> T1."""
+    ids = set(re.findall(r"\b(?:TASK-\d+|T\d+)\b", line))
+    ids |= {f"T{n}" for n in _TASK_WORD_RE.findall(line)}
+    if m := _TASK_NUM_RE.match(line):
+        ids.add(f"T{m.group(1)}")
+    return ids
+
+
+def _match_diff(planned: set[str], diff_files: set[str]) -> set[str]:
+    """Archivos planeados que el diff cambio. Una ruta parcial ("sync.js", "js/app.js" desde
+    otra raiz) vale si coincide con el final de UNA sola ruta del diff."""
+    out = set(planned & diff_files)
+    for item in planned - diff_files:
+        tail = item.lstrip("./")
+        hits = [f for f in diff_files if f == tail or f.endswith("/" + tail)]
+        if len(hits) == 1:
+            out.add(hits[0])
+    return out
 
 
 def compute_traceability(run_dir: Path) -> list[dict]:
@@ -1711,21 +1863,19 @@ def compute_traceability(run_dir: Path) -> list[dict]:
     )
     for tf in test_files:
         text = tf.read_text(encoding="utf-8", errors="replace")
-        # python: `def test_x`; js/ts: `test("...")` / `it("...")`
-        pattern = r"(?m)^(?=\s*(?:async\s+)?def test_|\s*(?:test|it)\()"
+        # python: `def test_x`; js/ts: `test("...")` / `it("...")` / `describe("...")`
+        pattern = r"(?m)^(?=\s*(?:async\s+)?def test_|\s*(?:test|it|describe)\()"
         for chunk in re.split(pattern, text):
             name = re.match(
-                r"\s*(?:async\s+)?def (test_\w+)|\s*(?:test|it)\(\s*['\"`]([^'\"`]+)", chunk
+                r"\s*(?:async\s+)?def (test_\w+)|\s*(?:test|it|describe)\(\s*['\"`]([^'\"`]+)",
+                chunk,
             )
             if not name:
                 continue
             label = name.group(1) or name.group(2)
             for ac in set(ac_re.findall(chunk)):
                 tests_by_ac.setdefault(ac, []).append(f"{tf.name}::{label}")
-    reports = (
-        _read(run_dir / "08-review-report.md") + "\n" + _read(run_dir / "09-security-report.md")
-    )
-    segments = finding_segments(reports)
+    segments = report_segments(run_dir)
     dec_path = run_dir / "human-findings-decisions.json"
     decisions = (
         {
@@ -1737,13 +1887,14 @@ def compute_traceability(run_dir: Path) -> list[dict]:
     )
     rows = []
     for ac in acs:
-        cited = [line for line in plan_lines if ac in line]
-        tasks = sorted({t for line in cited for t in re.findall(r"\b(?:TASK-\d+|T\d+)\b", line)})
+        cited = _plan_cites(plan_lines, ac)
+        tasks = sorted({t for line in cited for t in _task_ids(line)})
         planned_files = {
             f for line in cited for f in re.findall(r"[\w./-]+\.[A-Za-z0-9]+", line)
         }
-        code = sorted(planned_files & diff_files)  # planeado Y realmente cambiado
-        findings = sorted(fid for fid, seg in segments.items() if ac in seg)
+        code = sorted(_match_diff(planned_files, diff_files))  # planeado Y realmente cambiado
+        cites = re.compile(re.escape(ac) + _AC_BOUNDARY)
+        findings = sorted(fid for fid, seg in segments.items() if cites.search(seg))
         rows.append(
             {
                 "ac": ac,
@@ -1789,6 +1940,7 @@ def build_traceability(run: dict, run_dir: Path) -> str:
                 f"Files changed in the run (git diff {_run_diff_range(run_dir)}): "
                 + (", ".join(diff_files) or "none recorded"),
                 f"Gates: {json.dumps(run['human_gates'])}",
+                f"Firmas: {'; '.join(signed_gates(run))}",
                 f"Estado final: {run['status']} — el merge final es exclusivamente humano.",
                 "",
             ]

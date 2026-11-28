@@ -167,6 +167,28 @@ def test_successful_retries_are_recorded_in_state(sandbox, monkeypatch):  # noqa
     assert st["llm_retries"] == 2 and "EXHAUSTED" not in st["last_llm_note"]
 
 
+def test_exhausted_retries_degrade_the_stored_probe(sandbox, monkeypatch):  # noqa: F811
+    import time
+
+    from factory_app import probe
+
+    run = sandbox()
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    probe._store("gemini", "g-z", {"status": "OK", "at": time.time()})
+
+    def always_429():
+        raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    ex = ADKExecutor(backoff_base=0, max_retries=1)
+    with pytest.raises(ORCH.TransientModelError):
+        ex._call_with_backoff(always_429, "intake", "CR-T", model=("gemini", "g-z"))
+    assert probe.result("gemini", "g-z")["status"] == "QUOTA"
+    assert "EXHAUSTED" in state(run)["last_llm_note"]
+    # al reanudar, la fase sale bien a la primera: la nota vieja ya no describe el run
+    assert ex._call_with_backoff(lambda: "ok", "intake", "CR-T") == "ok"
+    assert "EXHAUSTED" not in state(run)["last_llm_note"]
+
+
 def test_long_prompt_fields_are_visibly_truncated():
     p = ADKExecutor._prompt("review", {"change_id": "CR-T", "git_diff": "x" * 20_000})
     assert "[TRUNCATED 8000 chars" in p
@@ -192,6 +214,41 @@ def test_fix_receives_the_accepted_findings_text(sandbox):  # noqa: F811
     drive(run, ex, stop_at="review")
     fix = ex.ctx["fix"]["accepted_blocking_findings"]
     assert "RF-01" in fix and "race condition in register" in fix
+
+
+def _decide_with(run, **decisions):
+    """Clasificacion con campos nuevos (motivo, "corregir en este ciclo") registrada AHORA."""
+    import json
+    from datetime import datetime, timezone
+
+    (run / "human-findings-decisions.json").write_text(json.dumps({
+        "decisions": [{"finding_id": fid.replace("_", "-"), **d} for fid, d in decisions.items()],
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+
+
+def test_a_should_fix_marked_by_the_reviewer_triggers_the_fix_with_its_reason(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = Capture(review_report="# Review\n\nRF-01 | SHOULD FIX | AC-03 | js/app.js | sin usar\n")
+    drive(run, ex, stop_at="review")
+    _decide_with(run, RF_01={"decision": "ACCEPTED", "blocking": True,
+                             "reason": "index.html debe cargar js/sync.js"})
+    approve(run, "review")
+    drive(run, ex, stop_at="review")
+    fix = ex.ctx["fix"]["accepted_blocking_findings"]
+    assert "RF-01" in fix and "Nota del Human Reviewer: index.html debe cargar js/sync.js" in fix
+    table = (run / "10-human-review-decisions.md").read_text(encoding="utf-8")
+    row = "| RF-01 | SHOULD FIX | ACCEPTED | yes (human) | index.html debe cargar js/sync.js"
+    assert row in table
+
+
+def test_the_blocking_mark_needs_an_accepting_verdict(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = Capture(review_report="# Review\n\nRF-01 | SHOULD FIX | naming\n")
+    drive(run, ex, stop_at="review")
+    _decide_with(run, RF_01={"decision": "DEFERRED", "blocking": True})
+    exc = drive(run, ex, stop_at="release")
+    assert exc.gate == "release" and "fix" not in ex.ctx  # un DEFERRED nunca cambia codigo
 
 
 def test_fix_after_verification_fail_receives_the_failure(sandbox):  # noqa: F811

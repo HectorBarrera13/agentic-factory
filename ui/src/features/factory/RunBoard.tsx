@@ -317,6 +317,17 @@ export function RunBoard({
                 notify(errorMessage(err), "danger");
               }
             }}
+            onAdd={async (finding) => {
+              if (!signature) return;
+              try {
+                const r = await api.decideFindings(changeId, { verdicts: {}, added: [{ ...finding }], ...signature });
+                notify(`Finding ${r.added?.[0] ?? ""} añadido y aceptado.`, "success");
+                run.reload();
+              } catch (err) {
+                notify(errorMessage(err), "danger");
+                throw err;
+              }
+            }}
           />
 
           <Card>
@@ -416,7 +427,11 @@ function ModelWarning({ items }: { items: ModelInUse[] }) {
     }
   };
   return (
-    <Callout tone="warning" icon={<AlertTriangle />} title="Un modelo en uso no pasó la prueba">
+    <Callout
+      tone="warning"
+      icon={<AlertTriangle />}
+      title={items.some((m) => m.probe?.source === "run") ? "Un modelo en uso falló en una fase real" : "Un modelo en uso no pasó la prueba"}
+    >
       <ul className="mt-1 space-y-0.5">
         {items.map((m) => (
           <li key={`${m.provider}:${m.model}`}>

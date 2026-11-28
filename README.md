@@ -205,7 +205,10 @@ Alineación con el instructivo (§8-§18):
   defecto) se exige confirmación explícita (`--force`), que también queda registrada.
 - Re-review: la ronda anterior se archiva (`08-review-report-roundN.md`), se escribe
   `13-re-review.md`, y los reportes de una ronda no se regeneran al reanudar tras el gate.
-- Solo un MUST FIX / HIGH aceptado dispara fix; un SHOULD FIX aceptado queda registrado.
+- Solo un MUST FIX / HIGH aceptado, o un finding que el Human Reviewer marca "corregir en este
+  ciclo", dispara fix; un SHOULD FIX aceptado sin esa marca queda registrado. Cada
+  clasificación lleva su motivo (llega al Coder Fix) y el Human Reviewer puede añadir findings
+  propios (`HR-NN`, en `08b-human-review-findings.md`), que quedan aceptados por quien los añade.
 - `traceability.md` solo enlaza lo evidenciable; lo demás es `UNMAPPED` y se cuenta en
   `traceability_gaps` de `factory-run.json`.
 
