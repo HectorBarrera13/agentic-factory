@@ -30,6 +30,7 @@ import {
   type ProviderInfo,
 } from "@/lib/api";
 import { useApp, useLoad } from "@/lib/app-state";
+import { EnvOverrideNote } from "@/features/factory/RunBoard";
 import { ModelPicker, resetModelCache } from "./ModelPicker";
 import { isConfigured, ProvidersPanel } from "./ProvidersPanel";
 import { TemperatureField } from "./TemperatureField";
@@ -56,15 +57,25 @@ const GATE_LABEL: Record<string, string> = {
   release: "Gate release",
 };
 
+const PROJECT_TABS = ["agents", "verify", "paths", "gates"];
+const GLOBAL_TABS = ["providers", "profiles"];
+
 export function SettingsView() {
-  const { session, meta, refreshSession, notify, probeTick } = useApp();
+  const { session, meta, refreshSession, notify, probeTick, settingsTab, setSettingsTab } = useApp();
   const saved = session?.project?.config ?? null;
   const [draft, setDraft] = React.useState<ProjectConfig | null>(saved);
+  // pestaña desde la ruta (#/settings/<tab>); las de proyecto solo existen con proyecto
+  const tabs = draft ? [...PROJECT_TABS, ...GLOBAL_TABS] : GLOBAL_TABS;
+  const tab = settingsTab && tabs.includes(settingsTab) ? settingsTab : draft ? "agents" : "profiles";
   const [error, setError] = React.useState<string | null>(null);
   const [busy, setBusy] = React.useState(false);
   const [providersVersion, setProvidersVersion] = React.useState(0);
   const providers = useLoad(() => api.providers(), [providersVersion]);
   const probes = useLoad(() => api.probes(), [probeTick]);
+  const inUse = useLoad(
+    () => (saved ? api.modelsInUse() : Promise.resolve({ items: [] })),
+    [probeTick, JSON.stringify(saved?.agents)],
+  );
   const providerChanged = () => {
     resetModelCache();
     setProvidersVersion((v) => v + 1);
@@ -124,7 +135,7 @@ export function SettingsView() {
           </div>
         ) : null}
       </header>
-      <Tabs defaultValue={draft ? "agents" : "profiles"} className="flex min-h-0 flex-1 flex-col">
+      <Tabs value={tab} onValueChange={setSettingsTab} className="flex min-h-0 flex-1 flex-col">
         <TabsList className="px-6">
           {draft ? (
             <>
@@ -143,6 +154,7 @@ export function SettingsView() {
             {draft ? (
               <>
                 <TabsContent value="agents" className="space-y-4">
+                  <EnvOverrideNote items={inUse.data?.items ?? []} />
                   <AgentsPanel
                     draft={draft}
                     patch={patch}
@@ -460,7 +472,7 @@ export function RoleChips({
 }
 
 // ---------------------------------------------------------------- agentes
-function ProviderSelect({
+export function ProviderSelect({
   label,
   value,
   onChange,

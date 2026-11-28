@@ -1,17 +1,18 @@
-import { Check, Hand, Loader2, X } from "lucide-react";
+import { Check, Hand, Loader2, Pause, X } from "lucide-react";
 import type { Phase, RunState } from "@/lib/api";
 import { stepStates } from "@/lib/phases";
 import { cn } from "@/lib/utils";
 
 export function PhaseStepper({ phases, state, busy }: { phases: Phase[]; state: RunState; busy: boolean }) {
   const steps = stepStates(phases, state);
+  const paused = Boolean(state.paused) && !busy;
   return (
     <ol aria-label="Fases del run" className="flex items-start overflow-x-auto pb-1">
       {phases.map((phase, i) => {
         const s = steps[i];
         const gate = Boolean(phase.gate);
         return (
-          <li key={phase.id} data-state={s} className="flex min-w-[5.5rem] flex-1 flex-col items-center gap-1.5 text-center">
+          <li key={phase.id} data-state={s} data-paused={paused && s === "current" ? "" : undefined} className="flex min-w-[5.5rem] flex-1 flex-col items-center gap-1.5 text-center">
             <div className="flex w-full items-center">
               <span className={cn("h-px flex-1", i === 0 ? "bg-transparent" : steps[i - 1] === "done" ? "bg-primary" : "bg-border")} />
               <span
@@ -32,6 +33,8 @@ export function PhaseStepper({ phases, state, busy }: { phases: Phase[]; state: 
                     <X />
                   ) : s === "waiting" ? (
                     <Hand />
+                  ) : s === "current" && paused ? (
+                    <Pause aria-label="pausada" />
                   ) : s === "current" && busy ? (
                     <Loader2 className="animate-spin" />
                   ) : (

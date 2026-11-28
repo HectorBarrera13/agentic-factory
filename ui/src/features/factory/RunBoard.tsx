@@ -7,8 +7,11 @@ import {
   FileText,
   FolderGit2,
   GitCompare,
+  FlaskConical,
   History,
+  Pause,
   Play,
+  Settings2,
   Trash2,
 } from "lucide-react";
 import * as React from "react";
@@ -26,7 +29,7 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui";
-import { api, errorMessage, type RunDetail } from "@/lib/api";
+import { api, errorMessage, roleLabel, type ModelInUse, type RunDetail } from "@/lib/api";
 import { useApp, useLoad } from "@/lib/app-state";
 import { statusLabel, statusTone, TERMINAL } from "@/lib/phases";
 import { cn, formatTime, languageFor } from "@/lib/utils";
@@ -41,12 +44,46 @@ const OUTCOME_COPY: Record<string, { tone: "info" | "warning" | "danger" | "succ
   transient: { tone: "warning", title: "Error transitorio del modelo: reintenta más tarde" },
   error: { tone: "danger", title: "Error al avanzar (el run quedó en su último checkpoint)" },
   done: { tone: "success", title: "Run terminado" },
+  paused: { tone: "info", title: "Run pausado" },
 };
 
+type Mode = "fake" | "adk";
+const LS_MODE = "factory.mode";
+
+/** Modo recordado; por defecto el modelo real (la simulacion es para probar el flujo). */
+function readMode(): Mode {
+  try {
+    return localStorage.getItem(LS_MODE) === "fake" ? "fake" : "adk";
+  } catch {
+    return "adk";
+  }
+}
+
+const PROBE_WORDS: Record<string, string> = {
+  NO_TOOLS: "no usa tools",
+  NO_ACCESS: "sin acceso en tu plan",
+  QUOTA: "sin cuota",
+  INVALID_KEY: "clave inválida",
+  ERROR: "error",
+};
+
+const probeWords = (m: ModelInUse) => (m.probe ? PROBE_WORDS[m.probe.status] ?? m.probe.status : "sin probar");
+
 export function RunBoard({ changeId }: { changeId: string }) {
-  const { meta, tick, signer, notify, openFile } = useApp();
+  const { meta, tick, probeTick, signer, notify, openFile, session } = useApp();
   const run = useLoad(() => api.run(changeId), [changeId, tick]);
-  const [mode, setMode] = React.useState<"fake" | "adk">("fake");
+  const agents = session?.project?.config.agents;
+  const inUse = useLoad(() => api.modelsInUse(), [probeTick, JSON.stringify(agents)]);
+  const [mode, setModeState] = React.useState<Mode>(readMode);
+  const setMode = (m: Mode) => {
+    setModeState(m);
+    try {
+      localStorage.setItem(LS_MODE, m);
+    } catch {
+      /* sin almacenamiento: solo esta sesion */
+    }
+  };
+  const [pausing, setPausing] = React.useState(false);
   const [tab, setTab] = React.useState("artifacts");
   const [artifact, setArtifact] = React.useState<string | null>(null);
   const [starting, setStarting] = React.useState(false);
@@ -61,7 +98,25 @@ export function RunBoard({ changeId }: { changeId: string }) {
   const terminal = TERMINAL.includes(st.status);
   const signature = signer.profile ? { profile_id: signer.profile.id, role: signer.role } : null;
 
+  const models = inUse.data?.items ?? [];
+  const notOk = mode === "adk" ? models.filter((m) => m.probe?.status !== "OK") : [];
+  const paused = st.paused && !d.busy ? st.paused : null;
+  const isPausing = d.busy && (pausing || Boolean(d.outcome?.pausing));
+  const realLabel = models.length
+    ? `Modelo real (${models[0].provider}/${models[0].model}${models.length > 1 ? ` +${models.length - 1}` : ""})`
+    : agents
+      ? `Modelo real (${agents.provider}/${agents.model})`
+      : "Modelo real";
+
   const advance = async () => {
+    if (
+      notOk.length &&
+      !window.confirm(
+        `${notOk.map((m) => `${m.provider}/${m.model}: ${probeWords(m)}`).join("\n")}\n\n` +
+          "Este modelo no ha pasado la prueba y la fase puede fallar. ¿Avanzar de todos modos?",
+      )
+    )
+      return;
     setStarting(true);
     try {
       await api.advance(changeId, mode);
@@ -70,6 +125,18 @@ export function RunBoard({ changeId }: { changeId: string }) {
       notify(errorMessage(err), "danger");
     } finally {
       setStarting(false);
+    }
+  };
+
+  const pause = async () => {
+    setPausing(true);
+    try {
+      await api.pause(changeId);
+      run.reload();
+    } catch (err) {
+      notify(errorMessage(err), "danger");
+    } finally {
+      setPausing(false);
     }
   };
 
@@ -85,7 +152,8 @@ export function RunBoard({ changeId }: { changeId: string }) {
           <div className="flex items-center gap-2">
             <h2 className="font-mono text-base font-semibold">{changeId}</h2>
             <Badge tone={statusTone(st.status, st.awaiting_gate)}>{statusLabel(st.status, st.awaiting_gate)}</Badge>
-            {d.busy ? <Badge tone="info">en curso</Badge> : null}
+            {d.busy ? <Badge tone="info">{isPausing ? "pausando…" : "en curso"}</Badge> : null}
+            {paused ? <Badge tone="warning"><Pause className="size-3" /> Pausada en {statusLabel(paused.status)}</Badge> : null}
           </div>
           <p className="mt-0.5 text-xs text-muted-foreground">
             {st.branch ? <>rama <span className="font-mono">{st.branch}</span> · </> : null}
@@ -95,17 +163,28 @@ export function RunBoard({ changeId }: { changeId: string }) {
         <div className="flex-1" />
         {!terminal ? (
           <div className="flex items-center gap-2">
-            <Select aria-label="Modo de ejecución" className="h-8 w-40 text-xs" value={mode} onChange={(e) => setMode(e.target.value as "fake" | "adk")}>
-              <option value="fake">Fake (determinista)</option>
-              <option value="adk">ADK (Gemini)</option>
+            <Select aria-label="Modo de ejecución" className="h-8 w-64 text-xs" value={mode} disabled={d.busy} onChange={(e) => setMode(e.target.value as Mode)}>
+              <option value="adk">{realLabel}</option>
+              <option value="fake">Simulación (Fake, sin modelo)</option>
             </Select>
+            {d.busy ? (
+              <Button
+                variant="outline"
+                onClick={pause}
+                loading={isPausing}
+                disabled={isPausing}
+                title="Corta ya la ejecución; al reanudar se repite la fase en curso desde su inicio"
+              >
+                <Pause /> {isPausing ? "Pausando…" : "Pausar"}
+              </Button>
+            ) : null}
             <Button
               onClick={advance}
               loading={starting || d.busy}
               disabled={Boolean(st.awaiting_gate) && !d.gate?.recorded}
-              title={st.awaiting_gate && !d.gate?.recorded ? "Decide el gate primero" : "Avanza hasta el siguiente gate"}
+              title={st.awaiting_gate && !d.gate?.recorded ? "Decide el gate primero" : paused ? "Repite la fase pausada desde su inicio" : "Avanza hasta el siguiente gate"}
             >
-              <Play /> Avanzar
+              <Play /> {paused ? "Reanudar" : "Avanzar"}
             </Button>
           </div>
         ) : (
@@ -118,6 +197,9 @@ export function RunBoard({ changeId }: { changeId: string }) {
           <Card className="px-4 py-4">
             <PhaseStepper phases={meta.phases} state={st} busy={d.busy} />
           </Card>
+
+          {!terminal && notOk.length ? <ModelWarning items={notOk} /> : null}
+          {!terminal ? <EnvOverrideNote items={models} /> : null}
 
           <RunAlerts detail={d} />
 
@@ -206,7 +288,15 @@ function RunAlerts({ detail }: { detail: RunDetail }) {
       </Callout>,
     );
   }
-  if (o && o.kind !== "awaiting" && o.kind !== "done" && !(o.kind === "running" && !detail.busy)) {
+  if (st.paused && !detail.busy) {
+    alerts.push(
+      <Callout key="paused" tone="info" icon={<Pause />} title={`Run pausado en ${statusLabel(st.paused.status)}`}>
+        Al reanudar se repite esa fase desde su inicio (último punto de control).
+        {st.paused.worktree_reset ? " Los cambios a medias del Coder en el worktree del run se descartaron." : ""}
+      </Callout>,
+    );
+  }
+  if (o && o.kind !== "awaiting" && o.kind !== "done" && o.kind !== "paused" && !(o.kind === "running" && !detail.busy)) {
     const copy = OUTCOME_COPY[o.kind];
     alerts.push(
       <Callout key="outcome" tone={copy.tone} title={copy.title}>
@@ -215,6 +305,64 @@ function RunAlerts({ detail }: { detail: RunDetail }) {
     );
   }
   return alerts.length ? <div className="space-y-2">{alerts}</div> : null;
+}
+
+/** Modelos en uso que no pasaron la prueba: avisar ANTES de gastar una fase. */
+function ModelWarning({ items }: { items: ModelInUse[] }) {
+  const { notify, setView, setSettingsTab } = useApp();
+  const [probing, setProbing] = React.useState(false);
+  const probeAll = async () => {
+    setProbing(true);
+    try {
+      const results = await Promise.all(items.map((m) => api.probe(m.provider, m.model)));
+      const ok = results.filter((r) => r.status === "OK").length;
+      notify(ok === results.length ? "Modelos disponibles" : `${results.length - ok} modelo(s) siguen sin pasar la prueba`, ok === results.length ? "success" : "danger");
+    } catch (err) {
+      notify(errorMessage(err), "danger");
+    } finally {
+      setProbing(false);
+    }
+  };
+  return (
+    <Callout tone="warning" icon={<AlertTriangle />} title="Un modelo en uso no pasó la prueba">
+      <ul className="mt-1 space-y-0.5">
+        {items.map((m) => (
+          <li key={`${m.provider}:${m.model}`}>
+            <span className="font-mono">{m.provider}/{m.model}</span> ({m.roles.join(", ")}): <strong>{probeWords(m)}</strong>
+            {m.probe?.message ? <span className="text-muted-foreground"> — {m.probe.message}</span> : null}
+          </li>
+        ))}
+      </ul>
+      <div className="mt-2 flex gap-2">
+        <Button size="xs" variant="outline" loading={probing} onClick={probeAll}>
+          <FlaskConical /> Probar ahora
+        </Button>
+        <Button
+          size="xs"
+          variant="ghost"
+          onClick={() => {
+            setSettingsTab("agents");
+            setView("settings");
+          }}
+        >
+          <Settings2 /> Ir a Ajustes
+        </Button>
+      </div>
+    </Callout>
+  );
+}
+
+/** FACTORY_MODEL del entorno gana sobre lo elegido en Ajustes: que no sea silencioso. */
+export function EnvOverrideNote({ items }: { items: ModelInUse[] }) {
+  const hit = items.find((m) => m.env_override);
+  if (!hit) return null;
+  return (
+    <Callout tone="warning" icon={<AlertTriangle />} title="FACTORY_MODEL del entorno reemplaza el modelo">
+      Se usará <span className="font-mono">{hit.model}</span> en lugar de{" "}
+      <span className="font-mono">{hit.configured_model}</span> ({hit.roles.map(roleLabel).join(", ")}). Quita{" "}
+      <span className="font-mono">FACTORY_MODEL</span> del entorno o del <span className="font-mono">.env</span> y reinicia Studio para usar el de Ajustes.
+    </Callout>
+  );
 }
 
 function TerminalActions({ detail, onChange }: { detail: RunDetail; onChange: () => void }) {

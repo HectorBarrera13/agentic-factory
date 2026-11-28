@@ -1,7 +1,8 @@
 import * as React from "react";
 import { api, errorMessage, type Meta, type Profile, type SessionInfo } from "./api";
+import { formatRoute, parseHash, type Route, type View } from "./route";
 
-export type View = "code" | "factory" | "settings";
+export type { View } from "./route";
 export type Theme = "dark" | "light";
 
 interface Toast {
@@ -39,6 +40,11 @@ interface AppState {
   openFile: (root: string, path: string) => void;
   pendingOpen: { root: string; path: string } | null;
   clearPendingOpen: () => void;
+  /** Pestaña de Ajustes en la ruta (null = la de por defecto). */
+  settingsTab: string | null;
+  setSettingsTab: (tab: string) => void;
+  /** El editor informa el archivo activo para que la ruta lo recuerde. */
+  setCodeFile: (file: { root: string; path: string } | null) => void;
 }
 
 const Ctx = React.createContext<AppState | null>(null);
@@ -65,7 +71,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [session, setSession] = React.useState<SessionInfo | null>(null);
   const [meta, setMeta] = React.useState<Meta | null>(null);
   const [loadError, setLoadError] = React.useState<string | null>(null);
-  const [view, setView] = React.useState<View>("factory");
+  const [route, setRoute] = React.useState<Route>(() => parseHash(window.location.hash));
+  const view = route.view;
   const [theme, setTheme] = React.useState<Theme>(() =>
     readJson<Theme>(LS_THEME, window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark"),
   );
@@ -76,8 +83,50 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const [tick, setTick] = React.useState(0);
   const [probeTick, setProbeTick] = React.useState(0);
   const [live, setLive] = React.useState(false);
-  const [selectedRun, setSelectedRun] = React.useState<string | null>(null);
-  const [pendingOpen, setPendingOpen] = React.useState<{ root: string; path: string } | null>(null);
+  const selectedRun = route.run;
+  // al recargar en #/code?root=&path= se vuelve a abrir ese archivo
+  const [pendingOpen, setPendingOpen] = React.useState<{ root: string; path: string } | null>(() => route.file);
+
+  const patchRoute = React.useCallback((patch: Partial<Route>) => {
+    setRoute((r) => {
+      const next = { ...r, ...patch };
+      return formatRoute(next) === formatRoute(r) ? r : next;
+    });
+  }, []);
+  const setView = React.useCallback((v: View) => patchRoute({ view: v }), [patchRoute]);
+  const setSelectedRun = React.useCallback((id: string | null) => patchRoute({ run: id }), [patchRoute]);
+  const setSettingsTab = React.useCallback((tab: string) => patchRoute({ tab }), [patchRoute]);
+  const setCodeFile = React.useCallback(
+    (file: { root: string; path: string } | null) => patchRoute({ file }),
+    [patchRoute],
+  );
+
+  // ruta -> URL: cambiar de vista es una entrada del historial; lo demas la reemplaza
+  const lastView = React.useRef(view);
+  React.useEffect(() => {
+    const hash = formatRoute(route);
+    if (window.location.hash !== hash) {
+      const url = `${window.location.pathname}${window.location.search}${hash}`;
+      if (lastView.current !== route.view) window.history.pushState(null, "", url);
+      else window.history.replaceState(null, "", url);
+    }
+    lastView.current = route.view;
+  }, [route]);
+
+  // URL -> ruta (atras/adelante o un hash pegado a mano)
+  React.useEffect(() => {
+    const onNav = () => {
+      const next = parseHash(window.location.hash);
+      setRoute((r) => (formatRoute(r) === formatRoute(next) ? r : next));
+      if (next.file) setPendingOpen(next.file);
+    };
+    window.addEventListener("popstate", onNav);
+    window.addEventListener("hashchange", onNav);
+    return () => {
+      window.removeEventListener("popstate", onNav);
+      window.removeEventListener("hashchange", onNav);
+    };
+  }, []);
 
   const notify = React.useCallback((text: string, tone: Toast["tone"] = "info") => {
     const id = Date.now() + Math.random();
@@ -164,6 +213,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     },
     pendingOpen,
     clearPendingOpen: () => setPendingOpen(null),
+    settingsTab: route.tab,
+    setSettingsTab,
+    setCodeFile,
   };
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

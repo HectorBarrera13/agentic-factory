@@ -96,7 +96,7 @@ function TreeNode({
 }
 
 export function CodeView() {
-  const { tick, notify, theme, pendingOpen, clearPendingOpen } = useApp();
+  const { tick, notify, theme, pendingOpen, clearPendingOpen, setCodeFile } = useApp();
   const [root, setRoot] = React.useState("user");
   const [tabs, setTabs] = React.useState<OpenTab[]>([]);
   const [active, setActive] = React.useState<string | null>(null);
@@ -152,6 +152,14 @@ export function CodeView() {
       clearPendingOpen();
     }
   }, [pendingOpen, openFile, clearPendingOpen]);
+
+  // la ruta recuerda el archivo activo (recargar lo vuelve a abrir)
+  const currentRoot = current?.root;
+  const currentPath = current?.path;
+  React.useEffect(() => {
+    if (pendingOpen) return;
+    setCodeFile(currentRoot && currentPath ? { root: currentRoot, path: currentPath } : null);
+  }, [currentRoot, currentPath, pendingOpen, setCodeFile]);
 
   const save = React.useCallback(async () => {
     if (!current || current.readonly || current.content === current.saved) return;

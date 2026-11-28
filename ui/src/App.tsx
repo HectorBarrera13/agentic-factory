@@ -180,6 +180,11 @@ function Toasts() {
 export default function App() {
   const { session, loadError, view, setView, refreshSession } = useApp();
   const [openDialog, setOpenDialog] = React.useState(false);
+  const [browseFirst, setBrowseFirst] = React.useState(false);
+  const openProject = (browse = false) => {
+    setBrowseFirst(browse);
+    setOpenDialog(true);
+  };
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -218,9 +223,9 @@ export default function App() {
         <ActivityBar />
         <main className="min-w-0 flex-1">
           {!project ? (
-            <WelcomeScreen onOpen={() => setOpenDialog(true)} />
+            <WelcomeScreen onOpen={openProject} />
           ) : !project.configured && view !== "settings" ? (
-            <WelcomeScreen onOpen={() => setOpenDialog(true)} unconfigured />
+            <WelcomeScreen onOpen={openProject} unconfigured />
           ) : view === "code" ? (
             <CodeView />
           ) : view === "factory" ? (
@@ -230,8 +235,8 @@ export default function App() {
           )}
         </main>
       </div>
-      <StatusBar onOpenProject={() => setOpenDialog(true)} />
-      <OpenProjectDialog open={openDialog} onOpenChange={setOpenDialog} />
+      <StatusBar onOpenProject={() => openProject()} />
+      <OpenProjectDialog open={openDialog} onOpenChange={setOpenDialog} browseFirst={browseFirst} />
       <Toasts />
     </div>
   );

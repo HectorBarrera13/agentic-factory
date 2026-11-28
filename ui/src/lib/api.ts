@@ -66,6 +66,16 @@ export interface ProbeResult {
   seconds: number;
 }
 
+export interface ModelInUse {
+  provider: ProviderId;
+  model: string;
+  roles: string[];
+  probe: ProbeResult | null;
+  /** FACTORY_MODEL del entorno reemplaza el modelo configurado (solo Gemini). */
+  env_override: boolean;
+  configured_model: string | null;
+}
+
 export interface Probes {
   items: Record<string, ProbeResult>;
   running: string[];
@@ -183,7 +193,9 @@ export interface RunSummary {
 }
 
 export interface Outcome {
-  kind: "running" | "done" | "awaiting" | "blocked" | "transient" | "error";
+  kind: "running" | "done" | "awaiting" | "blocked" | "transient" | "error" | "paused";
+  /** Se pidio pausa y el motor aun no corta (llamada al modelo cancelandose). */
+  pausing?: boolean;
   status?: string;
   gate?: string;
   message?: string;
@@ -217,6 +229,8 @@ export interface RunState {
   iterations?: number;
   branch?: string;
   worktree?: string;
+  /** Pausa humana: el run quedo en `status` (su ultimo checkpoint). */
+  paused?: { at: string; status: string; reason: string; worktree_reset: boolean };
   [key: string]: unknown;
 }
 
@@ -249,6 +263,8 @@ export interface Detected {
   config: ProjectConfig;
   notes: string[];
   has_config: boolean;
+  /** Proyecto nuevo: ultimo modelo que paso la prueba (ya aplicado en config). */
+  suggested_model?: { provider: ProviderId; model: string };
 }
 
 export class ApiError extends Error {
@@ -292,6 +308,7 @@ export const api = {
   meta: () => request<Meta>("GET", "/api/meta"),
   openProject: (path: string) => request<ProjectInfo>("POST", "/api/projects/open", { path }),
   detect: (path: string) => request<Detected>("POST", "/api/projects/detect", { path }),
+  browse: () => request<{ path: string | null }>("POST", "/api/projects/browse"),
   saveConfig: (config: ProjectConfig) => request<ProjectInfo>("PUT", "/api/config", config),
 
   tree: (root: string) => request<FileTree>("GET", `/api/files/tree?${q({ root })}`),
@@ -325,6 +342,7 @@ export const api = {
     ),
   advance: (id: string, mode: "fake" | "adk") =>
     request<Outcome>("POST", `/api/runs/${enc(id)}/advance`, { mode }),
+  pause: (id: string) => request<Outcome>("POST", `/api/runs/${enc(id)}/pause`),
   decideGate: (id: string, gate: string, body: Json) =>
     request<Json>("POST", `/api/runs/${enc(id)}/gates/${enc(gate)}`, body),
   decideFindings: (id: string, body: Json) =>
@@ -362,6 +380,7 @@ export const api = {
       `/api/providers/${enc(id)}/models?${q({ refresh: String(refresh) })}`,
     ),
   probes: () => request<Probes>("GET", "/api/models/probes"),
+  modelsInUse: () => request<{ items: ModelInUse[] }>("GET", "/api/models/in-use"),
   probe: (provider: ProviderId, model: string) =>
     request<ProbeResult>("POST", "/api/models/probe", { provider, model }),
 };

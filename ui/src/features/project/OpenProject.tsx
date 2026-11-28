@@ -1,4 +1,4 @@
-import { ArrowLeft, Check, FolderOpen, History, Search, Sparkles, Wand2 } from "lucide-react";
+import { ArrowLeft, Bot, Check, FolderOpen, FolderSearch, History, Search, Sparkles, Wand2 } from "lucide-react";
 import * as React from "react";
 import {
   Badge,
@@ -12,10 +12,12 @@ import {
   Select,
 } from "@/components/ui";
 import { api, errorMessage, type Detected, type ProjectConfig } from "@/lib/api";
-import { useApp } from "@/lib/app-state";
+import { useApp, useLoad } from "@/lib/app-state";
+import { ModelPicker } from "@/features/settings/ModelPicker";
+import { ProviderSelect } from "@/features/settings/SettingsView";
 import { VerifyEditor } from "@/features/settings/VerifyEditor";
 
-export function WelcomeScreen({ onOpen, unconfigured }: { onOpen: () => void; unconfigured?: boolean }) {
+export function WelcomeScreen({ onOpen, unconfigured }: { onOpen: (browse?: boolean) => void; unconfigured?: boolean }) {
   const { session } = useApp();
   const project = session?.project;
   return (
@@ -37,10 +39,17 @@ export function WelcomeScreen({ onOpen, unconfigured }: { onOpen: () => void; un
             </Callout>
           </div>
         ) : null}
-        <Button className="mt-6" onClick={onOpen}>
-          {unconfigured ? <Wand2 /> : <FolderOpen />}
-          {unconfigured ? "Configurar proyecto" : "Abrir proyecto"}
-        </Button>
+        <div className="mt-6 flex justify-center gap-2">
+          <Button onClick={() => onOpen()}>
+            {unconfigured ? <Wand2 /> : <FolderOpen />}
+            {unconfigured ? "Configurar proyecto" : "Abrir proyecto"}
+          </Button>
+          {unconfigured ? null : (
+            <Button variant="outline" onClick={() => onOpen(true)}>
+              <FolderSearch /> Examinar…
+            </Button>
+          )}
+        </div>
       </div>
     </div>
   );
@@ -51,9 +60,12 @@ type Step = "path" | "review";
 export function OpenProjectDialog({
   open,
   onOpenChange,
+  browseFirst = false,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
+  /** Abre el explorador del sistema en cuanto se muestra el dialogo. */
+  browseFirst?: boolean;
 }) {
   const { session, refreshSession, notify } = useApp();
   const [step, setStep] = React.useState<Step>("path");
@@ -62,6 +74,9 @@ export function OpenProjectDialog({
   const [error, setError] = React.useState<string | null>(null);
   const [detected, setDetected] = React.useState<Detected | null>(null);
   const [config, setConfig] = React.useState<ProjectConfig | null>(null);
+  const [browsing, setBrowsing] = React.useState(false);
+  const providers = useLoad(() => (step === "review" ? api.providers() : Promise.resolve(null)), [step]);
+  const probes = useLoad(() => (step === "review" ? api.probes() : Promise.resolve(null)), [step]);
 
   React.useEffect(() => {
     if (open) {
@@ -93,6 +108,33 @@ export function OpenProjectDialog({
       setBusy(false);
     }
   };
+
+  // explorador nativo del sistema (lo abre el servidor local); elegir carpeta = analizarla
+  const browse = async () => {
+    setBrowsing(true);
+    setError(null);
+    try {
+      const { path: chosen } = await api.browse();
+      if (chosen) {
+        setPath(chosen);
+        await analyze(chosen);
+      }
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setBrowsing(false);
+    }
+  };
+
+  const browseRequested = React.useRef(false);
+  React.useEffect(() => {
+    if (open && browseFirst && !browseRequested.current) {
+      browseRequested.current = true;
+      browse();
+    }
+    if (!open) browseRequested.current = false;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, browseFirst]);
 
   const save = async () => {
     if (!config) return;
@@ -139,12 +181,21 @@ export function OpenProjectDialog({
             }}
           >
             <Field label="Carpeta del proyecto">
-              <Input
-                autoFocus
-                placeholder="C:\ruta\a\mi-proyecto"
-                value={path}
-                onChange={(e) => setPath(e.target.value)}
-              />
+              <div className="flex gap-2">
+                <Input
+                  autoFocus
+                  aria-label="Carpeta del proyecto"
+                  placeholder="C:\ruta\a\mi-proyecto"
+                  value={path}
+                  onChange={(e) => setPath(e.target.value)}
+                />
+                <Button type="button" variant="outline" loading={browsing} onClick={browse} title="Elegir la carpeta con el explorador del sistema">
+                  <FolderSearch /> Examinar…
+                </Button>
+              </div>
+              {browsing ? (
+                <p className="mt-1 text-xs text-muted-foreground">Elige la carpeta en la ventana del explorador (puede quedar detrás del navegador).</p>
+              ) : null}
             </Field>
             {session?.recent.length ? (
               <div>
@@ -222,6 +273,45 @@ export function OpenProjectDialog({
                   onChange={(e) => patch((c) => (c.docs.spec = e.target.value || null))}
                 />
               </Field>
+            </section>
+            <section>
+              <h4 className="mb-2 flex items-center gap-1.5 text-xs font-semibold">
+                <Bot className="size-3.5" /> Modelo de los agentes
+              </h4>
+              <div className="grid grid-cols-[12rem_1fr] gap-3">
+                <Field label="Proveedor">
+                  <ProviderSelect
+                    label="Proveedor del proyecto"
+                    value={config.agents.provider}
+                    providers={providers.data?.items ?? []}
+                    onChange={(v) =>
+                      patch((c) => {
+                        if (!v || v === c.agents.provider) return;
+                        c.agents.provider = v;
+                        c.agents.model = "";
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Modelo"
+                  hint={
+                    detected?.suggested_model &&
+                    detected.suggested_model.provider === config.agents.provider &&
+                    detected.suggested_model.model === config.agents.model
+                      ? "Sugerido: el último modelo que pasó la prueba."
+                      : undefined
+                  }
+                >
+                  <ModelPicker
+                    label="Modelo del proyecto"
+                    provider={config.agents.provider}
+                    value={config.agents.model}
+                    onChange={(v) => patch((c) => (c.agents.model = v))}
+                    probes={probes.data}
+                  />
+                </Field>
+              </div>
             </section>
             <section>
               <div className="mb-2 flex items-center justify-between">
