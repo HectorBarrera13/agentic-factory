@@ -40,6 +40,7 @@ __all__ = [
     "list_runs",
     "read_state",
     "report_finding_ids",
+    "retry_run",
     "start_run",
 ]
 
@@ -156,6 +157,122 @@ def start_run(project: Project, change_id: str) -> dict:
     return state
 
 
+RETRYABLE = ("ESCALATED", "NOT READY")
+ATTEMPTS_DIR = "intentos"
+
+
+def retry_run(
+    project: Project,
+    change_id: str,
+    body: str,
+    reason: str,
+    recorded_by: str,
+    force: bool = False,
+) -> dict:
+    """Reintentar: nuevo intento del MISMO CR (editado) tras ESCALATED / NOT READY.
+
+    No reanuda nada: el intento anterior se archiva entero en `runs/<CR>/intentos/<n>/`,
+    su rama se renombra a `<rama>-intento<n>` (se conserva) y el nuevo intento empieza en
+    INTAKE_PENDING con todos los gates en PENDING. Firma el Product Owner (roles del gate
+    requirements). Superado `limits.attempts` exige `force` (decision explicita)."""
+    from .context import use_project
+    from .orchestrator import archive_run_branch
+
+    cid, reason = _cid(change_id), reason.strip()
+    state = read_state(project, cid)
+    status = state.get("status")
+    if status not in RETRYABLE:
+        raise FactoryError(
+            f"Solo se reintenta un run ESCALATED o NOT READY ({cid} esta en {status})"
+        )
+    if not reason:
+        raise FactoryError("Reintentar requiere un motivo")
+    if not body.strip():
+        raise FactoryError("El Change Request no puede quedar vacio")
+    if not recorded_by.strip() or "TODO" in recorded_by:
+        raise FactoryError('Identifique al humano: "Nombre (Rol)"')
+    role = validate_role("requirements", recorded_by, project.config.gates.roles)
+    attempt = int(state.get("attempt", 1))
+    cap = project.config.limits.attempts
+    if attempt >= cap and not force:
+        raise FactoryError(
+            f"{cid} ya lleva {attempt} intento(s) (tope {cap}). Si el CR sigue sin salir, "
+            "considera dividirlo o reescribir su alcance; reintenta de todos modos solo si "
+            "lo decides explicitamente.",
+            code="attempts_exhausted",
+        )
+
+    run = project.run_dir(cid)
+    source = find_change_request(project, cid)
+    previous_cr = (run / "00-change-request.md").read_text(encoding="utf-8", errors="replace")
+    archive = run / ATTEMPTS_DIR / str(attempt)
+    if archive.exists():
+        raise FactoryError(f"Ya existe el archivo del intento {attempt}: {archive}")
+    with use_project(project):
+        branch = archive_run_branch(cid, attempt)
+    archive.mkdir(parents=True)
+    for item in sorted(run.iterdir()):
+        if item.name != ATTEMPTS_DIR:
+            shutil.move(str(item), str(archive / item.name))
+
+    text = body.rstrip() + "\n"
+    source.write_text(text, encoding="utf-8")
+    (run / "00-change-request.md").write_text(text, encoding="utf-8")
+    now = _now()
+    previous = [
+        *state.get("previous_attempts", []),
+        {
+            "n": attempt,
+            "status": status,
+            "stop_reason": state.get("stop_reason", ""),
+            "branch": branch,
+            "archive": archive.relative_to(project.root).as_posix(),
+            "archived_at": now,
+        },
+    ]
+    retry = {
+        "by": recorded_by,
+        "role": role,
+        "reason": reason,
+        "at": now,
+        "forced": bool(attempt >= cap),
+        "cr_changed": previous_cr.rstrip() != body.rstrip(),
+    }
+    new = {
+        **initial_state(cid),
+        "attempt": attempt + 1,
+        "previous_attempts": previous,
+        "retry": retry,
+        "transitions": [{"status": "INTAKE_PENDING", "event": "RETRY", "at": now}],
+    }
+    (run / "factory-state.json").write_text(json.dumps(new, indent=2), encoding="utf-8")
+    (run / "00-retry-decision.md").write_text(
+        "\n".join(
+            [
+                f"# Reintento — {cid} (intento {attempt + 1})",
+                "",
+                f"- Decidido por: {recorded_by}",
+                f"- Fecha: {now}",
+                f"- Motivo: {reason}",
+                f"- Intento anterior: #{attempt} {status} — {state.get('stop_reason') or '-'}",
+                f"- Archivo del intento anterior: {previous[-1]['archive']}",
+                f"- Rama conservada: {branch or '(no llego a crear rama)'}",
+                f"- CR modificado: {'si' if retry['cr_changed'] else 'no'}",
+                *(
+                    [f"- Tope de intentos ({cap}) superado por decision explicita"]
+                    if retry["forced"]
+                    else []
+                ),
+                "",
+                "> Nuevo intento: todos los gates humanos vuelven a PENDING. Nada se reanuda.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return new
+
+
 def list_runs(project: Project) -> list[dict]:
     out = []
     if not project.runs_dir.is_dir():
@@ -172,6 +289,7 @@ def list_runs(project: Project) -> list[dict]:
                 "awaiting_gate": st.get("awaiting_gate") or "",
                 "stop_reason": st.get("stop_reason") or "",
                 "created_at": st.get("created_at"),
+                "attempt": st.get("attempt", 1),
             }
         )
     return out

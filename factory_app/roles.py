@@ -10,7 +10,13 @@ from .project import DEFAULT_GATE_ROLES
 
 
 class FactoryError(Exception):
-    """Error de uso de la fabrica (mensaje para el humano; la CLI lo muestra y sale)."""
+    """Error de uso de la fabrica (mensaje para el humano; la CLI lo muestra y sale).
+
+    `code` (opcional) permite a la UI reaccionar a un caso concreto sin parsear el texto."""
+
+    def __init__(self, message: str = "", code: str = ""):
+        super().__init__(message)
+        self.code = code
 
 
 def role_of(recorded_by: str) -> str:

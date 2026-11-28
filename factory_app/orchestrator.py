@@ -605,14 +605,49 @@ def _try_resume_escalation(run_dir: Path, state: dict) -> dict | None:
             (run_dir / f"human-{gate}-decision.json").rename(
                 run_dir / f"human-{gate}-decision-clarification{n or ''}.json"
             )
+            # acumuladas: el agente ve TODAS las respuestas del PO, no solo la ultima
+            history = [*state.get("po_clarifications", [])]
+            history.append(
+                {
+                    "n": len(history) + 1,
+                    "gate": gate,
+                    "reason": str(decision.get("reason", ""))[:2000],
+                    "by": str(decision.get("recorded_by", "")),
+                    "at": str(decision.get("recorded_at", "")),
+                }
+            )
             return _update_state(
                 run_dir,
                 status=target,
                 stop_reason="",
                 awaiting_gate="",
                 planned=False,
-                po_clarification=str(decision.get("reason", ""))[:2000],
+                po_clarifications=history,
+                po_clarification=render_clarifications(history),
             )
+    return None
+
+
+def render_clarifications(history: list[dict]) -> str:
+    """Texto para el prompt: todas las aclaraciones del PO, numeradas y en orden."""
+    if not history:
+        return ""
+    lines = ["Cumulative Product Owner answers (already decided: do not ask these again):"]
+    for c in history:
+        who = " · ".join(x for x in (c.get("gate", ""), c.get("by", ""), c.get("at", "")) if x)
+        lines.append(f"{c.get('n', '?')}. [{who}] {c.get('reason', '')}")
+    return "\n".join(lines)
+
+
+def _clarifications_exhausted(state: dict) -> str | None:
+    """Tope de aclaraciones del PO por intento: al agotarse el run escala SIN gate abierto
+    (no se reanuda; se edita el CR con Reintentar)."""
+    used = len(state.get("po_clarifications", []))
+    cap = project().config.limits.clarification_rounds
+    if used >= cap:
+        return (
+            f"aclaraciones agotadas ({used}/{cap}): divide o reescribe el CR y usa Reintentar"
+        )
     return None
 
 
@@ -755,6 +790,28 @@ def remove_worktree(change_id: str) -> bool:
     return True
 
 
+def archive_run_branch(change_id: str, attempt: int) -> str | None:
+    """Reintentar: quita el worktree del intento y renombra su rama a
+    `<rama>-intento<N>` (se CONSERVA para revisarla; nunca se borra ni se mergea).
+    Devuelve la rama archivada, o None si el intento no llego a crear rama."""
+    if not _has_git():
+        return None
+    branch = project().branch(change_id)
+    if _git(["rev-parse", "--verify", f"refs/heads/{branch}"]).returncode != 0:
+        remove_worktree(change_id)
+        return None
+    remove_worktree(change_id)
+    _git(["worktree", "prune"])
+    n = attempt
+    while _git(["rev-parse", "--verify", f"refs/heads/{branch}-intento{n}"]).returncode == 0:
+        n += 1
+    target = f"{branch}-intento{n}"
+    r = _git(["branch", "-m", branch, target])
+    if r.returncode != 0:
+        raise Blocked(f"{change_id}: no se pudo archivar la rama {branch}: {r.stderr.strip()}")
+    return target
+
+
 def _diff_range(state: dict) -> str:
     base = state.get("base_commit") or project().config.git.base_branch
     return f"{base}...{state.get('branch') or 'HEAD'}"
@@ -811,6 +868,10 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 if reco == "HUMAN_CLARIFICATION_REQUIRED"
                 else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
             )
+            exhausted = _clarifications_exhausted(state)
+            if exhausted:
+                _escalate(run_dir, change_id, f"{exhausted} (intake: {why})")
+                raise Blocked(f"{change_id}: {exhausted} -> ESCALATED")
             _escalate(
                 run_dir,
                 change_id,
@@ -858,6 +919,10 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                     if reco == "HUMAN_CLARIFICATION_REQUIRED"
                     else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
                 )
+                exhausted = _clarifications_exhausted(state)
+                if exhausted:
+                    _escalate(run_dir, change_id, f"{exhausted} (planner: {why})")
+                    raise Blocked(f"{change_id}: {exhausted} -> ESCALATED")
                 _escalate(
                     run_dir,
                     change_id,
@@ -1402,6 +1467,12 @@ def build_factory_run(change_id: str, state: dict, run_dir: Path) -> dict:
         "history": state.get("transitions", []),
         # solo runs --adk: proveedor/modelo/temperatura pedida y efectiva por rol
         **({"models": state["models"]} if state.get("models") else {}),
+        # solo a partir del 2o intento (Reintentar): el run 1 conserva el shape del curso
+        **(
+            {"attempt": state.get("attempt", 1), "previous_attempts": state["previous_attempts"]}
+            if state.get("previous_attempts")
+            else {}
+        ),
     }
 
 
@@ -1418,6 +1489,17 @@ def build_evidence_summary(run: dict, run_dir: Path) -> str:
                 f"- Security: {run['security']}",
                 f"- Gates humanos: {run['human_gates']}",
                 f"- Iteraciones fix: {run['iterations']}",
+                *(
+                    [
+                        f"- Intento {run.get('attempt', 1)}; anteriores: "
+                        + "; ".join(
+                            f"#{a['n']} {a['status']} ({a.get('stop_reason') or '-'})"
+                            for a in run["previous_attempts"]
+                        )
+                    ]
+                    if run.get("previous_attempts")
+                    else []
+                ),
                 f"- Traceability gaps ({UNMAPPED}): {run.get('traceability_gaps', 0)}",
                 f"- Artefactos ({len(present)}): {', '.join(present)}",
                 "",

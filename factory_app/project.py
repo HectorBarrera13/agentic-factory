@@ -243,6 +243,11 @@ class Agents(BaseModel):
 class Limits(BaseModel):
     verify_rounds: int = Field(default=3, ge=1, le=10)
     review_rounds: int = Field(default=3, ge=1, le=10)
+    # respuestas del PO a pedidos de aclaracion por intento; al agotarse el run escala
+    # sin gate abierto y solo sigue con Reintentar (CR editado)
+    clarification_rounds: int = Field(default=3, ge=1, le=10)
+    # intentos por CR antes de pedir confirmacion explicita para reintentar
+    attempts: int = Field(default=3, ge=1, le=10)
 
 
 class Gates(BaseModel):
