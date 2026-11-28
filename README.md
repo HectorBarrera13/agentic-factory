@@ -48,6 +48,11 @@ uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?
   desde su inicio. Si se cortó al Coder, sus cambios a medias en el worktree del run se descartan
   (nunca en tu árbol). La pausa y la reanudación quedan en `transitions` (`PAUSED`/`RESUMED`). La
   verificación (tests/lint) no se corta: termina y la pausa se aplica justo después.
+- **Escalados**: el tablero distingue el escalado *reanudable* (el agente pide una aclaración: la
+  registras como decisión en el gate y pulsas Avanzar) del *definitivo* (gate rechazado o diferido,
+  topes de rondas, aclaraciones agotadas). Un run `ESCALATED` o `NOT READY` muestra **Reintentar**:
+  editas el CR, escribes el motivo y firmas como Product Owner, y empieza un intento nuevo del mismo
+  CR (ver "Reintentar" abajo).
 - **Worktree por run**: al aprobar el plan, el run trabaja en `.factory/worktrees/<CR>` con su rama
   `factory/<CR>`; tu árbol no se toca y puedes seguir editando. El worktree solo se borra con
   "Quitar worktree" (la rama se conserva). Nunca hay merge automático.
@@ -121,6 +126,9 @@ uv run python scripts/decide_findings.py CR-001 --by "Ana (Human Reviewer)" SEC-
 uv run python scripts/approve_gate.py CR-001 review APPROVED "hallazgos clasificados" --by "Ana (Human Reviewer)"
 uv run python scripts/approve_gate.py CR-001 release APPROVED "evidencia completa" --by "Hector (Release Manager)"
 
+#    run ESCALATED o NOT READY: edita el archivo del CR y abre un intento nuevo (firma el PO)
+uv run python scripts/retry_run.py CR-001 "alcance aclarado" --by "Hector (Product Owner)"
+
 # 4. inspección
 uv run python scripts/show_run.py CR-001
 cat runs/CR-001/factory-run.json runs/CR-001/traceability.md
@@ -176,6 +184,19 @@ Alineación con el instructivo (§8-§18):
   aclaración solo reanuda (se archiva como `human-<gate>-decision-clarification.json`) y el
   intake/plan regenerado vuelve a pasar por su gate con una decisión nueva. Los rechazos de
   gate no se reanudan.
+- Las aclaraciones del PO se **acumulan** (`po_clarifications`): el agente recibe todas las
+  respuestas anteriores numeradas y no debe volver a preguntarlas. Tienen tope por intento
+  (`limits.clarification_rounds`, 3 por defecto): si el agente vuelve a pedir aclaración con el
+  tope agotado, el run queda `ESCALATED` sin gate abierto ("aclaraciones agotadas") y solo sigue
+  con Reintentar.
+- **Reintentar** (`retry_run`, Studio o `scripts/retry_run.py`), solo desde `ESCALATED` o
+  `NOT READY` y con firma del Product Owner (roles del gate `requirements`). No reanuda nada: el
+  intento anterior se archiva entero en `runs/<CR>/intentos/<n>/`, su rama se renombra a
+  `factory/<CR>-intento<n>` (se conserva, no se borra ni se mergea; se quita solo su worktree) y el
+  intento nuevo arranca en `INTAKE_PENDING` con el CR editado y todos los gates en `PENDING`.
+  Queda `00-retry-decision.md` (quién, por qué, intento anterior y si cambió el CR) y
+  `factory-run.json` incluye `attempt` y `previous_attempts`. Pasado `limits.attempts` (3 por
+  defecto) se exige confirmación explícita (`--force`), que también queda registrada.
 - Re-review: la ronda anterior se archiva (`08-review-report-roundN.md`), se escribe
   `13-re-review.md`, y los reportes de una ronda no se regeneran al reanudar tras el gate.
 - Solo un MUST FIX / HIGH aceptado dispara fix; un SHOULD FIX aceptado queda registrado.

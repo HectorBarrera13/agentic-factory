@@ -29,6 +29,8 @@ runs/CR-001/
   human-<gate>-decision-clarification*.json  # aclaraciones del PO que reanudaron un ESCALATED
   human-findings-decisions.json         # decisiones por finding (ACCEPTED/REJECTED/MODIFIED/DEFERRED)
   08-review-report-roundN.md, 09-security-report-roundN.md   # rondas previas archivadas
+  00-retry-decision.md                  # Reintentar: quien, por que, intento anterior, CR cambiado
+  intentos/<n>/                         # intento anterior archivado completo (rama factory/<CR>-intento<n>)
 ```
 
 La carpeta de runs, la de CRs y la de worktrees se configuran en `.factory/config.toml`
