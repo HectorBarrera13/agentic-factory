@@ -20,6 +20,29 @@ DOC_CANDIDATES = {
 }
 
 
+# carpetas que nunca son "el codigo" del proyecto aunque tengan archivos del lenguaje
+NOT_SOURCE_DIRS = {
+    "node_modules", "dist", "build", "out", "coverage", "vendor", "docs", "scripts",
+    "results", *TEST_DIR_CANDIDATES,
+}
+CODE_SUFFIXES = {
+    "javascript": (".js", ".mjs", ".cjs", ".jsx"),
+    "typescript": (".ts", ".tsx", ".mts", ".cts", ".js", ".mjs"),
+}
+
+
+def _code_dirs(root: Path, suffixes: tuple[str, ...]) -> list[str]:
+    """Carpetas de primer nivel con codigo del lenguaje (mira hasta dos niveles)."""
+    found = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith(".") or d.name in NOT_SOURCE_DIRS:
+            continue
+        files = [*d.glob("*"), *d.glob("*/*")]
+        if any(f.is_file() and f.suffix in suffixes for f in files):
+            found.append(d.name)
+    return found
+
+
 def _first(root: Path, candidates) -> str | None:
     return next((c for c in candidates if (root / c).exists()), None)
 
@@ -71,11 +94,17 @@ def _node(root: Path) -> dict:
         commands.append({"name": "lint", "cmd": ["npm", "run", "lint"], "kind": "lint"})
     if "build" in scripts:
         commands.append({"name": "build", "cmd": ["npm", "run", "build"], "kind": "exit_code"})
+    if (root / "src").is_dir():
+        source = ["src"]
+    elif (root / "app").is_dir():
+        source = ["app"]
+    else:
+        # p. ej. un proyecto vanilla con js/ y css/: antes se proponia "src", que no existia
+        source = _code_dirs(root, CODE_SUFFIXES[language]) or ["src"]
     return {
         "name": pkg.get("name", "") if isinstance(pkg, dict) else "",
         "language": language,
-        "source": ["src"] if (root / "src").is_dir() else ["app"] if (root / "app").is_dir()
-        else ["src"],
+        "source": source,
         "commands": commands,
     }
 
@@ -99,6 +128,13 @@ def detect(root: Path) -> dict:
         notes.append("Sin comandos de verificacion: la verificacion fallara hasta configurarlos.")
     if not (root / ".git").exists():
         notes.append("La carpeta no es un repo git: sin git no hay rama ni worktree por run.")
+    missing = [s for s in found["source"] if not (root / s).exists()]
+    if missing:
+        notes.append(
+            "No se encontro la carpeta de codigo " + ", ".join(missing)
+            + ": indica en Rutas y codigo donde esta el codigo; sin eso los agentes no pueden"
+            " leerlo ni cambiarlo."
+        )
     tests = _first(root, TEST_DIR_CANDIDATES) or "tests"
     docs = {key: _first(root, cands) for key, cands in DOC_CANDIDATES.items()}
     if not docs["requirements"]:

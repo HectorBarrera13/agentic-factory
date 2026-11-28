@@ -167,6 +167,27 @@ def test_wizard_detects_a_typescript_project(client, tmp_path):
     assert [c["kind"] for c in cfg["verify"]["commands"]] == ["jest", "lint"]
 
 
+def test_wizard_finds_the_real_code_folder_of_a_vanilla_js_project(client, tmp_path):
+    other = tmp_path / "notas"
+    for folder, name in [("js", "app.js"), ("css", "styles.css"), ("tests", "a.test.mjs"),
+                         ("scripts", "x.js"), ("node_modules/lib", "index.js")]:
+        (other / folder).mkdir(parents=True)
+        (other / folder / name).write_text("//")
+    (other / "package.json").write_text('{"name": "notas", "scripts": {"test": "node --test"}}')
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert out["config"]["code"]["source"] == ["js"]
+    assert not any("No se encontro la carpeta de codigo" in n for n in out["notes"])
+
+
+def test_wizard_warns_when_it_cannot_find_the_code_folder(client, tmp_path):
+    other = tmp_path / "vacio"
+    other.mkdir()
+    (other / "package.json").write_text('{"name": "vacio"}')
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert out["config"]["code"]["source"] == ["src"]
+    assert any("No se encontro la carpeta de codigo src" in n for n in out["notes"])
+
+
 # ---------------------------------------------------------------- CRs y perfiles
 def test_change_requests_crud_and_freeze(client):
     r = client.post("/api/crs", json={"change_id": "CR-002", "title": "Export", "body": "x"})
