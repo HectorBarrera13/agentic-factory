@@ -74,6 +74,10 @@ function mockBase(run: RunDetail, models: ModelInUse[]) {
   vi.spyOn(api, "run").mockResolvedValue(run);
   vi.spyOn(api, "modelsInUse").mockResolvedValue({ items: models });
   vi.spyOn(api, "activity").mockResolvedValue({ items: [], last: 0 });
+  vi.spyOn(api, "cr").mockResolvedValue({
+    change_id: "CR-001", file: "crs/CR-001.md", body: "# CR-001", frozen: true, retryable: false,
+    editable: false, archivable: false, deletable: false, reason: "el intake ya corrio",
+  });
 }
 
 beforeEach(() => {
@@ -125,7 +129,7 @@ describe("RunBoard", () => {
     render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
     const select = await screen.findByLabelText("Modo de ejecución");
     const options = [...(select as HTMLSelectElement).options].map((o) => o.textContent);
-    expect(options[0]).toMatch(/^Modelo real \(gemini\/gemini-a\)/);
+    expect(options[0]).toMatch(/^Modelo real · gemini\/gemini-a/);
     expect(options[1]).toMatch(/Simulación/);
     expect(select).toHaveValue("adk");
   });
@@ -192,7 +196,7 @@ describe("Escalado y Reintentar", () => {
   const mockRun = (st: Partial<RunState>) => {
     mockBase(detail({}, st), [model("OK")]);
     withPo();
-    vi.spyOn(api, "cr").mockResolvedValue({ change_id: "CR-001", file: "crs/CR-001.md", body: "# CR-001\nviejo", frozen: true, retryable: true });
+    vi.spyOn(api, "cr").mockResolvedValue({ change_id: "CR-001", file: "crs/CR-001.md", body: "# CR-001\nviejo", frozen: true, retryable: true, editable: false, archivable: true, deletable: true, reason: "" });
   };
 
   it("Reintentar aparece en ESCALATED y NOT READY, no en READY", async () => {

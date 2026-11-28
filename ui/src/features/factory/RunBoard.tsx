@@ -9,6 +9,7 @@ import {
   GitCompare,
   FlaskConical,
   Activity,
+  FolderArchive as ArchiveIcon,
   Pause,
   Play,
   RotateCcw,
@@ -24,6 +25,8 @@ import {
   Callout,
   Card,
   EmptyState,
+  LoadingBlock,
+  Menu,
   Select,
   Tabs,
   TabsContent,
@@ -36,6 +39,8 @@ import { deriveFlow, useActivity } from "@/lib/activity";
 import { statusLabel, statusTone, TERMINAL } from "@/lib/phases";
 import { cn, formatTime, languageFor } from "@/lib/utils";
 import { ProviderLogo } from "@/components/ProviderLogo";
+import { DeleteCrDialog, EditCrButton, useSignature } from "./CrEditor";
+import { StatusIcon } from "./StatusIcon";
 import { FindingsTable } from "./FindingsTable";
 import { GateCard } from "./GateCard";
 import { ActivityLog } from "./ActivityLog";
@@ -77,9 +82,21 @@ const PROBE_WORDS: Record<string, string> = {
 
 const probeWords = (m: ModelInUse) => (m.probe ? PROBE_WORDS[m.probe.status] ?? m.probe.status : "sin probar");
 
-export function RunBoard({ changeId }: { changeId: string }) {
+export function RunBoard({
+  changeId,
+  onRemoved,
+  onRestore,
+}: {
+  changeId: string;
+  /** el CR se archivo o elimino: la lista se recarga */
+  onRemoved?: () => void;
+  /** "Deshacer" del archivado */
+  onRestore?: (id: string) => void;
+}) {
   const { meta, tick, probeTick, signer, notify, openFile, session } = useApp();
   const run = useLoad(() => api.run(changeId), [changeId, tick]);
+  // que se puede hacer con el CR (editar antes del intake, archivar/eliminar al terminar)
+  const life = useLoad(() => api.cr(changeId), [changeId, tick, run.data?.state.status, run.data?.busy]);
   const agents = session?.project?.config.agents;
   const inUse = useLoad(() => api.modelsInUse(), [probeTick, JSON.stringify(agents)]);
   const [mode, setModeState] = React.useState<Mode>(readMode);
@@ -102,7 +119,7 @@ export function RunBoard({ changeId }: { changeId: string }) {
     return <div className="p-6"><Callout tone="danger" title="No se pudo cargar el run">{run.error}</Callout></div>;
   }
   const d = run.data;
-  if (!d || !meta) return <div className="p-6 text-sm text-muted-foreground">Cargando run…</div>;
+  if (!d || !meta) return <LoadingBlock label="Cargando run…" lines={5} />;
 
   const st = d.state;
   // un ESCALATED por ambiguedad con su gate abierto se reanuda: no es terminal en la UI
@@ -117,9 +134,9 @@ export function RunBoard({ changeId }: { changeId: string }) {
   const paused = st.paused && !d.busy ? st.paused : null;
   const isPausing = d.busy && (pausing || Boolean(d.outcome?.pausing));
   const realLabel = models.length
-    ? `Modelo real (${models[0].provider}/${models[0].model}${models.length > 1 ? ` +${models.length - 1}` : ""})`
+    ? `Modelo real · ${models[0].provider}/${models[0].model}${models.length > 1 ? ` +${models.length - 1}` : ""}`
     : agents
-      ? `Modelo real (${agents.provider}/${agents.model})`
+      ? `Modelo real · ${agents.provider}/${agents.model}`
       : "Modelo real";
 
   const advance = async () => {
@@ -163,55 +180,76 @@ export function RunBoard({ changeId }: { changeId: string }) {
 
   return (
     <div className="flex h-full flex-col">
-      <header className="flex flex-wrap items-center gap-3 border-b border-border px-5 py-3">
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
+      <header className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border px-5 py-3">
+        <div className="min-w-0 flex-1 basis-64">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="font-mono text-base font-semibold">{changeId}</h2>
-            <Badge tone={statusTone(st.status, st.awaiting_gate)}>{statusLabel(st.status, st.awaiting_gate)}</Badge>
+            <Badge tone={statusTone(st.status, st.awaiting_gate)}>
+              <StatusIcon status={st.status} awaiting={st.awaiting_gate} paused={st.paused} />
+              {statusLabel(st.status, st.awaiting_gate)}
+            </Badge>
             {d.busy ? <Badge tone="info">{isPausing ? "pausando…" : "en curso"}</Badge> : null}
             {paused ? <Badge tone="warning"><Pause className="size-3" /> Pausada en {statusLabel(paused.status)}</Badge> : null}
             {(st.attempt ?? 1) > 1 ? <Badge tone={(st.attempt ?? 1) > attempts ? "warning" : "neutral"}>Intento {st.attempt}/{attempts}</Badge> : null}
           </div>
-          <p className="mt-0.5 text-xs text-muted-foreground">
+          <p className="mt-0.5 truncate text-xs text-muted-foreground" title={st.branch ?? undefined}>
             {st.branch ? <>rama <span className="font-mono">{st.branch}</span> · </> : null}
             iteraciones {st.iterations ?? 0}
           </p>
         </div>
-        <div className="flex-1" />
-        {retryable ? (
-          <Button variant="outline" size="sm" onClick={() => setRetrying(true)} title="Editar el CR y correr un intento nuevo (el actual se archiva)">
-            <RotateCcw /> Reintentar
-          </Button>
-        ) : null}
-        {!terminal ? (
-          <div className="flex items-center gap-2">
-            <Select aria-label="Modo de ejecución" className="h-8 w-64 text-xs" value={mode} disabled={d.busy} onChange={(e) => setMode(e.target.value as Mode)}>
-              <option value="adk">{realLabel}</option>
-              <option value="fake">Simulación (Fake, sin modelo)</option>
-            </Select>
-            {d.busy ? (
-              <Button
-                variant="outline"
-                onClick={pause}
-                loading={isPausing}
-                disabled={isPausing}
-                title="Corta ya la ejecución; al reanudar se repite la fase en curso desde su inicio"
-              >
-                <Pause /> {isPausing ? "Pausando…" : "Pausar"}
-              </Button>
-            ) : null}
-            <Button
-              onClick={advance}
-              loading={starting || d.busy}
-              disabled={Boolean(st.awaiting_gate) && !d.gate?.recorded}
-              title={st.awaiting_gate && !d.gate?.recorded ? "Decide el gate primero" : paused ? "Repite la fase pausada desde su inicio" : "Avanza hasta el siguiente gate"}
-            >
-              <Play /> {paused ? "Reanudar" : "Avanzar"}
+        <div className="ml-auto flex min-w-0 flex-wrap items-center justify-end gap-2">
+          {life.data?.editable && !d.busy ? (
+            <EditCrButton
+              changeId={changeId}
+              onSaved={() => {
+                life.reload();
+                run.reload();
+              }}
+            />
+          ) : null}
+          {retryable ? (
+            <Button variant="outline" size="sm" onClick={() => setRetrying(true)} title="Editar el CR y correr un intento nuevo (el actual se archiva)">
+              <RotateCcw /> Reintentar
             </Button>
-          </div>
-        ) : (
-          <TerminalActions detail={d} onChange={run.reload} />
-        )}
+          ) : null}
+          {!terminal ? (
+            <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+              <Select aria-label="Modo de ejecución" className="h-8 w-auto min-w-40 max-w-64 text-xs" value={mode} disabled={d.busy} onChange={(e) => setMode(e.target.value as Mode)}>
+                <option value="adk">{realLabel}</option>
+                <option value="fake">Simulación (Fake, sin modelo)</option>
+              </Select>
+              {d.busy ? (
+                <Button
+                  variant="outline"
+                  onClick={pause}
+                  loading={isPausing}
+                  disabled={isPausing}
+                  title="Corta ya la ejecución; al reanudar se repite la fase en curso desde su inicio"
+                >
+                  <Pause /> {isPausing ? "Pausando…" : "Pausar"}
+                </Button>
+              ) : null}
+              <Button
+                onClick={advance}
+                loading={starting || d.busy}
+                disabled={Boolean(st.awaiting_gate) && !d.gate?.recorded}
+                title={st.awaiting_gate && !d.gate?.recorded ? "Decide el gate primero" : paused ? "Repite la fase pausada desde su inicio" : "Avanza hasta el siguiente gate"}
+              >
+                <Play /> {paused ? "Reanudar" : "Avanzar"}
+              </Button>
+            </div>
+          ) : (
+            <TerminalActions
+              detail={d}
+              archivable={Boolean(life.data?.archivable)}
+              deletable={Boolean(life.data?.deletable)}
+              reason={life.data?.reason}
+              onChange={run.reload}
+              onRemoved={onRemoved}
+              onRestore={onRestore}
+            />
+          )}
+        </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-auto">
@@ -224,10 +262,17 @@ export function RunBoard({ changeId }: { changeId: string }) {
               busy={d.busy}
               artifacts={d.artifacts.map((a) => a.name)}
               onOpenArtifact={showArtifact}
+              recorded={d.gate?.recorded ?? null}
             />
           </Card>
 
-          <NowStrip flow={flow} live={d.live} busy={d.busy} message={d.outcome?.kind === "running" ? d.outcome.message : undefined} />
+          <NowStrip
+            flow={flow}
+            live={d.live}
+            busy={d.busy}
+            message={d.outcome?.kind === "running" ? d.outcome.message : undefined}
+            recorded={d.gate?.recorded ?? null}
+          />
 
           {!terminal && notOk.length ? <ModelWarning items={notOk} /> : null}
           {!terminal ? <EnvOverrideNote items={models} /> : null}
@@ -410,9 +455,28 @@ export function EnvOverrideNote({ items }: { items: ModelInUse[] }) {
   );
 }
 
-function TerminalActions({ detail, onChange }: { detail: RunDetail; onChange: () => void }) {
+function TerminalActions({
+  detail,
+  archivable,
+  deletable,
+  reason,
+  onChange,
+  onRemoved,
+  onRestore,
+}: {
+  detail: RunDetail;
+  archivable: boolean;
+  deletable: boolean;
+  reason?: string;
+  onChange: () => void;
+  onRemoved?: () => void;
+  onRestore?: (id: string) => void;
+}) {
   const { notify } = useApp();
+  const sign = useSignature();
   const [busy, setBusy] = React.useState<string | null>(null);
+  const [deleting, setDeleting] = React.useState(false);
+  const id = detail.change_id;
   const act = async (name: string, fn: () => Promise<string>) => {
     setBusy(name);
     try {
@@ -424,29 +488,76 @@ function TerminalActions({ detail, onChange }: { detail: RunDetail; onChange: ()
       setBusy(null);
     }
   };
+  const archive = async () => {
+    const sig = sign();
+    if (!sig) return;
+    setBusy("archive");
+    try {
+      const r = await api.archiveCr(id, { profile_id: sig.profile_id, role: sig.role });
+      notify(
+        `${id} archivado${r.worktree_removed ? " (worktree quitado)" : ""}. La rama sigue.`,
+        "success",
+        onRestore ? { label: "Deshacer", onClick: () => onRestore(id) } : undefined,
+      );
+      onRemoved?.();
+    } catch (err) {
+      notify(errorMessage(err), "danger");
+    } finally {
+      setBusy(null);
+    }
+  };
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
       <Button
         variant="outline"
         size="sm"
         loading={busy === "export"}
-        onClick={() => act("export", async () => `Evidencia exportada en ${(await api.exportEvidence(detail.change_id)).dest}`)}
+        onClick={() => act("export", async () => `Evidencia exportada en ${(await api.exportEvidence(id)).dest}`)}
       >
         <Archive /> Exportar evidencia
       </Button>
-      {detail.worktree ? (
-        <Button
-          variant="ghost"
-          size="sm"
-          loading={busy === "cleanup"}
-          onClick={() => {
-            if (!window.confirm(`Quitar el worktree de ${detail.change_id}? La rama se conserva.`)) return;
-            act("cleanup", async () => ((await api.cleanup(detail.change_id)).removed ? "Worktree eliminado (la rama sigue)" : "No había worktree"));
-          }}
-        >
-          <Trash2 /> Quitar worktree
-        </Button>
-      ) : null}
+      <Button
+        variant="outline"
+        size="sm"
+        loading={busy === "archive"}
+        disabled={!archivable}
+        title={archivable ? "Oculta el CR y su run; se puede restaurar. Quita el worktree, la rama sigue." : reason}
+        onClick={archive}
+      >
+        <ArchiveIcon /> Archivar
+      </Button>
+      <Menu
+        label={`Más acciones de ${id}`}
+        items={[
+          ...(detail.worktree
+            ? [
+                {
+                  label: "Quitar worktree",
+                  icon: <Trash2 />,
+                  onSelect: () => {
+                    if (!window.confirm(`Quitar el worktree de ${id}? La rama se conserva.`)) return;
+                    act("cleanup", async () => ((await api.cleanup(id)).removed ? "Worktree eliminado (la rama sigue)" : "No había worktree"));
+                  },
+                },
+              ]
+            : []),
+          {
+            label: "Eliminar…",
+            icon: <Trash2 />,
+            danger: true,
+            disabled: !deletable,
+            hint: deletable ? "Borra el CR, su evidencia y el worktree; la rama sigue" : reason,
+            onSelect: () => setDeleting(true),
+          },
+        ]}
+      />
+      <DeleteCrDialog
+        changeId={id}
+        hasRun
+        open={deleting}
+        onOpenChange={setDeleting}
+        onDeleted={() => onRemoved?.()}
+      />
     </div>
   );
 }
@@ -463,14 +574,16 @@ function ArtifactsPane({ detail, selected, onSelect }: { detail: RunDetail; sele
   const text = content.data?.content ?? "";
   const isMd = current?.endsWith(".md");
   return (
-    <div className="grid min-h-[22rem] grid-cols-[15rem_1fr]">
-      <div className="border-r border-border p-1.5">
-        {detail.artifacts.map((a) => (
+    <div className="grid min-h-[22rem] grid-cols-[minmax(12rem,17rem)_minmax(0,1fr)]">
+      <div className="anim-list max-h-[34rem] overflow-auto border-r border-border p-1.5">
+        {detail.artifacts.map((a, i) => (
           <button
             key={a.name}
+            style={{ ["--i" as string]: i }}
             type="button"
             onClick={() => onSelect(a.name)}
-            className={cn("flex w-full items-center gap-1.5 truncate rounded px-2 py-1.5 text-left font-mono text-[11px] hover:bg-accent", a.name === current && "bg-primary/15")}
+            title={a.name}
+            className={cn("flex w-full min-w-0 items-center gap-1.5 rounded px-2 py-1.5 text-left font-mono text-[11px] transition-colors duration-100 hover:bg-accent", a.name === current && "bg-primary/15 text-foreground")}
           >
             <FileText className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="truncate">{a.name}</span>
@@ -520,7 +633,7 @@ function DiffPane({
   }
   const statusTone = (s: string) => (s === "A" ? "text-success" : s === "D" ? "text-danger" : "text-warning");
   return (
-    <div className="grid h-[30rem] grid-cols-[15rem_1fr]">
+    <div className="grid h-[30rem] grid-cols-[minmax(12rem,17rem)_minmax(0,1fr)]">
       <div className="overflow-auto border-r border-border p-1.5">
         {files.data?.files.map((f) => (
           <button

@@ -180,7 +180,34 @@ export interface ChangeRequest {
   change_id: string;
   file: string;
   title: string;
-  has_run: boolean;
+  has_run?: boolean;
+  /** solo en la lista de archivados */
+  archived?: boolean;
+  archived_at?: string;
+  archived_by?: string;
+  status?: string;
+}
+
+/** Que se puede hacer con un CR ahora (lo decide el servidor). */
+export interface CrLifecycle {
+  editable: boolean;
+  archivable: boolean;
+  deletable: boolean;
+  /** por que no se puede editar/archivar/eliminar, en palabras */
+  reason: string;
+}
+
+export interface CrInfo extends CrLifecycle {
+  change_id: string;
+  file: string;
+  body: string;
+  frozen: boolean;
+  retryable: boolean;
+}
+
+export interface Signature {
+  profile_id: string;
+  role: string;
 }
 
 export interface RunSummary {
@@ -391,12 +418,18 @@ export const api = {
     }),
   gitStatus: () => request<{ files: { status: string; path: string }[] }>("GET", "/api/git/status"),
 
-  crs: () => request<{ items: ChangeRequest[] }>("GET", "/api/crs"),
-  cr: (id: string) =>
-    request<{ change_id: string; file: string; body: string; frozen: boolean; retryable: boolean }>(
-      "GET",
-      `/api/crs/${enc(id)}`,
+  crs: (archived = false) =>
+    request<{ items: ChangeRequest[] }>("GET", archived ? "/api/crs?archived=true" : "/api/crs"),
+  cr: (id: string) => request<CrInfo>("GET", `/api/crs/${enc(id)}`),
+  archiveCr: (id: string, sig: Signature) =>
+    request<{ change_id: string; archived_at: string; branch?: string; worktree_removed?: boolean }>(
+      "POST",
+      `/api/crs/${enc(id)}/archive`,
+      sig,
     ),
+  restoreCr: (id: string) => request<{ change_id: string }>("POST", `/api/crs/${enc(id)}/restore`),
+  deleteCr: (id: string, confirm: string, sig: Signature) =>
+    request<{ change_id: string; deleted: string[] }>("DELETE", `/api/crs/${enc(id)}`, { confirm, ...sig }),
   createCr: (change_id: string, title: string, body: string) =>
     request<{ file: string }>("POST", "/api/crs", { change_id, title, body }),
   updateCr: (id: string, body: string) =>
