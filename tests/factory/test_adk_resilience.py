@@ -65,6 +65,54 @@ def test_planner_without_valid_recommendation_escalates(sandbox):  # noqa: F811
     assert not (run / "05-coder-report.md").exists()
 
 
+# ---------------------------------------------------------------- reportes sin contenido
+PLAN = (
+    "| Task | AC | files | tests |\n|---|---|---|---|\n"
+    "| T1 sala | AC-01 | js/sync.js | tests/sync.test.mjs |\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("report", "expected"),
+    [
+        ("RECOMMENDATION: PROCEED", "NO_CONTENT"),
+        ("# Plan\n\nRECOMMENDATION: PROCEED\n", "NO_CONTENT"),
+        (PLAN + "\nRECOMMENDATION: PROCEED", "PROCEED"),
+        # pedir aclaracion no necesita un reporte largo
+        ("RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED", "HUMAN_CLARIFICATION_REQUIRED"),
+        ("", "EMPTY"),
+    ],
+)
+def test_a_proceed_without_content_is_not_a_report(report, expected):
+    assert ORCH.judge_report(report) == expected
+
+
+def test_the_report_is_rebuilt_from_the_whole_phase_when_the_final_message_is_bare():
+    final = "RECOMMENDATION: PROCEED"
+    assert ORCH.assemble_report(final, [PLAN, final]) == PLAN + "\n\n" + final
+    full = PLAN + "\nRECOMMENDATION: PROCEED"
+    assert ORCH.assemble_report(full, ["leyendo...", full]) == full  # el final ya basta
+    assert ORCH.assemble_report(final, [final]) == final  # no hay nada mas que recuperar
+
+
+@pytest.mark.parametrize(("phase", "prefix", "gate"), [("intake", "intake:", "requirements"),
+                                                        ("plan", "planner:", "plan")])
+def test_an_empty_report_escalates_and_a_clarification_regenerates_it(sandbox, phase, prefix, gate):  # noqa: F811
+    run = sandbox()
+    drive(run, Answers(**{phase: "NO_CONTENT"}), stop_at=gate)
+    st = state(run)
+    assert st["status"] == "ESCALATED" and st["stop_reason"].startswith(prefix)
+    assert "solo la linea RECOMMENDATION" in st["stop_reason"]
+    # el humano aclara: el artefacto se regenera y vuelve a su gate sin gastar un intento
+    approve(run, gate, "MODIFIED")
+    with pytest.raises(AwaitingHuman) as exc:
+        ORCH.advance("CR-T", FakeExecutor())
+    assert exc.value.gate == gate
+    st = state(run)
+    assert st.get("attempt", 1) == 1 and len(st["po_clarifications"]) == 1
+
+
+
 def test_intake_and_planner_prompts_demand_the_recommendation_line():
     from factory_app import prompts
 

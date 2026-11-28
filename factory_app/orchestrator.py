@@ -98,6 +98,40 @@ def parse_recommendation(report: str) -> str:
     return hits[-1].upper() if hits else "MISSING"
 
 
+# Un reporte con menos texto que esto (sin contar la linea RECOMMENDATION) no es un reporte:
+# p. ej. un plan que llega como "RECOMMENDATION: PROCEED" y nada mas.
+MIN_REPORT_CHARS = 80
+
+
+def report_body(report: str) -> str:
+    """El reporte sin las lineas RECOMMENDATION."""
+    return "\n".join(line for line in report.splitlines() if not _RECO_RE.search(line)).strip()
+
+
+def assemble_report(final: str, said: list[str]) -> str:
+    """Reporte de una fase ADK. Hay modelos que escriben el reporte junto a una llamada a
+    tool y cierran solo con "RECOMMENDATION: ...": entonces vale todo el texto de la fase."""
+    if len(report_body(final)) < MIN_REPORT_CHARS and len(said) > 1:
+        return "\n\n".join(said)
+    return final
+
+
+def judge_report(report: str) -> str:
+    """Recomendacion efectiva: un PROCEED sin contenido vale NO_CONTENT (el run se detiene en
+    su gate humano en vez de pedir aprobar un artefacto vacio)."""
+    reco = parse_recommendation(report)
+    if reco == "PROCEED" and len(report_body(report)) < MIN_REPORT_CHARS:
+        return "NO_CONTENT"
+    return reco
+
+
+def invalid_answer(reco: str | None) -> str:
+    """Motivo legible de una respuesta del modelo que no sirve para avanzar."""
+    if reco == "NO_CONTENT":
+        return "el modelo devolvio solo la linea RECOMMENDATION, sin contenido"
+    return f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+
+
 def _retry_hint_seconds(exc: BaseException) -> int | None:
     """Extrae RetryInfo.retryDelay ('20000s') de errores 429 de genai."""
     m = re.search(r'retryDelay\D*(\d+)s', str(exc))
@@ -279,12 +313,19 @@ class ADKExecutor(AgentExecutor):
                 )
                 new_message = types.Content(role="user", parts=[types.Part(text=prompt)])
                 text = ""
+                said: list[str] = []  # todo el texto del modelo en la fase, no solo el final
                 async for event in runner.run_async(
                     user_id=session.user_id, session_id=session.id, new_message=new_message
                 ):
-                    if event.is_final_response() and event.content and event.content.parts:
-                        text = final_text(event.content.parts)
-                return text
+                    partial = getattr(event, "partial", False)
+                    if partial or not (event.content and event.content.parts):
+                        continue
+                    piece = final_text(event.content.parts)
+                    if piece.strip():
+                        said.append(piece)
+                    if event.is_final_response():
+                        text = piece
+                return assemble_report(text, said)
             finally:
                 await runner.close()
 
@@ -311,7 +352,7 @@ class ADKExecutor(AgentExecutor):
         return {
             "report": report or f"# {phase} {context['change_id']} (respuesta vacía)",
             # vacia o sin linea RECOMMENDATION => el run escala (nunca PROCEED por defecto)
-            "recommendation": parse_recommendation(report or ""),
+            "recommendation": judge_report(report or ""),
         }
 
     def _call_with_backoff(self, fn, phase: str, change_id: str):
@@ -951,7 +992,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             why = (
                 "requiere clarificacion del Product Owner"
                 if reco == "HUMAN_CLARIFICATION_REQUIRED"
-                else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+                else invalid_answer(reco)
             )
             exhausted = _clarifications_exhausted(state)
             if exhausted:
@@ -1002,7 +1043,7 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 why = (
                     "ambiguedad residual"
                     if reco == "HUMAN_CLARIFICATION_REQUIRED"
-                    else f"respuesta del modelo sin RECOMMENDATION valida ({reco})"
+                    else invalid_answer(reco)
                 )
                 exhausted = _clarifications_exhausted(state)
                 if exhausted:
