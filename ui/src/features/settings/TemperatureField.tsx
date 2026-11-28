@@ -61,9 +61,11 @@ export function TemperatureField({
           onChange={(e) => onChange(Number(e.target.value))}
           className={cn("min-w-24 flex-1 accent-[var(--primary)]", value === null && nullable && "opacity-50")}
         />
-        <span className="w-20 text-right font-mono text-xs tabular-nums">
+        <span className="flex shrink-0 items-center justify-end gap-1.5 whitespace-nowrap font-mono text-xs tabular-nums">
+          {value === null && nullable ? (
+            <span className="rounded-full border border-border bg-muted px-1.5 py-px font-sans text-[10px] text-muted-foreground">hereda</span>
+          ) : null}
           {shown.toFixed(2)}
-          {value === null && nullable ? <span className="text-muted-foreground"> (hereda)</span> : null}
         </span>
       </div>
       <div className="flex flex-wrap items-center gap-1">

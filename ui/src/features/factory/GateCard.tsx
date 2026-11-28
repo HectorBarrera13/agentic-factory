@@ -53,7 +53,7 @@ export function GateCard({
         <div className="flex items-end justify-between gap-3 p-4 text-xs">
           <div className="min-w-0 space-y-1">
             <p className="text-muted-foreground">
-              Firmado por <span className="font-medium text-foreground">{r.recorded_by}</span>
+              Firmado por <span className="break-words font-medium text-foreground">{r.recorded_by}</span>
             </p>
             <p className="break-words">«{r.reason}»</p>
           </div>

@@ -48,6 +48,24 @@ export function statusTone(status: string, awaiting?: string): Tone {
   return "info";
 }
 
+/** Etiqueta corta para listas estrechas (la completa va en el title). */
+export function statusShort(status: string, awaiting?: string): string {
+  if (awaiting) return `Gate ${awaiting}`;
+  const short: Record<string, string> = {
+    INTAKE_PENDING: "Intake",
+    REQUIREMENTS_GATE: "Requisitos",
+    PLAN_PENDING: "Plan",
+    IMPLEMENT_PENDING: "Implementación",
+    VERIFY_PENDING: "Verificación",
+    REVIEW_PENDING: "Review",
+    EVIDENCE_PENDING: "Evidencia",
+    "READY FOR HUMAN MERGE": "Listo",
+    "NOT READY": "No listo",
+    ESCALATED: "Escalado",
+  };
+  return short[status] ?? status;
+}
+
 export function statusLabel(status: string, awaiting?: string): string {
   if (awaiting) return `Esperando gate ${awaiting}`;
   const labels: Record<string, string> = {

@@ -145,7 +145,7 @@ export function FindingsTable({
                   <tr className="border-b border-border/60 bg-muted/40">
                     <td />
                     <td colSpan={3} className="px-2 py-2">
-                      <pre className="whitespace-pre-wrap font-mono text-[11px] text-foreground/80">{f.excerpt || "(sin extracto en los reportes)"}</pre>
+                      <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-foreground/80">{f.excerpt || "(sin extracto en los reportes)"}</pre>
                     </td>
                   </tr>
                 ) : null}

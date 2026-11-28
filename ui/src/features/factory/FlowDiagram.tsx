@@ -124,6 +124,7 @@ export function FlowDiagram({
   busy,
   artifacts,
   onOpenArtifact,
+  recorded,
 }: {
   flow: Flow;
   phases: Phase[];
@@ -131,6 +132,8 @@ export function FlowDiagram({
   busy: boolean;
   artifacts: string[];
   onOpenArtifact: (name: string) => void;
+  /** decision ya registrada en el gate abierto (falta Avanzar) */
+  recorded?: { decision: string } | null;
 }) {
   const [compact, setCompactState] = React.useState(readCompact);
   const setCompact = (v: boolean) => {
@@ -193,6 +196,8 @@ export function FlowDiagram({
 
   const loopFor = (fix: "verify" | "review") => flow.loops.find((l) => l.fix === fix);
   const vLoop = loopFor("verify");
+  // sin arcos de fix no hace falta el aire de arriba: el diagrama sube y se acorta
+  const lift = flow.loops.length ? 0 : TOP - 12;
   const rLoop = loopFor("review");
 
   return (
@@ -204,12 +209,12 @@ export function FlowDiagram({
         {toggle}
       </div>
       <div ref={scroller} className="overflow-x-auto pb-1">
-        <div style={{ width: WIDTH * scale, height: HEIGHT * scale }}>
+        <div style={{ width: WIDTH * scale, height: (HEIGHT - lift) * scale }}>
         <div
           role="group"
           aria-label="Diagrama del flujo del run"
           className="relative origin-top-left"
-          style={{ width: WIDTH, height: HEIGHT, transform: scale < 1 ? `scale(${scale})` : undefined }}
+          style={{ width: WIDTH, height: HEIGHT, transform: `scale(${scale}) translateY(${-lift}px)` }}
         >
           <svg className="absolute inset-0" width={WIDTH} height={HEIGHT} aria-hidden>
             <defs>
@@ -244,7 +249,7 @@ export function FlowDiagram({
             const has = n.artifact && artifacts.includes(n.artifact) ? n.artifact : null;
             const open = has ? () => onOpenArtifact(has) : undefined;
             return n.kind === "gate" || n.kind === "end" ? (
-              <GateNode key={n.id} node={n} box={b} now={now} onOpen={open} />
+              <GateNode key={n.id} node={n} box={b} now={now} onOpen={open} recorded={n.status === "waiting" ? recorded : null} />
             ) : (
               <AgentNode key={n.id} node={n} box={b} now={now} onOpen={open} />
             );
@@ -414,14 +419,28 @@ function AgentNode({ node: n, box, now, onOpen }: { node: FlowNode; box: Box; no
   );
 }
 
-function GateNode({ node: n, box, now, onOpen }: { node: FlowNode; box: Box; now: number; onOpen?: () => void }) {
+function GateNode({
+  node: n,
+  box,
+  now,
+  onOpen,
+  recorded,
+}: {
+  node: FlowNode;
+  box: Box;
+  now: number;
+  onOpen?: () => void;
+  recorded?: { decision: string } | null;
+}) {
   const end = n.kind === "end";
   const waited = n.status === "waiting" ? elapsedSince(n.since, now) : undefined;
   const color =
     n.status === "done" ? "var(--success)" : n.status === "failed" ? "var(--danger)" : n.status === "waiting" ? "var(--warning)" : "var(--border)";
   const who = n.roles?.length ? n.roles.join(" / ") : "humano";
   const caption =
-    n.status === "waiting"
+    n.status === "waiting" && recorded
+      ? `${recorded.decision} registrado · pulsa Avanzar`
+      : n.status === "waiting"
       ? `Esperando a ${who}`
       : n.decision
         ? `${n.decision}${n.by ? ` · ${n.by}` : ""}`

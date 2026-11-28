@@ -602,15 +602,15 @@ function AgentsPanel({
               });
             return (
               <div key={role} className="space-y-2 px-4 py-3">
-                <div className="grid grid-cols-[8rem_12rem_1fr] items-start gap-3">
-                  <span className="flex items-center gap-2 pt-1 text-sm font-medium">
+                <div className="grid grid-cols-[8rem_minmax(12rem,16rem)_minmax(0,1fr)] items-start gap-3">
+                  <span className="flex min-w-0 items-center gap-2 pt-1.5 text-sm font-medium">
                     <RoleIcon role={role} size="sm" />
-                    {ROLE_LABEL[role] ?? role}
+                    <span className="truncate" title={ROLE_LABEL[role] ?? role}>{ROLE_LABEL[role] ?? role}</span>
                   </span>
                   <ProviderSelect
                     label={`Proveedor ${role}`}
                     value={o.provider ?? ""}
-                    inherit={`Hereda (${providers.find((p) => p.id === a.provider)?.label ?? a.provider})`}
+                    inherit={`Hereda · ${providers.find((p) => p.id === a.provider)?.label ?? a.provider}`}
                     inherited={a.provider}
                     providers={providers}
                     onChange={(v) => set({ provider: v || null, model: v && v !== a.provider ? null : o.model ?? null })}

@@ -321,8 +321,11 @@ const TOOL_VERB: Record<string, string> = {
   escáneres: "corriendo escáneres",
 };
 
-export function toolPhrase(tool: { name: string; target?: string; running: boolean } | undefined): string {
+export function toolPhrase(tool: { name: string; target?: string; running: boolean; ok?: boolean } | undefined): string {
   if (!tool) return "";
+  if (tool.name === "escáneres" && !tool.running) {
+    return tool.ok === false ? "escáneres: bloquean el release" : "escáneres: sin bloqueos";
+  }
   const verb = TOOL_VERB[tool.name] ?? tool.name;
   const what = tool.target ? ` ${tool.target}` : "";
   return tool.running ? `${verb}${what}…` : `último: ${verb}${what}`;

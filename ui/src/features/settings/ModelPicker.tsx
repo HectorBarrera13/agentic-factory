@@ -63,14 +63,14 @@ const PROBE_TEXT: Record<ProbeResult["status"], { tone: "success" | "warning" | 
 export function ProbeChip({ result, running }: { result?: ProbeResult; running: boolean }) {
   if (running)
     return (
-      <Badge tone="info">
+      <Badge tone="info" className="shrink-0">
         <Loader2 className="size-3 animate-spin" /> probando…
       </Badge>
     );
-  if (!result) return <Badge>sin probar</Badge>;
+  if (!result) return <Badge className="shrink-0">sin probar</Badge>;
   const t = PROBE_TEXT[result.status] ?? PROBE_TEXT.ERROR;
   return (
-    <Badge tone={t.tone} title={result.message}>
+    <Badge tone={t.tone} title={result.message} className="shrink-0">
       {t.label}
     </Badge>
   );
@@ -122,6 +122,7 @@ export function ModelPicker({
       <div className="flex items-center gap-1.5">
         <Input
           aria-label={label}
+          className="min-w-0 flex-1"
           list={listId}
           spellCheck={false}
           placeholder={placeholder ?? (models.loading ? "cargando modelos…" : "elige o escribe un modelo")}
@@ -150,6 +151,7 @@ export function ModelPicker({
           variant="outline"
           size="sm"
           aria-label={`Probar ${label}`}
+          className="shrink-0"
           disabled={!effective || running}
           onClick={probe}
         >

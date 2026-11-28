@@ -211,7 +211,8 @@ export function OpenProjectDialog({
                         setPath(r);
                         analyze(r);
                       }}
-                      className="truncate rounded px-2 py-1.5 text-left font-mono text-xs hover:bg-accent"
+                      title={r}
+                      className="truncate rounded px-2 py-1.5 text-left font-mono text-xs transition-colors hover:bg-accent"
                     >
                       {r}
                     </button>

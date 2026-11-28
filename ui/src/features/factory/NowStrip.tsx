@@ -1,15 +1,43 @@
-import { Hand, Loader2 } from "lucide-react";
+import { Hand, Loader2, Play } from "lucide-react";
 import { ProviderLogo, PROVIDER_NAME } from "@/components/ProviderLogo";
 import type { LiveWork } from "@/lib/api";
 import { elapsedSince, formatDuration, toolPhrase, useNow, type Flow } from "@/lib/activity";
 import { RoleIcon, roleInfo } from "@/lib/roles";
 
 /** "Ahora": quien trabaja, con que modelo, en que y desde cuando (reemplaza el "Avanzando…"). */
-export function NowStrip({ flow, live, busy, message }: { flow: Flow; live?: LiveWork | null; busy: boolean; message?: string }) {
+export function NowStrip({
+  flow,
+  live,
+  busy,
+  message,
+  recorded,
+}: {
+  flow: Flow;
+  live?: LiveWork | null;
+  busy: boolean;
+  message?: string;
+  /** decision ya registrada en el gate abierto: falta pulsar Avanzar */
+  recorded?: { decision: string; recorded_by: string } | null;
+}) {
   const node = flow.focus ? flow.byId[flow.focus] : null;
   const working = busy && node?.status === "running";
   const now = useNow(busy || node?.status === "waiting");
 
+  if (node?.status === "waiting" && !busy && recorded) {
+    return (
+      <div role="status" aria-live="polite" className="anim-pop flex items-center gap-3 rounded-xl border border-primary/40 bg-primary/10 px-4 py-2.5">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/20 text-primary">
+          <Play className="size-5" />
+        </span>
+        <div className="min-w-0">
+          <p className="text-sm font-semibold">Decisión registrada · pulsa Avanzar</p>
+          <p className="truncate text-xs text-muted-foreground" title={`${node.label}: ${recorded.decision} · ${recorded.recorded_by}`}>
+            {node.label}: {recorded.decision} · {recorded.recorded_by}. El motor la aplica al avanzar.
+          </p>
+        </div>
+      </div>
+    );
+  }
   if (node?.status === "waiting" && !busy) {
     const waited = elapsedSince(node.since, now);
     return (

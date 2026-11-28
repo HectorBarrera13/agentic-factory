@@ -141,7 +141,7 @@ describe("TemperatureField", () => {
   it("atajos y heredar", async () => {
     const onChange = vi.fn();
     const { rerender } = render(<TemperatureField label="T coder" value={null} inherited={0.2} onChange={onChange} range={[0, 2]} />);
-    expect(screen.getByText("(hereda)")).toBeInTheDocument();
+    expect(screen.getByText("hereda")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Equilibrado/ }));
     expect(onChange).toHaveBeenLastCalledWith(0.7);
     rerender(<TemperatureField label="T coder" value={0.7} inherited={0.2} onChange={onChange} range={[0, 2]} />);

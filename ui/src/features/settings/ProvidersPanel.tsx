@@ -62,7 +62,7 @@ export function ProvidersPanel({
         title="Proveedores de modelos"
         description="Elige un proveedor y configura su acceso. Las claves se guardan solo en tu equipo (~/.agentic-factory/credentials.json), nunca en el proyecto, y la UI nunca las vuelve a mostrar."
       />
-      <div className="grid grid-cols-[13rem_1fr] divide-x divide-border">
+      <div className="grid grid-cols-[minmax(11rem,15rem)_1fr] divide-x divide-border">
         <nav aria-label="Proveedores" className="flex flex-col p-2">
           {providers.map((p) => {
             const test = tests[p.id];
@@ -75,7 +75,7 @@ export function ProvidersPanel({
                 aria-pressed={p.id === current.id}
                 onClick={() => setSelected(p.id)}
                 className={cn(
-                  "flex items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors",
+                  "flex items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-[background-color,transform] duration-150 active:scale-[0.98]",
                   p.id === current.id ? "bg-accent font-medium" : "hover:bg-accent/60",
                 )}
               >
@@ -87,7 +87,7 @@ export function ProvidersPanel({
                   )}
                 />
                 <ProviderLogo provider={p.id} decorative />
-                <span className="min-w-0 flex-1 truncate">{p.label}</span>
+                <span className="min-w-0 flex-1 leading-tight break-words" title={p.label}>{p.label}</span>
               </button>
             );
           })}

@@ -65,7 +65,7 @@ function TreeNode({
         type="button"
         onClick={() => (isDir ? toggle(entry.path) : onOpen(entry.path))}
         className={cn(
-          "flex w-full items-center gap-1 rounded-sm py-[3px] pr-2 text-left text-[13px] hover:bg-accent",
+          "flex w-full min-w-0 items-center gap-1 rounded-sm py-[3px] pr-2 text-left text-[13px] transition-colors duration-100 hover:bg-accent",
           activePath === entry.path && "bg-primary/15 text-foreground",
         )}
         style={{ paddingLeft: depth * 12 + 6 }}
@@ -276,14 +276,14 @@ export function CodeView() {
               <div
                 key={t.key}
                 className={cn(
-                  "group flex shrink-0 cursor-pointer items-center gap-1.5 border-r border-border px-3 text-xs",
+                  "group anim-enter relative flex shrink-0 cursor-pointer items-center gap-1.5 border-r border-border px-3 text-xs transition-colors duration-150",
                   t.key === active ? "bg-background text-foreground" : "text-muted-foreground hover:bg-accent",
                 )}
                 onClick={() => setActive(t.key)}
                 title={`${t.root === "user" ? "" : `[${t.root}] `}${t.path}`}
               >
                 {t.readonly ? <Lock className="size-3 text-muted-foreground" /> : null}
-                <span>{t.path.split("/").pop()}</span>
+                <span className="max-w-48 truncate">{t.path.split("/").pop()}</span>
                 {t.root !== "user" ? <Badge tone="info" className="px-1.5 py-0 text-[9px]">{t.root.slice(4)}</Badge> : null}
                 <button
                   type="button"
