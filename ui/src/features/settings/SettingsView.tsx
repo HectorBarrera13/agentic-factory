@@ -30,6 +30,9 @@ import {
   type ProviderInfo,
 } from "@/lib/api";
 import { useApp, useLoad } from "@/lib/app-state";
+import { ProviderLogo } from "@/components/ProviderLogo";
+import { RoleIcon } from "@/lib/roles";
+import { cn } from "@/lib/utils";
 import { EnvOverrideNote } from "@/features/factory/RunBoard";
 import { ModelPicker, resetModelCache } from "./ModelPicker";
 import { isConfigured, ProvidersPanel } from "./ProvidersPanel";
@@ -484,6 +487,7 @@ export function ProviderSelect({
   onChange,
   providers,
   inherit,
+  inherited,
 }: {
   label: string;
   value: ProviderId | "";
@@ -491,17 +495,23 @@ export function ProviderSelect({
   providers: ProviderInfo[];
   /** etiqueta de la opcion "heredar" (solo por rol) */
   inherit?: string;
+  /** proveedor que se usa cuando `value` hereda (para mostrar su logo) */
+  inherited?: ProviderId;
 }) {
+  const shown = value || inherited;
   return (
-    <Select aria-label={label} value={value} onChange={(e) => onChange(e.target.value as ProviderId | "")}>
-      {inherit ? <option value="">{inherit}</option> : null}
-      {providers.map((p) => (
-        <option key={p.id} value={p.id}>
-          {p.label}
-          {isConfigured(p) ? "" : " (sin configurar)"}
-        </option>
-      ))}
-    </Select>
+    <div className="relative">
+      <ProviderLogo provider={shown} decorative className={cn("pointer-events-none absolute top-1/2 left-2.5 -translate-y-1/2", !value && "opacity-50")} />
+      <Select aria-label={label} className="pl-8" value={value} onChange={(e) => onChange(e.target.value as ProviderId | "")}>
+        {inherit ? <option value="">{inherit}</option> : null}
+        {providers.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.label}
+            {isConfigured(p) ? "" : " (sin configurar)"}
+          </option>
+        ))}
+      </Select>
+    </div>
   );
 }
 
@@ -593,11 +603,15 @@ function AgentsPanel({
             return (
               <div key={role} className="space-y-2 px-4 py-3">
                 <div className="grid grid-cols-[8rem_12rem_1fr] items-start gap-3">
-                  <span className="pt-2 text-sm font-medium">{ROLE_LABEL[role] ?? role}</span>
+                  <span className="flex items-center gap-2 pt-1 text-sm font-medium">
+                    <RoleIcon role={role} size="sm" />
+                    {ROLE_LABEL[role] ?? role}
+                  </span>
                   <ProviderSelect
                     label={`Proveedor ${role}`}
                     value={o.provider ?? ""}
                     inherit={`Hereda (${providers.find((p) => p.id === a.provider)?.label ?? a.provider})`}
+                    inherited={a.provider}
                     providers={providers}
                     onChange={(v) => set({ provider: v || null, model: v && v !== a.provider ? null : o.model ?? null })}
                   />

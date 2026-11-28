@@ -8,6 +8,7 @@ import {
   type ProviderId,
   type ProviderInfo,
 } from "@/lib/api";
+import { ProviderLogo } from "@/components/ProviderLogo";
 import { cn } from "@/lib/utils";
 
 const KIND_TEXT: Record<string, string> = {
@@ -85,6 +86,7 @@ export function ProvidersPanel({
                     test && !test.ok ? "bg-danger" : ok ? "bg-success" : "bg-muted-foreground/40",
                   )}
                 />
+                <ProviderLogo provider={p.id} decorative />
                 <span className="min-w-0 flex-1 truncate">{p.label}</span>
               </button>
             );
