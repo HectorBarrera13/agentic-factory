@@ -396,6 +396,44 @@ def test_review_gate_needs_every_finding_classified(client, monkeypatch):
     assert client.post("/api/runs/CR-001/gates/review", json=body).status_code == 200
 
 
+@pytest.mark.skipif(GIT is None, reason="git no disponible")
+def test_classified_findings_stay_visible_after_the_review_gate(client, monkeypatch):
+    review = "# Review\n\nMUST FIX: 0\nSHOULD FIX: 1\nRF-01 | SHOULD FIX | renombrar\n"
+    monkeypatch.setattr(
+        runs_mod.RunManager, "_executor", lambda self, mode: ORCH.FakeExecutor(review_report=review)
+    )
+    pid = _profile(client)
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    roles = {"requirements": "Product Owner", "plan": "Tech Lead"}
+    for _ in range(3):
+        out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
+        if out.get("gate") == "review":
+            break
+        client.post(f"/api/runs/CR-001/gates/{out['gate']}", json={
+            "decision": "APPROVED", "reason": "ok", "profile_id": pid, "role": roles[out["gate"]]})
+    sig = {"profile_id": pid, "role": "Human Reviewer"}
+    client.post("/api/runs/CR-001/findings", json={"verdicts": {"RF-01": "ACCEPTED"}, **sig})
+    client.post("/api/runs/CR-001/gates/review",
+                json={"decision": "APPROVED", "reason": "ok", **sig})
+    out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
+    assert out.get("gate") == "release"  # el SHOULD FIX no abre una ronda de fix
+    findings = client.get("/api/runs/CR-001").json()["findings"]
+    # cerrado el gate review, la clasificacion sigue a la vista (no "sin clasificar")
+    assert findings["items"][0]["decision"] == "ACCEPTED"
+    assert findings["pending"] == []
+    assert client.get("/api/runs/CR-001").json()["release"] is None  # aun sin decidir
+    r = client.post("/api/runs/CR-001/gates/release", json={
+        "decision": "REJECTED", "reason": "falta AC-03 en el navegador", "profile_id": pid,
+        "role": "Release Manager"})
+    assert r.status_code == 200, r.text
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    detail = client.get("/api/runs/CR-001").json()
+    # el aviso final explica el NOT READY con el motivo del Release Manager
+    assert detail["state"]["status"] == "NOT READY"
+    assert detail["release"]["reason"] == "falta AC-03 en el navegador"
+    assert detail["release"]["recorded_by"] == "Ana (Release Manager)"
+
+
 def test_advance_reports_errors_without_crashing(client):
     r = client.post("/api/runs/CR-404/advance?wait=true", json={"mode": "fake"})
     assert r.status_code == 400 and "Run not found" in r.json()["error"]

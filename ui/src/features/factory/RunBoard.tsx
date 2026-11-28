@@ -33,7 +33,7 @@ import {
   TabsList,
   TabsTrigger,
 } from "@/components/ui";
-import { api, errorMessage, roleLabel, type ModelInUse, type RunDetail } from "@/lib/api";
+import { api, errorMessage, roleLabel, stopReason, type ModelInUse, type RunDetail } from "@/lib/api";
 import { useApp, useLoad } from "@/lib/app-state";
 import { deriveFlow, useActivity } from "@/lib/activity";
 import { statusLabel, statusTone, TERMINAL } from "@/lib/phases";
@@ -343,7 +343,7 @@ export function RunBoard({
           </Card>
         </div>
       </div>
-      <RetryDialog open={retrying} onOpenChange={setRetrying} state={st} onRetried={run.reload} />
+      <RetryDialog open={retrying} onOpenChange={setRetrying} state={st} release={d.release} onRetried={run.reload} />
     </div>
   );
 }
@@ -366,14 +366,17 @@ function RunAlerts({ detail, clarificationCap }: { detail: RunDetail; clarificat
   } else if (st.status === "ESCALATED" || st.status === "NOT READY") {
     alerts.push(
       <Callout key="stop" tone="danger" icon={<AlertTriangle />} title={st.status === "ESCALATED" ? "Run escalado a un humano (no se reanuda)" : "No listo para merge"}>
-        <p>{st.stop_reason || "Sin motivo registrado."}</p>
+        <p className="break-words">{stopReason(st, detail.release) || "Sin motivo registrado."}</p>
         <p className="mt-1">Usa Reintentar para editar el CR y correr un intento nuevo; este intento se archiva y su rama se conserva.</p>
       </Callout>,
     );
   } else if (st.status === "READY FOR HUMAN MERGE") {
     alerts.push(
       <Callout key="ready" tone="success" title="Listo para merge humano">
-        La fábrica nunca hace merge: revisa la rama <span className="font-mono">{st.branch}</span> y haz el merge tú.
+        {detail.release?.reason ? <p className="break-words">{stopReason(st, detail.release)}</p> : null}
+        <p className={detail.release?.reason ? "mt-1" : undefined}>
+          La fábrica nunca hace merge: revisa la rama <span className="font-mono">{st.branch}</span> y haz el merge tú.
+        </p>
       </Callout>,
     );
   }

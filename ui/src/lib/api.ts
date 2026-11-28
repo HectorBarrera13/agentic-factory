@@ -344,7 +344,24 @@ export interface RunDetail {
     recorded: { decision: string; reason: string; recorded_by: string; recorded_at: string } | null;
   } | null;
   findings: { items: Finding[]; pending: string[] };
+  /** Decision de release del intento actual: su motivo explica el READY / NOT READY. */
+  release?: ReleaseDecision | null;
   worktree: string | null;
+}
+
+export interface ReleaseDecision {
+  decision: string;
+  reason: string;
+  recorded_by: string;
+  recorded_at: string;
+  final_status?: string;
+}
+
+/** Motivo del final de un intento: el del motor o, si cerro el release, el del Release Manager. */
+export function stopReason(state: RunState, release?: ReleaseDecision | null): string {
+  if (state.stop_reason) return state.stop_reason;
+  if (release?.reason) return `Release ${release.decision} por ${release.recorded_by}: ${release.reason}`;
+  return "";
 }
 
 export interface DiffFiles {
