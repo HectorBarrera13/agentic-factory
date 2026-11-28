@@ -24,7 +24,12 @@ python scripts/verify_repo.py
 ## Factory Studio (UI local)
 
 IDE web local: a un lado tu código (explorador + editor Monaco), al otro tu fábrica
-(Change Requests, runs con stepper de fases, gates firmados, findings, diff y ajustes del flujo).
+(Change Requests, runs con diagrama de fases en vivo, gates firmados, findings, diff y ajustes del flujo).
+Cada run muestra un **diagrama del flujo en vivo**: quién trabaja (rol, proveedor y modelo), en qué
+tool o comando, cuánto lleva, a quién espera cada gate y las rondas de fix; debajo, la tira **Ahora**
+y la pestaña **Actividad** (registro por fase). Sale de `runs/<CR>/activity.jsonl`, que el motor escribe
+con datos reales (nunca el texto del modelo ni el contenido de los archivos). El diagrama se contrae a
+una tira de fases y respeta `prefers-reduced-motion`.
 Funciona sobre **cualquier proyecto git**: su configuración vive en `<proyecto>/.factory/config.toml`
 (este repo ya trae la suya, que apunta a `change_requests/` y `runs/`).
 
