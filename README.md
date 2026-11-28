@@ -226,6 +226,18 @@ agents-cli eval run        # requiere GEMINI_API_KEY
 
 `CR-001` waitlist · `CR-002` autorización owner/admin · `CR-003` bug duplicados (xfail intencional) · `CR-004` CSV export · `CR-005` ambiguo (la fábrica debe STOPear).
 
+Ciclo de vida de un CR en Studio (lo decide el servidor, `services.cr_lifecycle`):
+
+- **Editar**: mientras no tenga run, o con el run creado pero sin el primer Avanzar (intake sin
+  correr, sin pausa, sin ejecución en curso). El cambio llega también a `runs/<CR>/00-change-request.md`.
+  Después del intake el CR queda congelado como evidencia; para cambiarlo, **Reintentar**.
+- **Archivar** (solo runs terminados: `READY FOR HUMAN MERGE`, `NOT READY` o `ESCALATED` sin gate
+  abierto): mueve el CR a `<crs>/archivados/` y el run a `<runs>/archivados/<CR>/` con
+  `archivo.json` (quién, cuándo, estado final), quita el worktree y conserva la rama. Se restaura
+  desde la pestaña *Archivados* (o con *Deshacer* en el aviso).
+- **Eliminar**: permanente; pide teclear el ID y una firma. Borra el CR, la carpeta del run y el
+  worktree; la rama se conserva. Vale para runs terminados, archivados y CRs sin run.
+
 ## Estado
 
 Ver `PROJECT_MILESTONES.md` y `docs/TASKS.md`. Pendiente principal: corridas reales con

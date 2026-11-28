@@ -34,7 +34,13 @@ runs/CR-001/
   08-review-report-roundN.md, 09-security-report-roundN.md   # rondas previas archivadas
   00-retry-decision.md                  # Reintentar: quien, por que, intento anterior, CR cambiado
   intentos/<n>/                         # intento anterior archivado completo (rama factory/<CR>-intento<n>)
+runs/archivados/CR-001/                 # run terminado y archivado desde Studio (mismo contenido)
+  archivo.json                          # {change_id, archived_at, archived_by, status, branch, worktree_removed}
 ```
+
+Archivar no borra evidencia: mueve el run (y el CR a `<crs>/archivados/`) y quita el worktree; la
+rama `factory/<CR>` sigue. Restaurar lo devuelve a su sitio si no existe ya un CR o run con ese ID.
+Eliminar (permanente, con el ID tecleado) borra CR, run y worktree, nunca la rama.
 
 La carpeta de runs, la de CRs y la de worktrees se configuran en `.factory/config.toml`
 (`[paths]`). En este repo apuntan a `runs/` y `change_requests/`; en otros proyectos el valor por
