@@ -9,10 +9,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
 import time
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import activity
@@ -25,6 +27,57 @@ BINARY_SUFFIXES = {
 SKIP_PARTS = {"__pycache__", "node_modules"}
 READ_CAP = 40_000
 WRITE_CAP = 60_000
+
+# Archivos leidos (o creados) en la fase ADK en curso. None = fuera de una fase: sin guarda.
+_phase_reads: ContextVar[set[str] | None] = ContextVar("phase_reads", default=None)
+READ_FIRST = "lee el archivo antes de reescribirlo (read_product_file / read_repo_file)"
+
+
+@contextlib.contextmanager
+def phase_reads():
+    """Durante una fase, sobrescribir un archivo EXISTENTE exige haberlo leido en esa fase:
+    el agente no puede reescribir a ciegas codigo que no vio."""
+    token = _phase_reads.set(set())
+    try:
+        yield
+    finally:
+        _phase_reads.reset(token)
+
+
+# ruta -> bytes originales (None: el archivo no existia) de lo que la fase escribio
+_phase_writes: ContextVar[dict[Path, bytes | None] | None] = ContextVar(
+    "phase_writes", default=None
+)
+
+
+@contextlib.contextmanager
+def phase_writes():
+    """Una fase que falla (cuota agotada, pausa, error) deshace lo que escribio: el worktree
+    vuelve a su punto de control y la fase se repite desde cero al reanudar, en vez de dejar
+    archivos a medias que bloquean el reanudar ("cambios sin commitear")."""
+    originals: dict[Path, bytes | None] = {}
+    token = _phase_writes.set(originals)
+    try:
+        yield
+    except BaseException:
+        _revert_writes(originals)
+        raise
+    finally:
+        _phase_writes.reset(token)
+
+
+def _revert_writes(originals: dict[Path, bytes | None]) -> None:
+    root = work_root()
+    for path, before in originals.items():
+        if before is not None:
+            path.write_bytes(before)
+            continue
+        path.unlink(missing_ok=True)
+        # carpetas que la fase creo y quedaron vacias
+        parent = path.parent
+        while root in parent.parents and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
 
 
 def _under(posix: str, prefixes: list[str]) -> bool:
@@ -120,6 +173,8 @@ def read_repo_file(relative_path: str) -> dict:
         return {"ok": False, "error": "file is not UTF-8 text"}
     if len(text) > READ_CAP:
         text = text[:READ_CAP] + "\n...[TRUNCATED]..."
+    if (reads := _phase_reads.get()) is not None:
+        reads.add(rel)
     return {"ok": True, "path": rel, "content": text}
 
 
@@ -262,6 +317,9 @@ def write_product_file(relative_path: str, content: str) -> dict:
     configuration. El motor ademas registra intentos y corre verificacion
     determinista despues; el Coder nunca puede autoaprobarse.
 
+    Overwriting an EXISTING file requires reading it first in the same phase
+    (read_product_file): keep everything that the change does not touch.
+
     Args:
         relative_path: Path under one of the writable areas (code.source or code.tests).
         content: Full new file content (max 60000 chars).
@@ -285,8 +343,16 @@ def write_product_file(relative_path: str, content: str) -> dict:
         return {"ok": False, "error": "target is a directory"}
     if len(content) > WRITE_CAP:
         return {"ok": False, "error": "file too large for one write"}
+    reads = _phase_reads.get()
+    if reads is not None and candidate.is_file() and posix not in reads:
+        return {"ok": False, "error": f"{posix}: {READ_FIRST}"}
+    writes = _phase_writes.get()
+    if writes is not None and candidate not in writes:
+        writes[candidate] = candidate.read_bytes() if candidate.is_file() else None
     candidate.parent.mkdir(parents=True, exist_ok=True)
     candidate.write_text(content, encoding="utf-8")
+    if reads is not None:
+        reads.add(posix)  # lo que el agente escribio en esta fase ya lo conoce
     return {"ok": True, "path": posix, "bytes": len(content.encode("utf-8"))}
 
 

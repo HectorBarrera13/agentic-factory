@@ -22,6 +22,9 @@ from factory_app.context import project  # noqa: E402
 from factory_app.orchestrator import ADKExecutor, final_text  # noqa: E402
 from tests.factory.conftest import activate_project  # noqa: E402
 
+# un plan con contenido: un PROCEED sin cuerpo se trata como NO_CONTENT
+STEP = "Paso 1: T1 crea la sala en js/sync.js (AC-01) y su test en tests/sync.test.mjs"
+
 
 class FakeLlm(BaseLlm):
     """1a llamada: pide la tool list_repo_files; 2a: responde en 3 partes (thought+texto)."""
@@ -42,7 +45,7 @@ class FakeLlm(BaseLlm):
         else:
             parts = [
                 types.Part(text="razonamiento interno", thought=True),
-                types.Part(text="# Plan\nPaso 1\n"),
+                types.Part(text=f"# Plan\n{STEP}\n"),
                 types.Part(text="RECOMMENDATION: PROCEED"),
             ]
         yield LlmResponse(content=types.Content(role="model", parts=parts))
@@ -86,7 +89,7 @@ def test_final_text_joins_all_text_parts_without_thoughts():
 def test_executor_keeps_the_whole_report_and_closes_the_runner(fake_model):
     llm, _tmp, closed = fake_model
     out = ADKExecutor().run_agent("plan", {"change_id": "CR-001", "cr_text": "CR body"})
-    assert out["report"] == "# Plan\nPaso 1\nRECOMMENDATION: PROCEED"
+    assert out["report"] == f"# Plan\n{STEP}\nRECOMMENDATION: PROCEED"
     assert "razonamiento interno" not in out["report"]
     assert out["recommendation"] == "PROCEED"
     assert closed["n"] == 1

@@ -292,6 +292,32 @@ def test_probe_without_key_is_invalid_key():
     assert probe.probe("anthropic", "claude-x")["status"] == "INVALID_KEY"
 
 
+def test_a_real_quota_failure_replaces_a_stored_ok():
+    import time
+
+    probe._store("gemini", "g-x", {"provider": "gemini", "model": "g-x", "status": "OK",
+                                   "temperature_supported": True, "at": time.time()})
+    before = probe.version
+    out = probe.record_runtime_failure("gemini", "g-x", "intake",
+                                       RuntimeError("429 RESOURCE_EXHAUSTED quota"))
+    assert out["status"] == "QUOTA" and out["source"] == "run"
+    assert "fase real (intake" in out["message"]
+    assert probe.result("gemini", "g-x")["status"] == "QUOTA"
+    assert probe.temperature_supported("gemini", "g-x") is True  # lo que se sabia se conserva
+    assert probe.version > before  # la UI se entera por SSE
+
+
+@pytest.mark.real_probe
+def test_a_model_that_failed_in_a_run_is_probed_again(monkeypatch):
+    import time
+
+    done = []
+    monkeypatch.setattr(probe, "probe", lambda p, m: done.append((p, m)))
+    probe._store("gemini", "g-y", {"status": "OK", "at": time.time()})
+    probe.record_runtime_failure("gemini", "g-y", "plan", RuntimeError("429 quota"))
+    assert probe.probe_in_background([("gemini", "g-y")]) == ["gemini:g-y"]
+
+
 # ---------------------------------------------------------------- backoff
 @pytest.mark.parametrize(
     ("message", "transient"),

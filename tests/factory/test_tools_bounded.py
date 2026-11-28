@@ -23,6 +23,53 @@ def test_coder_can_write_product_and_tests(sandbox):
     )["ok"]
 
 
+def test_in_a_phase_an_existing_file_must_be_read_before_it_is_rewritten(sandbox):
+    (sandbox / "campusflow" / "app.py").write_text("ORIGINAL = 1\n", encoding="utf-8")
+    with tools.phase_reads():
+        out = tools.write_product_file("campusflow/app.py", "x = 1\n")
+        assert out["ok"] is False and "lee el archivo antes" in out["error"]
+        assert (sandbox / "campusflow" / "app.py").read_text() == "ORIGINAL = 1\n"
+        assert tools.read_product_file("campusflow/app.py")["ok"]
+        assert tools.write_product_file("campusflow/app.py", "ORIGINAL = 1\nx = 1\n")["ok"]
+        # un archivo nuevo se crea, y el agente puede reescribir lo que el mismo creo
+        assert tools.write_product_file("campusflow/new.py", "a = 1\n")["ok"]
+        assert tools.write_product_file("campusflow/new.py", "a = 2\n")["ok"]
+        # el Test Analyst hereda la guarda
+        (sandbox / "tests" / "product").mkdir()
+        (sandbox / "tests" / "product" / "test_old.py").write_text("def test_a(): pass\n")
+        assert tools.write_test_file("tests/product/test_old.py", "x")["ok"] is False
+    # fuera de una fase (scripts, FakeExecutor) no hay guarda
+    assert tools.write_product_file("campusflow/app.py", "y = 2\n")["ok"]
+
+
+def test_each_phase_starts_without_known_files(sandbox):
+    (sandbox / "campusflow" / "app.py").write_text("A = 1\n", encoding="utf-8")
+    with tools.phase_reads():
+        tools.read_product_file("campusflow/app.py")
+    with tools.phase_reads():
+        assert tools.write_product_file("campusflow/app.py", "B = 1\n")["ok"] is False
+
+
+def test_a_failed_phase_undoes_its_writes(sandbox):
+    app = sandbox / "campusflow" / "app.py"
+    app.write_text("ORIGINAL = 1\n", encoding="utf-8")
+    with pytest.raises(RuntimeError), tools.phase_writes():
+        assert tools.write_product_file("campusflow/app.py", "CAMBIADO = 1\n")["ok"]
+        assert tools.write_product_file("campusflow/nuevo/mod.py", "a = 1\n")["ok"]
+        assert tools.write_product_file("campusflow/nuevo/mod.py", "a = 2\n")["ok"]
+        raise RuntimeError("429 RESOURCE_EXHAUSTED")  # la fase falla a medias
+    # el worktree vuelve a su punto de control: nada a medias que bloquee el reanudar
+    assert app.read_text(encoding="utf-8") == "ORIGINAL = 1\n"
+    assert not (sandbox / "campusflow" / "nuevo").exists()
+    assert (sandbox / "campusflow").is_dir()  # no borra carpetas que ya existian
+
+
+def test_a_phase_that_succeeds_keeps_its_writes(sandbox):
+    with tools.phase_writes():
+        assert tools.write_product_file("campusflow/ok.py", "a = 1\n")["ok"]
+    assert (sandbox / "campusflow" / "ok.py").read_text(encoding="utf-8") == "a = 1\n"
+
+
 @pytest.mark.parametrize(
     "path",
     [

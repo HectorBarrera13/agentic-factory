@@ -135,30 +135,59 @@ def _artifacts(run: Path) -> list[dict]:
     ]
 
 
+def _finding_source(fid: str) -> str:
+    """Quien encontro el finding: Reviewer IA, Human Reviewer, Security o escaner."""
+    if fid.startswith("SEC-SCAN-"):
+        return "scanner"
+    return {"RF": "reviewer", "HR": "human", "SEC": "security"}.get(fid.split("-", 1)[0], "")
+
+
 def _findings(project: Project, run: Path, state: dict) -> dict:
     ids = sorted(services.report_finding_ids(run))
+    fixed = services.previously_fixed(run)
     with use_project(project):
         severities = ORCH.finding_severities(run)
-        reports = [ORCH._read(run / n) for n in ("08-review-report.md", "09-security-report.md")]
-        segments = ORCH.finding_segments("\n".join(reports))
+        segments = ORCH.report_segments(run)
     path = run / "human-findings-decisions.json"
     decided = {}
-    if path.is_file() and state.get("awaiting_gate") == "review":
+    # Con review abierto se muestra lo que se va clasificando; ya cerrado, lo que se decidio
+    # en esa ronda (las rondas con fix archivan su archivo, asi que el que queda es el ultimo).
+    review_open = state.get("awaiting_gate") == "review"
+    review_closed = (state.get("human_gates") or {}).get("review", "PENDING") != "PENDING"
+    if path.is_file() and (review_open or review_closed):
         data = json.loads(path.read_text(encoding="utf-8"))
-        decided = {d["finding_id"]: d["decision"] for d in data.get("decisions", [])}
+        decided = {d["finding_id"]: d for d in data.get("decisions", [])}
     return {
         "items": [
             {
                 "id": fid,
                 "severity": severities.get(fid, "UNKNOWN"),
                 "blocking": severities.get(fid, "MUST FIX") in ORCH.BLOCKING_SEVERITIES,
-                "decision": decided.get(fid),
+                "decision": (decided.get(fid) or {}).get("decision"),
+                "reason": (decided.get(fid) or {}).get("reason") or "",
+                "human_blocking": (decided.get(fid) or {}).get("blocking") is True,
+                "source": _finding_source(fid),
+                "fixed_before": fid in fixed,
                 "excerpt": segments.get(fid, "").strip()[:600],
             }
             for fid in ids
         ],
         "pending": [fid for fid in ids if fid not in decided],
     }
+
+
+def _release(run: Path) -> dict | None:
+    """Decision de release del intento actual (15-release-decision.json): el motivo del
+    Release Manager es el motivo del READY / NOT READY final."""
+    path = run / "15-release-decision.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    keys = ("decision", "reason", "recorded_by", "recorded_at", "final_status")
+    return {k: data.get(k) for k in keys}
 
 
 def detail(project: Project, manager: RunManager, change_id: str) -> dict:
@@ -192,6 +221,7 @@ def detail(project: Project, manager: RunManager, change_id: str) -> dict:
         if gate
         else None,
         "findings": _findings(project, run, state),
+        "release": _release(run),
         "live": activity.live(run) if manager.busy(project, cid) else None,
         "worktree": state.get("worktree") if (project.root / str(state.get("worktree") or "-"))
         .exists() else None,

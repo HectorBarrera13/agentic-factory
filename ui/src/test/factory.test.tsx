@@ -131,10 +131,62 @@ describe("FindingsTable", () => {
     expect(onSave).toHaveBeenCalledWith({ "RF-01": "ACCEPTED" });
   });
 
+  it("RESOLVED solo se ofrece para un finding ya corregido en una ronda anterior", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const rows: Finding[] = [
+      { id: "HR-01", severity: "MUST FIX", blocking: true, decision: null, excerpt: "", fixed_before: true },
+      { id: "RF-02", severity: "MUST FIX", blocking: true, decision: null, excerpt: "" },
+    ];
+    render(<FindingsTable items={rows} pending={["HR-01", "RF-02"]} verdicts={[...VERDICTS, "RESOLVED"]} roles={["reviewer"]} signer={signer("reviewer")} editable onSave={onSave} />);
+    const resolvedIn = (id: string) => Array.from((screen.getByLabelText(`Clasificar ${id}`) as HTMLSelectElement).options).some((o) => o.value === "RESOLVED");
+    expect(resolvedIn("HR-01")).toBe(true);
+    expect(resolvedIn("RF-02")).toBe(false);
+    await userEvent.selectOptions(screen.getByLabelText("Clasificar HR-01"), "RESOLVED");
+    await userEvent.click(screen.getByRole("button", { name: /guardar clasificación \(1\)/i }));
+    expect(onSave).toHaveBeenCalledWith({ "HR-01": "RESOLVED" });
+  });
+
   it("sin el rol de findings no permite clasificar", () => {
     render(<FindingsTable items={items} pending={["RF-01"]} verdicts={VERDICTS} roles={["human reviewer"]} signer={signer("tech lead")} editable onSave={vi.fn()} />);
     expect(screen.getByText(/tu rol no puede clasificar/i)).toBeInTheDocument();
     expect(screen.getByLabelText("Clasificar RF-01")).toBeDisabled();
+  });
+
+  it("un SHOULD FIX aceptado se puede marcar para corregir, con su motivo", async () => {
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    const should: Finding[] = [{ id: "RF-02", severity: "SHOULD FIX", blocking: false, decision: null, excerpt: "sync.js sin usar", source: "reviewer" }];
+    render(<FindingsTable items={should} pending={["RF-02"]} verdicts={VERDICTS} roles={["reviewer"]} signer={signer("reviewer")} editable onSave={onSave} />);
+    expect(screen.queryByLabelText("Corregir RF-02 en este ciclo")).not.toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("Clasificar RF-02"), "ACCEPTED");
+    expect(screen.getByText("Queda registrado, no cambia código")).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("Corregir RF-02 en este ciclo"));
+    expect(screen.getByText("El Coder lo corrige en la ronda de fix")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Ver RF-02" }));
+    await userEvent.type(screen.getByLabelText("Motivo de RF-02"), "cargar sync.js");
+    await userEvent.click(screen.getByRole("button", { name: /guardar clasificación \(1\)/i }));
+    expect(onSave).toHaveBeenCalledWith({ "RF-02": { decision: "ACCEPTED", reason: "cargar sync.js", blocking: true } });
+  });
+
+  it("el Human Reviewer añade un finding propio", async () => {
+    const onAdd = vi.fn().mockResolvedValue(undefined);
+    render(<FindingsTable items={[]} pending={[]} verdicts={VERDICTS} roles={["reviewer"]} signer={signer("reviewer")} editable onSave={vi.fn()} onAdd={onAdd} />);
+    expect(screen.getByText("Sin findings en esta ronda")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: /añadir finding/i }));
+    const form = screen.getByRole("form", { name: "Añadir finding" });
+    expect(within(form).getByRole("button", { name: /^añadir$/i })).toBeDisabled();
+    await userEvent.type(within(form).getByLabelText("Título del finding"), "Eco al emisor");
+    await userEvent.type(within(form).getByLabelText("AC del finding"), "AC-01");
+    await userEvent.click(within(form).getByRole("button", { name: /^añadir$/i }));
+    expect(onAdd).toHaveBeenCalledWith({ severity: "MUST FIX", title: "Eco al emisor", detail: "", ac: "AC-01", blocking: false });
+    expect(screen.queryByRole("form", { name: "Añadir finding" })).not.toBeInTheDocument();
+  });
+
+  it("sin edicion muestra el motivo y la marca de corregir", async () => {
+    const done: Finding[] = [{ id: "RF-03", severity: "SHOULD FIX", blocking: false, decision: "ACCEPTED", excerpt: "x", reason: "hazlo ya", human_blocking: true }];
+    render(<FindingsTable items={done} pending={[]} verdicts={VERDICTS} roles={["reviewer"]} signer={signer("reviewer")} editable={false} onSave={vi.fn()} />);
+    expect(screen.getByText(/corregir en este ciclo/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Ver RF-03" }));
+    expect(screen.getByText("hazlo ya")).toBeInTheDocument();
   });
 
   it("muestra el extracto del finding al expandir", async () => {

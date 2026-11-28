@@ -108,6 +108,18 @@ def test_an_archived_cr_can_be_deleted_and_restore_never_overwrites(sandbox):  #
     assert services.list_archived(p) == []
 
 
+def test_an_old_cr_without_h1_is_titled_by_its_file_name(sandbox):  # noqa: F811
+    sandbox()
+    p = project()
+    p.cr_dir.mkdir(parents=True, exist_ok=True)
+    (p.cr_dir / "CR-04-notas-online.md").write_text(
+        "## Problema\r\nNo hay notas colaborativas\r\n## Alcance\r\n- Notas\r\n",
+        encoding="utf-8",
+    )
+    titles = {c["change_id"]: c["title"] for c in services.list_change_requests(p)}
+    assert titles["CR-04"] == "Notas online"  # no "Problema"
+
+
 def test_a_cr_without_a_run_is_deletable_and_gets_its_h1(sandbox):  # noqa: F811
     sandbox()  # proyecto activo; CR-N no tiene run
     p = project()

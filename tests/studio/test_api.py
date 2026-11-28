@@ -167,6 +167,44 @@ def test_wizard_detects_a_typescript_project(client, tmp_path):
     assert [c["kind"] for c in cfg["verify"]["commands"]] == ["jest", "lint"]
 
 
+def test_wizard_finds_the_real_code_folder_of_a_vanilla_js_project(client, tmp_path):
+    other = tmp_path / "notas"
+    for folder, name in [("js", "app.js"), ("css", "styles.css"), ("tests", "a.test.mjs"),
+                         ("scripts", "x.js"), ("node_modules/lib", "index.js")]:
+        (other / folder).mkdir(parents=True)
+        (other / folder / name).write_text("//")
+    (other / "package.json").write_text('{"name": "notas", "scripts": {"test": "node --test"}}')
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert out["config"]["code"]["source"] == ["js"]
+    assert not any("No se encontro la carpeta de codigo" in n for n in out["notes"])
+
+
+def test_wizard_warns_when_it_cannot_find_the_code_folder(client, tmp_path):
+    other = tmp_path / "vacio"
+    other.mkdir()
+    (other / "package.json").write_text('{"name": "vacio"}')
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert out["config"]["code"]["source"] == ["src"]
+    assert any("No se encontro la carpeta de codigo src" in n for n in out["notes"])
+
+
+@pytest.mark.skipif(GIT is None, reason="git no disponible")
+def test_wizard_proposes_the_current_branch_as_base(client, tmp_path):
+    other = tmp_path / "repo"
+    (other / "src").mkdir(parents=True)
+    (other / "src" / "a.js").write_text("//")
+    (other / "package.json").write_text('{"name": "repo"}')
+    _sh(other, "init", "-q", "-b", "ada-08")
+    _sh(other, "add", ".")
+    _sh(other, "commit", "-qm", "init")
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert out["config"]["git"]["base_branch"] == "ada-08"
+    assert any("Rama base: ada-08" in n for n in out["notes"])
+    _sh(other, "checkout", "-q", "--detach")  # detached HEAD: se queda en main
+    out = client.post("/api/projects/detect", json={"path": str(other)}).json()
+    assert out["config"]["git"]["base_branch"] == "main"
+
+
 # ---------------------------------------------------------------- CRs y perfiles
 def test_change_requests_crud_and_freeze(client):
     r = client.post("/api/crs", json={"change_id": "CR-002", "title": "Export", "body": "x"})
@@ -373,6 +411,76 @@ def test_review_gate_needs_every_finding_classified(client, monkeypatch):
     client.post("/api/runs/CR-001/findings", json={
         "verdicts": {"RF-02": "DEFERRED"}, "profile_id": pid, "role": "Human Reviewer"})
     assert client.post("/api/runs/CR-001/gates/review", json=body).status_code == 200
+
+
+@pytest.mark.skipif(GIT is None, reason="git no disponible")
+def test_findings_take_a_reason_a_fix_mark_and_human_findings(client, monkeypatch):
+    review = "# Review\n\nRF-01 | SHOULD FIX | AC-03 | js/app.js | sin usar\nSHOULD FIX: 1\n"
+    monkeypatch.setattr(
+        runs_mod.RunManager, "_executor", lambda self, mode: ORCH.FakeExecutor(review_report=review)
+    )
+    pid = _profile(client)
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    roles = {"requirements": "Product Owner", "plan": "Tech Lead"}
+    for _ in range(3):
+        out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
+        if out.get("gate") == "review":
+            break
+        client.post(f"/api/runs/CR-001/gates/{out['gate']}", json={
+            "decision": "APPROVED", "reason": "ok", "profile_id": pid, "role": roles[out["gate"]]})
+    sig = {"profile_id": pid, "role": "Human Reviewer"}
+    r = client.post("/api/runs/CR-001/findings", json={
+        "verdicts": {"RF-01": {"decision": "ACCEPTED", "reason": "cargar sync.js",
+                               "blocking": True}},
+        "added": [{"severity": "MUST FIX", "title": "eco al emisor", "ac": "AC-01"}], **sig})
+    assert r.status_code == 200, r.text
+    assert r.json()["added"] == ["HR-01"] and r.json()["pending"] == []
+    items = {f["id"]: f for f in client.get("/api/runs/CR-001").json()["findings"]["items"]}
+    assert items["RF-01"]["reason"] == "cargar sync.js" and items["RF-01"]["human_blocking"]
+    assert items["RF-01"]["blocking"] is False  # su severidad sigue siendo SHOULD FIX
+    assert items["HR-01"]["source"] == "human" and items["HR-01"]["decision"] == "ACCEPTED"
+    assert items["HR-01"]["severity"] == "MUST FIX" and "eco al emisor" in items["HR-01"]["excerpt"]
+    r = client.post("/api/runs/CR-001/findings", json={
+        "verdicts": {"RF-01": {"decision": "REJECTED", "blocking": True}}, **sig})
+    assert r.status_code == 400
+
+
+@pytest.mark.skipif(GIT is None, reason="git no disponible")
+def test_classified_findings_stay_visible_after_the_review_gate(client, monkeypatch):
+    review = "# Review\n\nMUST FIX: 0\nSHOULD FIX: 1\nRF-01 | SHOULD FIX | renombrar\n"
+    monkeypatch.setattr(
+        runs_mod.RunManager, "_executor", lambda self, mode: ORCH.FakeExecutor(review_report=review)
+    )
+    pid = _profile(client)
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    roles = {"requirements": "Product Owner", "plan": "Tech Lead"}
+    for _ in range(3):
+        out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
+        if out.get("gate") == "review":
+            break
+        client.post(f"/api/runs/CR-001/gates/{out['gate']}", json={
+            "decision": "APPROVED", "reason": "ok", "profile_id": pid, "role": roles[out["gate"]]})
+    sig = {"profile_id": pid, "role": "Human Reviewer"}
+    client.post("/api/runs/CR-001/findings", json={"verdicts": {"RF-01": "ACCEPTED"}, **sig})
+    client.post("/api/runs/CR-001/gates/review",
+                json={"decision": "APPROVED", "reason": "ok", **sig})
+    out = client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"}).json()
+    assert out.get("gate") == "release"  # el SHOULD FIX no abre una ronda de fix
+    findings = client.get("/api/runs/CR-001").json()["findings"]
+    # cerrado el gate review, la clasificacion sigue a la vista (no "sin clasificar")
+    assert findings["items"][0]["decision"] == "ACCEPTED"
+    assert findings["pending"] == []
+    assert client.get("/api/runs/CR-001").json()["release"] is None  # aun sin decidir
+    r = client.post("/api/runs/CR-001/gates/release", json={
+        "decision": "REJECTED", "reason": "falta AC-03 en el navegador", "profile_id": pid,
+        "role": "Release Manager"})
+    assert r.status_code == 200, r.text
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    detail = client.get("/api/runs/CR-001").json()
+    # el aviso final explica el NOT READY con el motivo del Release Manager
+    assert detail["state"]["status"] == "NOT READY"
+    assert detail["release"]["reason"] == "falta AC-03 en el navegador"
+    assert detail["release"]["recorded_by"] == "Ana (Release Manager)"
 
 
 def test_advance_reports_errors_without_crashing(client):

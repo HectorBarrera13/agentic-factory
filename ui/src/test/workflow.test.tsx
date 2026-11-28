@@ -211,6 +211,22 @@ describe("Escalado y Reintentar", () => {
     expect(await screen.findByRole("button", { name: /Reintentar/ })).toBeInTheDocument();
   });
 
+  it("NOT READY por el release muestra el motivo del Release Manager", async () => {
+    const release = {
+      decision: "REJECTED",
+      reason: "AC-03 no llega al navegador",
+      recorded_by: "Ana (Release Manager)",
+      recorded_at: "2026-11-28T06:34:51Z",
+      final_status: "NOT READY",
+    };
+    mockBase(detail({ release }, { status: "NOT READY", stop_reason: "" }), [model("OK")]);
+    withPo();
+    vi.spyOn(api, "cr").mockResolvedValue({ change_id: "CR-001", file: "crs/CR-001.md", body: "# CR-001\nviejo", frozen: true, retryable: true, editable: false, archivable: true, deletable: true, reason: "" });
+    render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);
+    expect(await screen.findByText(/Release REJECTED por Ana \(Release Manager\): AC-03 no llega al navegador/)).toBeInTheDocument();
+    expect(screen.queryByText("Sin motivo registrado.")).not.toBeInTheDocument();
+  });
+
   it("el escalado definitivo y el reanudable se explican distinto", async () => {
     mockRun({ status: "ESCALATED", stop_reason: "gate plan: REJECTED" });
     const { unmount } = render(<AppProvider><RunBoard changeId="CR-001" /></AppProvider>);

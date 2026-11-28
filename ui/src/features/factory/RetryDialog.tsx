@@ -3,7 +3,7 @@ import * as React from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Button, Callout, Dialog, DialogContent, Field, Textarea } from "@/components/ui";
-import { ApiError, api, errorMessage, roleLabel, type RunState } from "@/lib/api";
+import { ApiError, api, errorMessage, roleLabel, stopReason, type ReleaseDecision, type RunState } from "@/lib/api";
 import { useApp } from "@/lib/app-state";
 import { statusLabel } from "@/lib/phases";
 
@@ -16,11 +16,13 @@ export function RetryDialog({
   open,
   onOpenChange,
   state,
+  release,
   onRetried,
 }: {
   open: boolean;
   onOpenChange: (v: boolean) => void;
   state: RunState;
+  release?: ReleaseDecision | null;
   onRetried: () => void;
 }) {
   const { signer, session, notify } = useApp();
@@ -88,7 +90,7 @@ export function RetryDialog({
       >
         <form className="space-y-3" onSubmit={submit}>
           <Callout tone="danger" title={`Intento ${attempt}: ${statusLabel(state.status)}`}>
-            {state.stop_reason || "Sin motivo registrado."}
+            <span className="break-words">{stopReason(state, release) || "Sin motivo registrado."}</span>
           </Callout>
           {attempt >= cap ? (
             <Callout tone="warning" title={`Llevas ${attempt} de ${cap} intentos`}>

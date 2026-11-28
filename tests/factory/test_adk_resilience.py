@@ -65,6 +65,54 @@ def test_planner_without_valid_recommendation_escalates(sandbox):  # noqa: F811
     assert not (run / "05-coder-report.md").exists()
 
 
+# ---------------------------------------------------------------- reportes sin contenido
+PLAN = (
+    "| Task | AC | files | tests |\n|---|---|---|---|\n"
+    "| T1 sala | AC-01 | js/sync.js | tests/sync.test.mjs |\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("report", "expected"),
+    [
+        ("RECOMMENDATION: PROCEED", "NO_CONTENT"),
+        ("# Plan\n\nRECOMMENDATION: PROCEED\n", "NO_CONTENT"),
+        (PLAN + "\nRECOMMENDATION: PROCEED", "PROCEED"),
+        # pedir aclaracion no necesita un reporte largo
+        ("RECOMMENDATION: HUMAN_CLARIFICATION_REQUIRED", "HUMAN_CLARIFICATION_REQUIRED"),
+        ("", "EMPTY"),
+    ],
+)
+def test_a_proceed_without_content_is_not_a_report(report, expected):
+    assert ORCH.judge_report(report) == expected
+
+
+def test_the_report_is_rebuilt_from_the_whole_phase_when_the_final_message_is_bare():
+    final = "RECOMMENDATION: PROCEED"
+    assert ORCH.assemble_report(final, [PLAN, final]) == PLAN + "\n\n" + final
+    full = PLAN + "\nRECOMMENDATION: PROCEED"
+    assert ORCH.assemble_report(full, ["leyendo...", full]) == full  # el final ya basta
+    assert ORCH.assemble_report(final, [final]) == final  # no hay nada mas que recuperar
+
+
+@pytest.mark.parametrize(("phase", "prefix", "gate"), [("intake", "intake:", "requirements"),
+                                                        ("plan", "planner:", "plan")])
+def test_an_empty_report_escalates_and_a_clarification_regenerates_it(sandbox, phase, prefix, gate):  # noqa: F811
+    run = sandbox()
+    drive(run, Answers(**{phase: "NO_CONTENT"}), stop_at=gate)
+    st = state(run)
+    assert st["status"] == "ESCALATED" and st["stop_reason"].startswith(prefix)
+    assert "solo la linea RECOMMENDATION" in st["stop_reason"]
+    # el humano aclara: el artefacto se regenera y vuelve a su gate sin gastar un intento
+    approve(run, gate, "MODIFIED")
+    with pytest.raises(AwaitingHuman) as exc:
+        ORCH.advance("CR-T", FakeExecutor())
+    assert exc.value.gate == gate
+    st = state(run)
+    assert st.get("attempt", 1) == 1 and len(st["po_clarifications"]) == 1
+
+
+
 def test_intake_and_planner_prompts_demand_the_recommendation_line():
     from factory_app import prompts
 
@@ -119,6 +167,41 @@ def test_successful_retries_are_recorded_in_state(sandbox, monkeypatch):  # noqa
     assert st["llm_retries"] == 2 and "EXHAUSTED" not in st["last_llm_note"]
 
 
+def test_exhausted_retries_degrade_the_stored_probe(sandbox, monkeypatch):  # noqa: F811
+    import time
+
+    from factory_app import probe
+
+    run = sandbox()
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    probe._store("gemini", "g-z", {"status": "OK", "at": time.time()})
+
+    def always_429():
+        raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    ex = ADKExecutor(backoff_base=0, max_retries=1)
+    with pytest.raises(ORCH.TransientModelError):
+        ex._call_with_backoff(always_429, "intake", "CR-T", model=("gemini", "g-z"))
+    assert probe.result("gemini", "g-z")["status"] == "QUOTA"
+    assert "EXHAUSTED" in state(run)["last_llm_note"]
+    # al reanudar, la fase sale bien a la primera: la nota vieja ya no describe el run
+    assert ex._call_with_backoff(lambda: "ok", "intake", "CR-T") == "ok"
+    assert "EXHAUSTED" not in state(run)["last_llm_note"]
+
+
+def test_request_retries_count_in_the_metric(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = ADKExecutor(backoff_base=0, max_retries=1)
+
+    def phase_with_two_request_retries():
+        ex._request_retries += 2  # lo que suma request_retry durante la fase
+        return "ok"
+
+    assert ex._call_with_backoff(phase_with_two_request_retries, "implement", "CR-T") == "ok"
+    st = state(run)
+    assert st["llm_retries"] == 2 and "2 backoff retries" in st["last_llm_note"]
+
+
 def test_long_prompt_fields_are_visibly_truncated():
     p = ADKExecutor._prompt("review", {"change_id": "CR-T", "git_diff": "x" * 20_000})
     assert "[TRUNCATED 8000 chars" in p
@@ -144,6 +227,92 @@ def test_fix_receives_the_accepted_findings_text(sandbox):  # noqa: F811
     drive(run, ex, stop_at="review")
     fix = ex.ctx["fix"]["accepted_blocking_findings"]
     assert "RF-01" in fix and "race condition in register" in fix
+
+
+def _sign(run, gate, decision, reason):
+    import json
+    from datetime import datetime, timezone
+
+    (run / f"human-{gate}-decision.json").write_text(json.dumps({
+        "decision": decision, "reason": reason, "recorded_by": "Tony (Product Owner)",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+
+
+def test_gate_reasons_reach_the_phases_that_follow(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = Capture()
+    drive(run, ex, stop_at="requirements")
+    _sign(run, "requirements", "MODIFIED", "No existe AC-04; el texto es 'en conflicto'")
+    drive(run, ex, stop_at="plan")
+    plan_notes = ex.ctx["plan"]["human_gate_notes"]
+    assert "gate requirements: MODIFIED por Tony (Product Owner)" in plan_notes
+    assert "No existe AC-04" in plan_notes
+    _sign(run, "plan", "MODIFIED", "T4 pertenece a AC-01")
+    drive(run, ex, stop_at="review")
+    for phase in ("implement", "test_analysis", "review"):
+        notes = ex.ctx[phase]["human_gate_notes"]
+        assert "No existe AC-04" in notes and "T4 pertenece a AC-01" in notes, phase
+    prompt = ADKExecutor._prompt("implement", ex.ctx["implement"])
+    assert "HUMAN_GATE_NOTES:\n- gate requirements: MODIFIED" in prompt
+
+
+def test_a_fixed_finding_is_marked_resolved_and_does_not_fix_again(sandbox):  # noqa: F811
+    from factory_app import services
+    from factory_app.context import project
+
+    run = sandbox()
+    reviewer = "Tester (Human Reviewer)"
+    ex = Capture(review_report="# Review\n\nRF-01 | MUST FIX | race condition in register\n")
+    drive(run, ex, stop_at="review")
+    with pytest.raises(services.FactoryError, match="ronda anterior"):
+        services.decide_findings(project(), "CR-T", {"RF-01": "RESOLVED"}, reviewer)
+    services.decide_findings(project(), "CR-T", {"RF-01": "ACCEPTED"}, reviewer)
+    approve(run, "review")
+    drive(run, ex, stop_at="review")  # fix + re-review: el Reviewer vuelve a nombrar RF-01
+    assert services.previously_fixed(run) == {"RF-01"}
+    services.decide_findings(project(), "CR-T", {"RF-01": {
+        "decision": "RESOLVED", "reason": "corregido y verificado"}}, reviewer)
+    approve(run, "review")
+    drive(run, ex)
+    st = state(run)
+    assert st["status"] == "READY FOR HUMAN MERGE"
+    assert st["review_rounds"] == 1  # RESOLVED no abre otra ronda de fix
+
+
+def _decide_with(run, **decisions):
+    """Clasificacion con campos nuevos (motivo, "corregir en este ciclo") registrada AHORA."""
+    import json
+    from datetime import datetime, timezone
+
+    (run / "human-findings-decisions.json").write_text(json.dumps({
+        "decisions": [{"finding_id": fid.replace("_", "-"), **d} for fid, d in decisions.items()],
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }), encoding="utf-8")
+
+
+def test_a_should_fix_marked_by_the_reviewer_triggers_the_fix_with_its_reason(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = Capture(review_report="# Review\n\nRF-01 | SHOULD FIX | AC-03 | js/app.js | sin usar\n")
+    drive(run, ex, stop_at="review")
+    _decide_with(run, RF_01={"decision": "ACCEPTED", "blocking": True,
+                             "reason": "index.html debe cargar js/sync.js"})
+    approve(run, "review")
+    drive(run, ex, stop_at="review")
+    fix = ex.ctx["fix"]["accepted_blocking_findings"]
+    assert "RF-01" in fix and "Nota del Human Reviewer: index.html debe cargar js/sync.js" in fix
+    table = (run / "10-human-review-decisions.md").read_text(encoding="utf-8")
+    row = "| RF-01 | SHOULD FIX | ACCEPTED | yes (human) | index.html debe cargar js/sync.js"
+    assert row in table
+
+
+def test_the_blocking_mark_needs_an_accepting_verdict(sandbox):  # noqa: F811
+    run = sandbox()
+    ex = Capture(review_report="# Review\n\nRF-01 | SHOULD FIX | naming\n")
+    drive(run, ex, stop_at="review")
+    _decide_with(run, RF_01={"decision": "DEFERRED", "blocking": True})
+    exc = drive(run, ex, stop_at="release")
+    assert exc.gate == "release" and "fix" not in ex.ctx  # un DEFERRED nunca cambia codigo
 
 
 def test_fix_after_verification_fail_receives_the_failure(sandbox):  # noqa: F811

@@ -66,7 +66,8 @@ uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?
   decisión se firma como `Nombre (Rol)` y el rol se valida contra los roles del gate del proyecto.
   Un perfil viejo con roles fuera del catálogo carga marcado como incompleto hasta editarlo.
 - **Ajustes**: proveedor, modelo y temperatura por agente (ver abajo), límites de rondas, comandos de verificación
-  (`pytest` / `jest` / `ruff` / `lint` / `exit_code`), rutas, roles por gate. El orden de fases y
+  (`pytest` / `jest` / `ruff` / `lint` / `exit_code`; un `exit_code` que corre `node --test` también
+  cuenta sus tests), rutas, roles por gate. El orden de fases y
   gates es fijo. La guardia de integridad de tests solo existe para Python ("no disponible" en
   otros lenguajes).
 - **Seguridad**: solo escucha en 127.0.0.1, valida `Host`, token por sesión (cookie HttpOnly),
@@ -107,7 +108,9 @@ Los scripts CLI siguen funcionando y aceptan `--project RUTA` (por defecto, este
   (algunos modelos de razonamiento), no se envía. La UI avisa "se aplicará X" o "no acepta
   temperatura"; lo pedido y lo efectivo por agente quedan en `factory-state.json` y
   `factory-run.json` (`models`).
-- Reintentos: solo el backoff del orquestador reintenta (los SDKs van con 0 reintentos); los
+- Reintentos: los SDKs van con 0 reintentos; la fábrica repite primero la petición que falló
+  (respetando el `retryDelay` del proveedor) y, si no basta, la fase entera; una fase que falla
+  deshace lo que escribió en el worktree del run. Los
   errores 429/529/overloaded/servicio no disponible de cualquier proveedor son transitorios y los de
   autenticación o modelo inexistente escalan al humano.
 
@@ -204,7 +207,15 @@ Alineación con el instructivo (§8-§18):
   defecto) se exige confirmación explícita (`--force`), que también queda registrada.
 - Re-review: la ronda anterior se archiva (`08-review-report-roundN.md`), se escribe
   `13-re-review.md`, y los reportes de una ronda no se regeneran al reanudar tras el gate.
-- Solo un MUST FIX / HIGH aceptado dispara fix; un SHOULD FIX aceptado queda registrado.
+  Un finding aceptado en una ronda anterior que el fix ya corrigió se clasifica `RESOLVED`
+  (solo se admite para esos findings): no abre otra ronda de fix ni cuenta como rechazo.
+- El motivo con que se firma un gate `requirements` o `plan` (APPROVED/MODIFIED) llega a las
+  fases siguientes como `HUMAN_GATE_NOTES` (planner, Coder, Test Analyst, Reviewer) y manda
+  sobre el intake o el plan cuando los contradice.
+- Solo un MUST FIX / HIGH aceptado, o un finding que el Human Reviewer marca "corregir en este
+  ciclo", dispara fix; un SHOULD FIX aceptado sin esa marca queda registrado. Cada
+  clasificación lleva su motivo (llega al Coder Fix) y el Human Reviewer puede añadir findings
+  propios (`HR-NN`, en `08b-human-review-findings.md`), que quedan aceptados por quien los añade.
 - `traceability.md` solo enlaza lo evidenciable; lo demás es `UNMAPPED` y se cuenta en
   `traceability_gaps` de `factory-run.json`.
 

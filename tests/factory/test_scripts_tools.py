@@ -111,6 +111,45 @@ def test_decide_findings_rejects_unknown_ids(review_run):
     assert r.returncode != 0 and "RF-09" in (r.stdout + r.stderr)
 
 
+def test_decide_findings_records_reason_and_blocking_mark(review_run):
+    name, run = review_run
+    r = _cli("decide_findings.py", name, "--by", REVIEWER, "RF-02=ACCEPTED:blocking",
+             "--reason", "RF-02=renombrar=ahora", "RF-01=ACCEPTED")
+    assert r.returncode == 0, r.stdout + r.stderr
+    data = {d["finding_id"]: d for d in json.loads(
+        (run / "human-findings-decisions.json").read_text())["decisions"]}
+    assert data["RF-02"]["blocking"] is True and data["RF-02"]["reason"] == "renombrar=ahora"
+    assert data["RF-01"]["blocking"] is False and data["RF-01"]["recorded_by"] == REVIEWER
+    r = _cli("decide_findings.py", name, "--by", REVIEWER, "RF-02=REJECTED:blocking")
+    assert r.returncode != 0 and "ACCEPTED o MODIFIED" in (r.stdout + r.stderr)
+
+
+def test_the_human_reviewer_can_add_findings(review_run):
+    from factory_app import services
+    from factory_app.project import load_project
+
+    name, run = review_run
+    project = load_project(ROOT)
+    out = services.decide_findings(
+        project, name, {}, REVIEWER,
+        added=[{"severity": "MUST FIX", "title": "sync.js no se carga", "ac": "AC-03",
+                "detail": "index.html | no incluye el script"}],
+    )
+    assert out["added"] == ["HR-01"]
+    row = (run / "08b-human-review-findings.md").read_text(encoding="utf-8")
+    assert "HR-01 | MUST FIX | AC-03 | - | sync.js no se carga: index.html / no incluye" in row
+    assert f"(por {REVIEWER})" in row
+    assert _decisions(run)["HR-01"] == "ACCEPTED"  # lo acepta quien lo añade
+    assert "HR-01" in services.report_finding_ids(run)
+    again = services.decide_findings(project, name, {}, REVIEWER,
+                                     added=[{"severity": "SHOULD FIX", "title": "eco"}])
+    assert again["added"] == ["HR-02"]
+    with pytest.raises(services.FactoryError):
+        services.decide_findings(project, name, {}, REVIEWER,
+                                 added=[{"severity": "LOW", "title": "x"}])
+    assert "HR-03" not in (run / "08b-human-review-findings.md").read_text(encoding="utf-8")
+
+
 # ---------------------------------------------------------------- tools
 @pytest.fixture()
 def tools_root(tmp_path, monkeypatch):

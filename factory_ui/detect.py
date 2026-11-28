@@ -6,6 +6,7 @@ Solo sugiere; el humano revisa y guarda. Nada se escribe aqui.
 from __future__ import annotations
 
 import json
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -18,6 +19,29 @@ DOC_CANDIDATES = {
     "architecture": ("docs/ARCHITECTURE.md", "ARCHITECTURE.md", "docs/architecture.md"),
     "repo_map": ("docs/REPO_MAP.md", "REPO_MAP.md"),
 }
+
+
+# carpetas que nunca son "el codigo" del proyecto aunque tengan archivos del lenguaje
+NOT_SOURCE_DIRS = {
+    "node_modules", "dist", "build", "out", "coverage", "vendor", "docs", "scripts",
+    "results", *TEST_DIR_CANDIDATES,
+}
+CODE_SUFFIXES = {
+    "javascript": (".js", ".mjs", ".cjs", ".jsx"),
+    "typescript": (".ts", ".tsx", ".mts", ".cts", ".js", ".mjs"),
+}
+
+
+def _code_dirs(root: Path, suffixes: tuple[str, ...]) -> list[str]:
+    """Carpetas de primer nivel con codigo del lenguaje (mira hasta dos niveles)."""
+    found = []
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or d.name.startswith(".") or d.name in NOT_SOURCE_DIRS:
+            continue
+        files = [*d.glob("*"), *d.glob("*/*")]
+        if any(f.is_file() and f.suffix in suffixes for f in files):
+            found.append(d.name)
+    return found
 
 
 def _first(root: Path, candidates) -> str | None:
@@ -71,13 +95,32 @@ def _node(root: Path) -> dict:
         commands.append({"name": "lint", "cmd": ["npm", "run", "lint"], "kind": "lint"})
     if "build" in scripts:
         commands.append({"name": "build", "cmd": ["npm", "run", "build"], "kind": "exit_code"})
+    if (root / "src").is_dir():
+        source = ["src"]
+    elif (root / "app").is_dir():
+        source = ["app"]
+    else:
+        # p. ej. un proyecto vanilla con js/ y css/: antes se proponia "src", que no existia
+        source = _code_dirs(root, CODE_SUFFIXES[language]) or ["src"]
     return {
         "name": pkg.get("name", "") if isinstance(pkg, dict) else "",
         "language": language,
-        "source": ["src"] if (root / "src").is_dir() else ["app"] if (root / "app").is_dir()
-        else ["src"],
+        "source": source,
         "commands": commands,
     }
+
+
+def current_branch(root: Path) -> str | None:
+    """Rama actual del repo (None en detached HEAD, sin git o si git falla)."""
+    try:
+        out = subprocess.run(
+            ["git", "branch", "--show-current"], cwd=root, capture_output=True, text=True,
+            timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    branch = out.stdout.strip()
+    return branch if out.returncode == 0 and branch else None
 
 
 def detect(root: Path) -> dict:
@@ -97,8 +140,20 @@ def detect(root: Path) -> dict:
         notes.append("No se detecto el lenguaje: revisa areas y comandos.")
     if not found["commands"]:
         notes.append("Sin comandos de verificacion: la verificacion fallara hasta configurarlos.")
+    base_branch = "main"
     if not (root / ".git").exists():
         notes.append("La carpeta no es un repo git: sin git no hay rama ni worktree por run.")
+    elif branch := current_branch(root):
+        base_branch = branch
+        if branch != "main":
+            notes.append(f"Rama base: {branch} (la rama actual); cambiala en Git si no es esa.")
+    missing = [s for s in found["source"] if not (root / s).exists()]
+    if missing:
+        notes.append(
+            "No se encontro la carpeta de codigo " + ", ".join(missing)
+            + ": indica en Rutas y codigo donde esta el codigo; sin eso los agentes no pueden"
+            " leerlo ni cambiarlo."
+        )
     tests = _first(root, TEST_DIR_CANDIDATES) or "tests"
     docs = {key: _first(root, cands) for key, cands in DOC_CANDIDATES.items()}
     if not docs["requirements"]:
@@ -109,6 +164,7 @@ def detect(root: Path) -> dict:
             "code": {"source": found["source"], "tests": tests, "language": found["language"]},
             "docs": docs,
             "verify": {"commands": found["commands"]},
+            "git": {"base_branch": base_branch},
         }
     )
     return {"config": config.model_dump(), "notes": notes,

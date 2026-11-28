@@ -123,6 +123,26 @@ def test_jest_and_generic_commands_are_parsed_by_kind():
     assert ORCH.parse_verification(v) == (10, 1, "NOT_RUN")  # sin linter configurado
 
 
+NODE_SPEC = (
+    "\u25b6 sync\n  \u2714 sala (0.7ms)\n"
+    "\u2139 tests 21\n\u2139 suites 8\n\u2139 pass 20\n\u2139 fail 1\n"
+)
+NODE_TAP = "TAP version 13\nok 1 - sala\n1..3\n# tests 3\n# pass 3\n# fail 0\n"
+
+
+@pytest.mark.parametrize(("stdout", "expected"), [(NODE_SPEC, (21, 1)), (NODE_TAP, (3, 0))])
+def test_node_test_summary_is_counted_for_exit_code_commands(stdout, expected):
+    v = {"ok": False, "results": [
+        {"command": "node --test tests/*.test.mjs", "kind": "exit_code", "stdout": stdout,
+         "returncode": 1 if expected[1] else 0}]}
+    assert ORCH.parse_verification(v) == (*expected, "NOT_RUN")
+
+
+def test_a_number_in_a_test_name_is_not_a_node_summary():
+    out = "\u2714 should show tests 5 per page (1ms)\nbuild ok\n"
+    assert ORCH.node_test_counts(out) is None
+
+
 def test_verification_runs_configured_commands_in_the_run_worktree(tmp_path, monkeypatch):
     cfg = ProjectConfig.model_validate(
         {"verify": {"commands": [

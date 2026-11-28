@@ -64,6 +64,8 @@ export interface ProbeResult {
   temperature_supported: boolean | null;
   at: number;
   seconds: number;
+  /** "run": el resultado viene de una fase real que agoto la cuota, no de la prueba. */
+  source?: "run";
 }
 
 export interface ModelInUse {
@@ -236,9 +238,29 @@ export interface Outcome {
 export interface Finding {
   id: string;
   severity: string;
+  /** Bloqueante por su severidad (MUST FIX / HIGH). */
   blocking: boolean;
   decision: string | null;
   excerpt: string;
+  /** Motivo del Human Reviewer para esta clasificacion. */
+  reason?: string;
+  /** Marcado "corregir en este ciclo" por el Human Reviewer. */
+  human_blocking?: boolean;
+  source?: "reviewer" | "human" | "security" | "scanner" | "";
+  /** Aceptado en una ronda anterior (ya paso por un fix): admite RESOLVED. */
+  fixed_before?: boolean;
+}
+
+/** Veredicto de un finding: solo la decision, o con motivo / "corregir en este ciclo". */
+export type FindingVerdict = string | { decision: string; reason?: string; blocking?: boolean };
+
+/** Finding propio del Human Reviewer (queda como HR-NN). */
+export interface AddedFinding {
+  severity: string;
+  title: string;
+  detail?: string;
+  ac?: string;
+  blocking?: boolean;
 }
 
 export interface Artifact {
@@ -344,7 +366,24 @@ export interface RunDetail {
     recorded: { decision: string; reason: string; recorded_by: string; recorded_at: string } | null;
   } | null;
   findings: { items: Finding[]; pending: string[] };
+  /** Decision de release del intento actual: su motivo explica el READY / NOT READY. */
+  release?: ReleaseDecision | null;
   worktree: string | null;
+}
+
+export interface ReleaseDecision {
+  decision: string;
+  reason: string;
+  recorded_by: string;
+  recorded_at: string;
+  final_status?: string;
+}
+
+/** Motivo del final de un intento: el del motor o, si cerro el release, el del Release Manager. */
+export function stopReason(state: RunState, release?: ReleaseDecision | null): string {
+  if (state.stop_reason) return state.stop_reason;
+  if (release?.reason) return `Release ${release.decision} por ${release.recorded_by}: ${release.reason}`;
+  return "";
 }
 
 export interface DiffFiles {
@@ -453,7 +492,7 @@ export const api = {
   decideGate: (id: string, gate: string, body: Json) =>
     request<Json>("POST", `/api/runs/${enc(id)}/gates/${enc(gate)}`, body),
   decideFindings: (id: string, body: Json) =>
-    request<{ decisions: unknown[]; pending: string[] }>(
+    request<{ decisions: unknown[]; pending: string[]; added?: string[] }>(
       "POST",
       `/api/runs/${enc(id)}/findings`,
       body,
