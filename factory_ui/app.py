@@ -108,6 +108,15 @@ class CrUpdate(BaseModel):
     body: str
 
 
+class SignBody(BaseModel):
+    profile_id: str
+    role: str
+
+
+class DeleteCrBody(SignBody):
+    confirm: str
+
+
 class StartBody(BaseModel):
     change_id: str
 
@@ -424,19 +433,25 @@ def create_app(
 
     # ------------------------------------------------------------ change requests
     @app.get("/api/crs")
-    def list_crs():
-        return {"items": services.list_change_requests(session.require())}
+    def list_crs(archived: bool = False):
+        p = session.require()
+        if archived:
+            return {"items": services.list_archived(p)}
+        return {"items": services.list_change_requests(p)}
 
     @app.get("/api/crs/{change_id}")
     def get_cr(change_id: str):
         p = session.require()
         path = services.find_change_request(p, change_id)
+        life = services.cr_lifecycle(p, change_id, busy=session.runs.busy(p, change_id))
         return {
             "change_id": change_id.upper(),
             "file": path.relative_to(p.root).as_posix(),
             "body": path.read_text(encoding="utf-8"),
-            "frozen": (p.run_dir(change_id) / "factory-state.json").is_file(),
+            # compatibilidad: congelado = ya no se edita (el intake corrio o esta corriendo)
+            "frozen": not life["editable"],
             "retryable": _retryable(p, change_id),
+            **life,
         }
 
     @app.post("/api/crs")
@@ -448,8 +463,27 @@ def create_app(
     @app.put("/api/crs/{change_id}")
     def update_cr(change_id: str, body: CrUpdate):
         p = session.require()
-        path = services.update_change_request(p, change_id, body.body)
+        path = services.update_change_request(
+            p, change_id, body.body, busy=session.runs.busy(p, change_id))
         return {"file": path.relative_to(p.root).as_posix()}
+
+    @app.post("/api/crs/{change_id}/archive")
+    def archive_cr(change_id: str, body: SignBody):
+        p = session.require()
+        signed = _signature(session, body.profile_id, body.role)
+        return services.archive_change_request(
+            p, change_id, signed, busy=session.runs.busy(p, change_id))
+
+    @app.post("/api/crs/{change_id}/restore")
+    def restore_cr(change_id: str):
+        return services.restore_change_request(session.require(), change_id)
+
+    @app.delete("/api/crs/{change_id}")
+    def delete_cr(change_id: str, body: DeleteCrBody):
+        p = session.require()
+        _signature(session, body.profile_id, body.role)  # solo un humano identificado borra
+        return services.delete_change_request(
+            p, change_id, body.confirm, busy=session.runs.busy(p, change_id))
 
     # ------------------------------------------------------------ runs
     @app.get("/api/runs")

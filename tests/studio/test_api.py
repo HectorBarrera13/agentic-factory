@@ -175,8 +175,63 @@ def test_change_requests_crud_and_freeze(client):
     assert ids == ["CR-001", "CR-002"]
     assert client.put("/api/crs/CR-002", json={"body": "# CR-002\nnuevo"}).status_code == 200
     client.post("/api/runs", json={"change_id": "CR-002"})
-    assert client.get("/api/crs/CR-002").json()["frozen"] is True
-    assert client.put("/api/crs/CR-002", json={"body": "otro"}).status_code == 400
+    # run creado pero sin avanzar: el CR sigue editable y su copia de evidencia lo sigue
+    cr = client.get("/api/crs/CR-002").json()
+    assert cr["editable"] is True and cr["frozen"] is False and cr["deletable"] is False
+    edited = {"body": "# CR-002\nantes del intake"}
+    assert client.put("/api/crs/CR-002", json=edited).status_code == 200
+    copy = client.get("/api/runs/CR-002/artifacts/00-change-request.md").json()["content"]
+    assert "antes del intake" in copy
+    client.post("/api/runs/CR-002/advance?wait=true", json={"mode": "fake"})
+    cr = client.get("/api/crs/CR-002").json()
+    assert cr["frozen"] is True and cr["editable"] is False and "congelado" in cr["reason"]
+    r = client.put("/api/crs/CR-002", json={"body": "otro"})
+    assert r.status_code == 400 and r.json()["code"] == "cr_frozen"
+
+
+def test_finished_crs_are_archived_restored_and_deleted(client, project_dir):
+    pid = _profile(client)
+    sign = {"profile_id": pid, "role": "Product Owner"}
+    client.post("/api/runs", json={"change_id": "CR-001"})
+    r = client.post("/api/crs/CR-001/archive", json=sign)
+    assert r.status_code == 400 and r.json()["code"] == "not_finished"
+    # rechazar requirements => ESCALATED definitivo (terminado)
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    client.post("/api/runs/CR-001/gates/requirements", json={
+        "decision": "REJECTED", "reason": "no", **sign})
+    client.post("/api/runs/CR-001/advance?wait=true", json={"mode": "fake"})
+    cr = client.get("/api/crs/CR-001").json()
+    assert cr["archivable"] is True and cr["deletable"] is True
+    r = client.post("/api/crs/CR-001/archive", json=sign)
+    assert r.status_code == 200, r.text
+    assert r.json()["archived_by"] == "Ana (Product Owner)"
+    assert [c["change_id"] for c in client.get("/api/crs").json()["items"]] == []
+    assert client.get("/api/runs").json()["items"] == []
+    archived = client.get("/api/crs?archived=1").json()["items"]
+    assert [(a["change_id"], a["status"]) for a in archived] == [("CR-001", "ESCALATED")]
+    assert client.post("/api/crs/CR-001/restore").status_code == 200
+    assert [c["change_id"] for c in client.get("/api/crs").json()["items"]] == ["CR-001"]
+    assert client.get("/api/runs").json()["items"][0]["status"] == "ESCALATED"
+    # eliminar exige teclear el ID
+    r = client.request("DELETE", "/api/crs/CR-001", json={"confirm": "CR-002", **sign})
+    assert r.status_code == 400 and r.json()["code"] == "confirm_mismatch"
+    r = client.request("DELETE", "/api/crs/CR-001", json={"confirm": "cr-001", **sign})
+    assert r.status_code == 200, r.text
+    assert client.get("/api/crs").json()["items"] == []
+    assert client.get("/api/crs/CR-001").status_code == 400
+
+
+def test_a_cr_without_a_run_can_be_deleted_but_not_archived(client):
+    pid = _profile(client)
+    sign = {"profile_id": pid, "role": "Product Owner"}
+    client.post("/api/crs", json={"change_id": "CR-009", "title": "Algo", "body": "## Problema\nx"})
+    items = {c["change_id"]: c for c in client.get("/api/crs").json()["items"]}
+    assert items["CR-009"]["title"] == "CR-009 — Algo"  # "## Problema" no es el titulo
+    assert client.post("/api/crs/CR-009/archive", json=sign).json()["code"] == "not_finished"
+    r = client.request("DELETE", "/api/crs/CR-009", json={"confirm": "CR-009", **sign})
+    assert r.status_code == 200
+    r = client.request("DELETE", "/api/crs/..%2F..%2Fx", json={"confirm": "x", **sign})
+    assert r.status_code in (400, 404)  # un ID con ruta nunca sale de las carpetas
 
 
 def test_profiles_sign_only_with_their_own_roles(client):
