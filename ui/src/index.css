@@ -230,7 +230,7 @@ body {
 }
 @keyframes pop-in {
   from {
-    opacity: 0;
+    opacity: 0.6;
     transform: translateY(4px) scale(0.98);
   }
   to {
@@ -268,13 +268,161 @@ body {
   animation: breathe 2s ease-in-out infinite;
 }
 
+/* ------------------------------------------------------------ movimiento de toda la UI */
+/* Cortas (150-250 ms) y sin partir de opacidad 0: si la pagina esta en segundo plano la
+   animacion se congela en su primer cuadro y no debe verse apagada. */
+@keyframes enter {
+  from {
+    opacity: 0.55;
+    transform: translateY(6px);
+  }
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes fade-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes zoom-in {
+  from {
+    opacity: 0.4;
+    transform: translateY(8px) scale(0.96);
+  }
+}
+@keyframes zoom-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0.4;
+    transform: translateX(24px);
+  }
+}
+@keyframes toast-out {
+  to {
+    opacity: 0;
+    transform: translateX(24px);
+  }
+}
+@keyframes toast-timer {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+@keyframes menu-in {
+  from {
+    opacity: 0.4;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+
+.anim-enter {
+  animation: enter 0.22s ease-out both;
+}
+/* cascada al cargar: cada hijo con style="--i: n" (sin repetir en cada tick del SSE) */
+.anim-list > * {
+  animation: enter 0.22s ease-out both;
+  animation-delay: calc(min(var(--i, 0), 12) * 22ms);
+}
+.anim-menu {
+  animation: menu-in 0.16s ease-out both;
+  transform-origin: top right;
+}
+.dialog-overlay[data-state="open"] {
+  animation: fade-in 0.18s ease-out;
+}
+.dialog-overlay[data-state="closed"] {
+  animation: fade-out 0.15s ease-in forwards;
+}
+.dialog-content[data-state="open"] {
+  animation: zoom-in 0.2s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.dialog-content[data-state="closed"] {
+  animation: zoom-out 0.15s ease-in forwards;
+}
+.toast[data-leaving="false"] {
+  animation: toast-in 0.22s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.toast[data-leaving="true"] {
+  animation: toast-out 0.18s ease-in forwards;
+}
+.toast-timer {
+  transform-origin: left;
+  animation: toast-timer var(--toast-ms, 3500ms) linear forwards;
+}
+.tab-trigger {
+  position: relative;
+}
+.tab-trigger::after {
+  content: "";
+  position: absolute;
+  left: 0.5rem;
+  right: 0.5rem;
+  bottom: -1px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--primary);
+  transform: scaleX(0);
+  transition: transform 0.2s ease-out;
+}
+.tab-trigger[data-state="active"]::after {
+  transform: scaleX(1);
+}
+.tab-content[data-state="active"] {
+  animation: enter 0.2s ease-out;
+}
+.skeleton {
+  background-color: color-mix(in srgb, var(--muted-foreground) 14%, transparent);
+  background-image: linear-gradient(
+    90deg,
+    transparent 0%,
+    color-mix(in srgb, var(--foreground) 8%, transparent) 50%,
+    transparent 100%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
+}
+.nav-indicator {
+  transition: transform 0.25s cubic-bezier(0.2, 0.9, 0.3, 1.1);
+}
+.no-scrollbar {
+  scrollbar-width: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .anim-flow,
   .anim-pulse,
   .anim-shimmer,
   .anim-pop,
   .anim-breathe,
+  .anim-enter,
+  .anim-list > *,
+  .anim-menu,
+  .dialog-overlay,
+  .dialog-content,
+  .toast,
+  .toast-timer,
+  .tab-content,
+  .skeleton,
   .animate-spin {
     animation: none !important;
+  }
+  .tab-trigger::after,
+  .nav-indicator,
+  * {
+    transition-duration: 0s !important;
   }
 }

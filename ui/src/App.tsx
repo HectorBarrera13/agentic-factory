@@ -9,6 +9,7 @@ import {
   Settings,
   Sun,
   UserRound,
+  X,
 } from "lucide-react";
 import * as React from "react";
 import { Button, Callout, Select } from "@/components/ui";
@@ -31,8 +32,14 @@ function ActivityBar() {
   return (
     <nav
       aria-label="Vistas"
-      className="flex w-14 shrink-0 flex-col items-center gap-1 border-r border-border bg-sidebar py-2"
+      className="relative flex w-14 shrink-0 flex-col items-center gap-1 border-r border-border bg-sidebar py-2"
     >
+      {/* indicador de la vista activa: se desliza entre los botones */}
+      <span
+        aria-hidden
+        className="nav-indicator absolute left-0 top-0 h-7 w-[3px] rounded-r-full bg-primary"
+        style={{ transform: `translateY(${64 + Math.max(0, ITEMS.findIndex((i) => i.id === view)) * 48}px)` }}
+      />
       <div className="mb-2 flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-sm font-bold text-primary-foreground">
         F
       </div>
@@ -45,13 +52,10 @@ function ActivityBar() {
           aria-current={view === item.id ? "page" : undefined}
           onClick={() => setView(item.id)}
           className={cn(
-            "relative flex h-11 w-11 flex-col items-center justify-center gap-0.5 rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground [&_svg]:size-5",
-            view === item.id && "bg-accent text-foreground",
+            "relative flex h-11 w-11 flex-col items-center justify-center gap-0.5 rounded-lg text-muted-foreground transition-[color,background-color,transform] duration-150 hover:bg-accent hover:text-foreground active:scale-95 [&_svg]:size-5 [&_svg]:transition-transform",
+            view === item.id && "bg-primary/12 text-primary [&_svg]:scale-110",
           )}
         >
-          {view === item.id ? (
-            <span className="absolute -left-2 top-2 h-7 w-0.5 rounded-full bg-primary" />
-          ) : null}
           {item.icon}
           <span className="text-[9px] font-medium">{item.label}</span>
         </button>
@@ -62,7 +66,7 @@ function ActivityBar() {
         onClick={toggleTheme}
         title={theme === "dark" ? "Tema claro" : "Tema oscuro"}
         aria-label="Cambiar tema"
-        className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground hover:bg-accent hover:text-foreground [&_svg]:size-4"
+        className="flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-accent hover:text-foreground [&_svg]:size-4 [&_svg]:transition-transform [&_svg]:duration-300 hover:[&_svg]:rotate-45"
       >
         {theme === "dark" ? <Sun /> : <Moon />}
       </button>
@@ -130,17 +134,17 @@ function StatusBar({ onOpenProject }: { onOpenProject: () => void }) {
         className="flex items-center gap-1.5 rounded px-1.5 py-0.5 hover:bg-accent hover:text-foreground"
         title={project?.root}
       >
-        <FolderOpen className="size-3.5" />
-        {project ? project.name : "Sin proyecto"}
+        <FolderOpen className="size-3.5 shrink-0" />
+        <span className="max-w-56 truncate">{project ? project.name : "Sin proyecto"}</span>
       </button>
       {project ? (
-        <span>
+        <span className="hidden truncate md:inline">
           {project.config.code.language} · base {project.config.git.base_branch}
           {project.git ? "" : " · sin git"}
         </span>
       ) : null}
       <span className="flex items-center gap-1" title="Actualizaciones en vivo (SSE)">
-        <span className={cn("size-1.5 rounded-full", live ? "bg-success" : "bg-muted-foreground")} />
+        <span className={cn("size-1.5 rounded-full transition-colors", live ? "anim-breathe bg-success" : "bg-muted-foreground")} />
         {live ? "en vivo" : "sin conexión en vivo"}
       </span>
       <div className="flex-1" />
@@ -149,18 +153,20 @@ function StatusBar({ onOpenProject }: { onOpenProject: () => void }) {
   );
 }
 
-function Toasts() {
-  const { toasts } = useApp();
+export function Toasts() {
+  const { toasts, dismissToast } = useApp();
   return (
-    <div className="pointer-events-none fixed bottom-10 right-4 z-[60] flex w-80 flex-col gap-2">
+    <div className="pointer-events-none fixed bottom-10 right-4 z-[60] flex w-[min(22rem,calc(100vw-2rem))] flex-col gap-2">
       {toasts.map((t) => (
         <div
           key={t.id}
           role="alert"
+          data-leaving={t.leaving ? "true" : "false"}
           className={cn(
-            "pointer-events-auto flex items-start gap-2 rounded-lg border bg-popover px-3 py-2.5 text-xs shadow-lg",
+            "toast pointer-events-auto relative flex items-start gap-2 overflow-hidden rounded-lg border bg-popover py-2.5 pr-2 pl-3 text-xs shadow-xl",
             t.tone === "danger" && "border-danger/40",
             t.tone === "success" && "border-success/40",
+            t.tone === "info" && "border-info/30",
           )}
         >
           {t.tone === "danger" ? (
@@ -170,7 +176,35 @@ function Toasts() {
           ) : (
             <Info className="mt-0.5 size-4 shrink-0 text-info" />
           )}
-          <span className="break-words">{t.text}</span>
+          <span className="min-w-0 flex-1 break-words pt-px">{t.text}</span>
+          {t.action ? (
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => {
+                t.action!.onClick();
+                dismissToast(t.id);
+              }}
+            >
+              {t.action.label}
+            </Button>
+          ) : null}
+          <button
+            type="button"
+            aria-label="Cerrar aviso"
+            onClick={() => dismissToast(t.id)}
+            className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+          >
+            <X className="size-3.5" />
+          </button>
+          <span
+            aria-hidden
+            className={cn(
+              "toast-timer absolute inset-x-0 bottom-0 h-0.5",
+              t.tone === "danger" ? "bg-danger/60" : t.tone === "success" ? "bg-success/60" : "bg-info/60",
+            )}
+            style={{ ["--toast-ms" as string]: `${t.ms}ms` }}
+          />
         </div>
       ))}
     </div>
@@ -213,7 +247,12 @@ export default function App() {
     );
   }
   if (!session) {
-    return <div className="flex h-full items-center justify-center text-sm text-muted-foreground">Cargando…</div>;
+    return (
+      <div role="status" aria-label="Cargando…" className="flex h-full items-center justify-center gap-3 text-sm text-muted-foreground">
+        <span className="anim-pulse flex size-9 items-center justify-center rounded-lg bg-primary text-sm font-bold text-primary-foreground">F</span>
+        Cargando Factory Studio…
+      </div>
+    );
   }
 
   const project = session.project;

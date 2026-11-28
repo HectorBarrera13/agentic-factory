@@ -5,10 +5,20 @@ import { formatRoute, parseHash, type Route, type View } from "./route";
 export type { View } from "./route";
 export type Theme = "dark" | "light";
 
+export interface ToastAction {
+  label: string;
+  onClick: () => void;
+}
+
 interface Toast {
   id: number;
   tone: "info" | "success" | "danger";
   text: string;
+  /** ms visibles (la barra de tiempo del toast dura lo mismo) */
+  ms: number;
+  /** saliendo: animacion de salida antes de quitarlo */
+  leaving: boolean;
+  action?: ToastAction;
 }
 
 export interface Signer {
@@ -28,7 +38,8 @@ interface AppState {
   signer: Signer;
   setSigner: (profileId: string | null, role?: string) => void;
   toasts: Toast[];
-  notify: (text: string, tone?: Toast["tone"]) => void;
+  notify: (text: string, tone?: Toast["tone"], action?: ToastAction) => void;
+  dismissToast: (id: number) => void;
   /** Cambia cada vez que el backend reporta un cambio (SSE). */
   tick: number;
   /** Cambia cuando llega un resultado (o inicio) de probe de modelo. */
@@ -128,11 +139,21 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
-  const notify = React.useCallback((text: string, tone: Toast["tone"] = "info") => {
-    const id = Date.now() + Math.random();
-    setToasts((t) => [...t, { id, tone, text }]);
-    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), tone === "danger" ? 7000 : 3500);
+  const dismissToast = React.useCallback((id: number) => {
+    // primero la animacion de salida, despues se quita
+    setToasts((t) => t.map((x) => (x.id === id ? { ...x, leaving: true } : x)));
+    window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 180);
   }, []);
+
+  const notify = React.useCallback(
+    (text: string, tone: Toast["tone"] = "info", action?: ToastAction) => {
+      const id = Date.now() + Math.random();
+      const ms = action ? 8000 : tone === "danger" ? 7000 : 3500;
+      setToasts((t) => [...t.slice(-4), { id, tone, text, ms, leaving: false, action }]);
+      window.setTimeout(() => dismissToast(id), ms);
+    },
+    [dismissToast],
+  );
 
   const refreshSession = React.useCallback(async () => {
     try {
@@ -201,6 +222,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     signer: { profile, role },
     setSigner,
     toasts,
+    dismissToast,
     notify,
     tick,
     probeTick,
