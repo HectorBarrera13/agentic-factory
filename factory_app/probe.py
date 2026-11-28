@@ -78,6 +78,15 @@ def _mark(provider: str, model: str, active: bool) -> None:
         version += 1
 
 
+def latest_ok() -> tuple[str, str] | None:
+    """(proveedor, modelo) del probe OK mas reciente: sugerencia para proyectos nuevos."""
+    oks = [r for r in results().values() if isinstance(r, dict) and r.get("status") == "OK"]
+    if not oks:
+        return None
+    best = max(oks, key=lambda r: float(r.get("at", 0)))
+    return str(best["provider"]), str(best["model"])
+
+
 def temperature_supported(provider: str, model: str) -> bool | None:
     hit = result(provider, model)
     return None if hit is None else hit.get("temperature_supported")

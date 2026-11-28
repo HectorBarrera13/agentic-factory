@@ -30,6 +30,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from pathlib import Path
 
+from . import control
 from .context import project, run_scope
 from .project import Limits
 
@@ -287,8 +288,24 @@ class ADKExecutor(AgentExecutor):
             finally:
                 await runner.close()
 
+        async def _guarded() -> str:
+            # Pausa inmediata: la llamada en curso se cancela; la fase se repite al reanudar.
+            task = asyncio.ensure_future(_run())
+            while True:
+                done, _pending = await asyncio.wait({task}, timeout=0.25)
+                if done:
+                    return task.result()
+                if control.pause_requested():
+                    task.cancel()
+                    try:
+                        await task
+                    except BaseException:  # noqa: BLE001 - la cancelacion es lo esperado
+                        pass
+                    raise control.Paused(f"pausado durante {phase}")
+
         def _call() -> str:
-            return asyncio.run(_run())
+            control.check_pause(f"pausado antes de {phase}")
+            return asyncio.run(_guarded())
 
         report = self._call_with_backoff(_call, phase, context["change_id"])
         return {
@@ -304,7 +321,6 @@ class ADKExecutor(AgentExecutor):
         Agotados los reintentos: TransientModelError; el run NO pierde checkpoint.
         """
         import random
-        import time
 
         max_retries = self.max_retries
         attempt = 0
@@ -334,7 +350,7 @@ class ADKExecutor(AgentExecutor):
                 delay = self.backoff_base * (2 ** (attempt - 1)) + random.uniform(0, 2)
                 print(f"  [llm] {phase}: transitorio ({type(exc).__name__}), "
                       f"intento {attempt}/{max_retries} en {delay:.1f}s")
-                time.sleep(delay)
+                control.sleep(delay)  # la pausa corta la espera
                 continue
             # exito: los reintentos que costo tambien cuentan en la metrica (§19.1)
             self._record_retries(change_id, phase, attempt, exhausted=False)
@@ -411,6 +427,56 @@ def _record_model(change_id: str, role: str, settings: dict) -> None:
     state = json.loads(path.read_text(encoding="utf-8"))
     state.setdefault("models", {})[role] = settings
     path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _set_fields(run_dir: Path, **kw) -> None:
+    """Campos auxiliares del estado sin registrar una transicion."""
+    path = _state_path(run_dir)
+    if not path.is_file():
+        return
+    state = json.loads(path.read_text(encoding="utf-8"))
+    state.update(kw)
+    path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _worktree_head(change_id: str) -> str:
+    wt = project().work_root(change_id)
+    if not _has_git() or wt == project().root:
+        return ""
+    return _git(["rev-parse", "HEAD"], wt).stdout.strip()
+
+
+def _record_pause(change_id: str, why: str) -> None:
+    """Pausa: el estado queda en su checkpoint (*_PENDING). Si se corto el Coder, el
+    worktree DEL RUN vuelve al commit de inicio de la fase (nunca el arbol del usuario)."""
+    run_dir = project().run_dir(change_id)
+    if not _state_path(run_dir).is_file():
+        return
+    state = _load_state(run_dir)
+    reset = False
+    head = state.get("phase_head")
+    wt = project().work_root(change_id)
+    if state.get("status") == "IMPLEMENT_PENDING" and head and wt != project().root:
+        _git(["reset", "-q", "--hard", head], wt)
+        _git(["clean", "-q", "-fd", "--", *_code_paths()], wt)
+        reset = True
+    state["paused"] = {"at": _now(), "status": state.get("status"), "reason": why,
+                       "worktree_reset": reset}
+    state.setdefault("transitions", []).append(
+        {"status": state.get("status"), "event": "PAUSED", "at": _now()})
+    _state_path(run_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def _resume_if_paused(change_id: str) -> None:
+    run_dir = project().run_dir(change_id)
+    if not _state_path(run_dir).is_file():
+        return
+    state = _load_state(run_dir)
+    if not state.pop("paused", None):
+        return
+    state.setdefault("transitions", []).append(
+        {"status": state.get("status"), "event": "RESUMED", "at": _now()})
+    _state_path(run_dir).write_text(json.dumps(state, indent=2), encoding="utf-8")
 
 
 def _read(path: Path) -> str:
@@ -704,7 +770,12 @@ def advance(change_id: str, executor: AgentExecutor | None = None) -> dict:
     Durante el avance el run queda activo: las tools trabajan en SU worktree."""
     change_id = change_id.strip().upper()
     with run_scope(change_id):
-        return _advance(change_id, executor or FakeExecutor())
+        _resume_if_paused(change_id)
+        try:
+            return _advance(change_id, executor or FakeExecutor())
+        except control.Paused as exc:
+            _record_pause(change_id, str(exc))
+            raise
 
 
 def _advance(change_id: str, executor: AgentExecutor) -> dict:
@@ -721,6 +792,8 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
         status = state["status"]
     if status in TERMINAL:
         return state
+    # checkpoint: cada fase empieza aqui con el estado persistido (pausa entre fases)
+    control.check_pause(f"pausado en {status}")
     cr_text = _read(run_dir / "00-change-request.md")
     clarification = state.get("po_clarification", "")
 
@@ -822,6 +895,8 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
             ),
         }
         _prepare_branch(change_id, state, require_clean=True)
+        # punto de retorno si se pausa a media fase (se descartan escrituras parciales)
+        _set_fields(run_dir, phase_head=_worktree_head(change_id))
         rng = _diff_range(state)
         phase = "fix" if fix_reason else "implement"
         out = executor.run_agent(phase, ctx)
@@ -916,9 +991,6 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                     + "\nFIX AUTORIZADO: "
                     + str(state.get("last_fix_reason", ""))
                 )
-                n = len(list(run_dir.glob("08-review-report-round*.md")))
-                _archive(run_dir, "08-review-report.md", n)
-                _archive(run_dir, "09-security-report.md", n)
             _prepare_branch(change_id, state, require_clean=False)
             diff = _git(["diff", _diff_range(state)]).stdout
             review_ctx = {
@@ -930,7 +1002,6 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                 "prior_findings": prior_findings,
             }
             review = executor.run_agent("review", review_ctx)  # sesion propia
-            (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
             sec = executor.run_agent(
                 "security",
                 {
@@ -940,6 +1011,11 @@ def _advance(change_id: str, executor: AgentExecutor) -> dict:
                     "prior_findings": prior_findings,
                 },
             )  # sesion propia distinta
+            if re_review:  # conservar la ronda anterior antes de escribir la nueva
+                n = len(list(run_dir.glob("08-review-report-round*.md")))
+                _archive(run_dir, "08-review-report.md", n)
+                _archive(run_dir, "09-security-report.md", n)
+            (run_dir / "08-review-report.md").write_text(review["report"], encoding="utf-8")
             from .scanners import run_security_scans
 
             scans = run_security_scans(
