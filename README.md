@@ -33,8 +33,21 @@ cd ui && npm install && npm run build && cd ..   # una vez (Node solo para compi
 uv run python -m factory_ui [RUTA_PROYECTO]       # abre http://127.0.0.1:8765/?token=...
 ```
 
-- **Abrir proyecto**: si no tiene `.factory/`, el asistente detecta lenguaje, carpetas y comandos
-  (pyproject / package.json) y tú revisas antes de guardar.
+- **Abrir proyecto**: sin ruta, Studio abre el último proyecto abierto que siga existiendo (si no
+  hay, la carpeta actual); una ruta explícita gana. "Examinar…" abre el explorador de carpetas del
+  sistema (tkinter, en un proceso aparte; si falta, se escribe la ruta a mano). Si el proyecto no
+  tiene `.factory/`, el asistente detecta lenguaje, carpetas y comandos (pyproject / package.json),
+  propone como modelo el último que pasó la prueba y tú revisas antes de guardar.
+- **Rutas**: la vista queda en la URL (`#/factory/CR-04`, `#/settings/providers`,
+  `#/code?root=…&path=…`); recargar o "atrás" vuelve al mismo lugar.
+- **Modo del run**: por defecto *Modelo real*; *Simulación (Fake)* es para probar el flujo sin
+  modelo. Antes de avanzar con un modelo que no pasó la prueba, el tablero avisa y pide
+  confirmación; también avisa si `FACTORY_MODEL` del entorno reemplaza el modelo de Ajustes.
+- **Pausar / reanudar**: "Pausar" corta ya (cancela la llamada al modelo en curso o la espera de
+  reintento) y el run queda *pausado* en su último punto de control. "Reanudar" repite esa fase
+  desde su inicio. Si se cortó al Coder, sus cambios a medias en el worktree del run se descartan
+  (nunca en tu árbol). La pausa y la reanudación quedan en `transitions` (`PAUSED`/`RESUMED`). La
+  verificación (tests/lint) no se corta: termina y la pausa se aplica justo después.
 - **Worktree por run**: al aprobar el plan, el run trabaja en `.factory/worktrees/<CR>` con su rama
   `factory/<CR>`; tu árbol no se toca y puedes seguir editando. El worktree solo se borra con
   "Quitar worktree" (la rama se conserva). Nunca hay merge automático.
